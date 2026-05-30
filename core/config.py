@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     crm_endpoint: str = Field(default="https://crm.mock/api/v1", alias="CRM_ENDPOINT")
     crm_api_key: SecretStr = Field(default="mock-key", alias="CRM_API_KEY")
 
+    # Google Calendar (book_appointment tool)
+    google_client_id: SecretStr = Field(default="", alias="GOOGLE_CLIENT_ID")
+    google_client_secret: SecretStr = Field(default="", alias="GOOGLE_CLIENT_SECRET")
+    google_refresh_token: SecretStr = Field(default="", alias="GOOGLE_REFRESH_TOKEN")
+
     # DSGVO
     data_residency_region: str = Field(default="eu-central-1", alias="DATA_RESIDENCY_REGION")
     enable_pii_redaction: bool = Field(default=True, alias="ENABLE_PII_REDACTION")

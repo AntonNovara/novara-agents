@@ -27,6 +27,7 @@ from agents.sdr_agent import SDRAgent
 from agents.support_agent import SupportAgent
 from agents.voice_agent import VoiceAgent
 from core.config import settings
+from tools.calendar_integration import GoogleCalendarTool
 from tools.document_parser import DocumentParser
 
 # ── Logging Setup ─────────────────────────────────────────────────────────────
@@ -59,8 +60,8 @@ log = structlog.get_logger("novara.gateway")
 
 _AGENT_REGISTRY: dict = {}
 
-
 _VOICE_AGENT: Optional[VoiceAgent] = None
+_CALENDAR_TOOL: Optional[GoogleCalendarTool] = None
 
 
 def _build_registry() -> dict:
@@ -77,10 +78,11 @@ def _build_registry() -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _AGENT_REGISTRY, _VOICE_AGENT
+    global _AGENT_REGISTRY, _VOICE_AGENT, _CALENDAR_TOOL
     log.info("Novara Agent Factory starting", environment=settings.environment)
     _AGENT_REGISTRY = _build_registry()
     _VOICE_AGENT = VoiceAgent()
+    _CALENDAR_TOOL = GoogleCalendarTool()
     log.info("Agent registry initialised", agents=list(_AGENT_REGISTRY.keys()))
     yield
     log.info("Novara Agent Factory shutting down")
@@ -290,6 +292,41 @@ async def voice_webhook(request: Request):
     msg = body.get("message", {})
     event_type = msg.get("type", "")
 
+    # ── Appointment booking via Vapi function-call ────────────────────────────
+    if event_type == "function-call":
+        fn = msg.get("functionCall", {})
+        if fn.get("name") == "book_appointment":
+            params = fn.get("parameters", {})
+            result = _CALENDAR_TOOL.book(
+                date=params.get("date", ""),
+                time=params.get("time", ""),
+                name=params.get("name", ""),
+                company=params.get("company", ""),
+                phone=params.get("phone", ""),
+                topic=params.get("topic", ""),
+            )
+            if result.success:
+                log.info(
+                    "Appointment booked",
+                    event_id=result.event_id,
+                    start=result.start,
+                )
+                return {
+                    "result": (
+                        f"Termin erfolgreich eingetragen: {result.summary} "
+                        f"am {result.start}."
+                    )
+                }
+            else:
+                log.error("Calendar booking failed", error=result.error)
+                return {
+                    "result": (
+                        "Der Termin konnte leider nicht eingetragen werden. "
+                        "Bitte versuchen Sie es später erneut."
+                    )
+                }
+
+    # ── Post-call SDR handoff ─────────────────────────────────────────────────
     if event_type == "end-of-call-report":
         transcript = msg.get("transcript", "")
         session_id = msg.get("call", {}).get("id", str(uuid.uuid4()))

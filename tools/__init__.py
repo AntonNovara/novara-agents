@@ -1,3 +1,4 @@
+from tools.calendar_integration import GoogleCalendarTool, BookingResult
 from tools.crm_integration import CRMIntegration, CRMIntegrationSDR, ERPRecord, LeadRecord, LeadCRMResult
 from tools.deal_tracker import DealTracker, DealRecord, DealResult, DealStage
 from tools.document_parser import DocumentParser
@@ -8,6 +9,7 @@ from tools.onboarding_tracker import OnboardingTracker, OnboardingRecord, Checkl
 from tools.ticket_system import TicketSystem, TicketRecord, TicketResult, TicketPriority
 
 __all__ = [
+    "GoogleCalendarTool", "BookingResult",
     "CRMIntegration", "CRMIntegrationSDR", "ERPRecord", "LeadRecord", "LeadCRMResult",
     "DealTracker", "DealRecord", "DealResult", "DealStage",
     "DocumentParser",

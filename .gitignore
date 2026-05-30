@@ -9,3 +9,5 @@ dist/
 build/
 .pytest_cache/
 *.log
+credentials.json
+get_token.py
