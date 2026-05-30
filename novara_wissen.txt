@@ -1,0 +1,435 @@
+PAKETE
+================================================================================
+
+ANGEBOTSPRINZIP:
+Immer mit dem Starter-Paket beginnen. Retainer erst nach bewiesenem Wert anbieten.
+Preise verstehen sich exkl. gesetzlicher Abgaben (Kleinunternehmer).
+
+------------------------------------------------------------
+PAKET 1: STARTER — €990 (einmalig)
+------------------------------------------------------------
+Für wen: Betriebe, die einen klar definierten Engpass haben
+Was: 1 Kernprozess wird automatisiert
+Typische Umsetzungszeit: 5 Werktage
+Beispielanwendungen:
+  - Automatische Antwort bei verpassten Anrufen (SMS + Terminbuchungs-Link)
+  - Automatische Bestätigung nach Kontaktformular-Einsendung
+  - Erinnerung an vereinbarte Termine (SMS/E-Mail, 24h vorher)
+  - Strukturierte Angebotsvorlagen mit automatischem Versand
+
+------------------------------------------------------------
+PAKET 2: GROWTH — €2.490 (einmalig)
+------------------------------------------------------------
+Für wen: Betriebe mit 2–3 manuellen Engpässen oder komplexerer Integration
+Was: 2–3 Prozesse, tiefere Systemintegration
+Typische Umsetzungszeit: 2–3 Wochen
+Beispielanwendungen:
+  - Verpasster Anruf → automatische Antwort + Lead-Erfassung + CRM-Update
+  - Angebotsanfrage → automatische Eingangsbestätigung + Angebotserstellung + Follow-up
+  - Kundenkommunikation + Terminbuchung + Erinnerung in einem System
+
+------------------------------------------------------------
+PAKET 3: RETAINER — €590/Monat (laufend)
+------------------------------------------------------------
+Für wen: Bestandskunden, die das System optimiert und betreut haben wollen
+Was: Laufende Betreuung, Optimierung, Support, monatliche Anpassungen
+Voraussetzung: Erst nach erfolgreichem Starter oder Growth Projekt anbieten
+Inhalt: 1 monatlicher Review-Call, Fehlerbehebung, kleine Erweiterungen
+
+------------------------------------------------------------
+ZAHLUNGSMODELL:
+  - Einmalprojekte: 50% Anzahlung bei Auftragsbestätigung, 50% bei Übergabe
+  - Retainer: Monatlich im Voraus
+
+------------------------------------------------------------
+GARANTIE (Standard-Formulierung):
+"Wenn das System in den ersten 14 Tagen nicht wie vereinbart funktioniert,
+zahlen Sie nichts."
+
+================================================================================
+3. UNSERE ZIELGRUPPE — IDEAL CUSTOMER PROFILE (ICP)
+================================================================================
+
+PRIMÄRE ZIELGRUPPE (aktuell aktiv):
+Handwerksbetriebe in Wien — Schwerpunkt: Elektrikerbetriebe
+
+GEOGRAFISCHER FOKUS: Wien, Österreich (DACH-Raum mittelfristig)
+
+------------------------------------------------------------
+IDEALER KUNDE — ELEKTRIKER IN WIEN
+------------------------------------------------------------
+Betriebsgröße: 1–10 Mitarbeiter (Inhaber-geführt)
+Jahresumsatz: €200.000 – €1.500.000
+Typisches Profil:
+  - Inhaber ist selbst auf der Baustelle tätig
+  - Büro läuft nebenher (Frau, Teilzeit-Bürokraft, oder gar nichts)
+  - Auftragsgewinnung: zu 80–90% über Empfehlungen und Telefon
+  - Keine oder minimale Online-Präsenz
+  - Kein CRM, kein Buchungssystem, keine automatisierten Prozesse
+  - Technologieskeptisch, aber offen wenn ROI klar ist
+  - Entscheidungsträger = Inhaber (kein langer Entscheidungsprozess)
+
+TOP 3 SCHMERZEN (Painkiller — in Priorität):
+
+1. VERPASSTE ANRUFE → VERLORENE AUFTRÄGE
+   "Wenn alle auf der Baustelle sind, klingelt das Telefon und niemand nimmt ab.
+   Der Anrufer legt auf und ruft beim nächsten Elektriker an."
+   Finanzieller Schaden: 1 verlorener Auftrag = €500–€2.000+
+
+2. ANGEBOTE ABENDS MANUELL TIPPEN
+   "Nach einem 10-Stunden-Tag sitzt der Inhaber nochmal 1–2 Stunden und tippt
+   Angebote. Das frisst Freizeit und verzögert die Antwortzeit."
+
+3. KEINE TERMINBESTÄTIGUNG / ERINNERUNG
+   "Kunden kommen nicht zum vereinbarten Termin — niemand hat vorher erinnert."
+
+DISQUALIFIKATIONS-KRITERIEN (kein guter Lead):
+  - Bereits professionell aufgestellt (CRM, Online-Buchung, dediziertes Büro-Team)
+  - Kein Interesse an Effizienz / "läuft eh gut so"
+  - Sehr großer Betrieb (>50 MA) → andere Lösungen nötig
+  - Lead-Score unter 40 bei automatisierter Bewertung
+
+AUTOMATION-POTENZIAL BEWERTUNG:
+  HOCH: Kein Online-Buchungssystem, keine automatisierte Kundenkommunikation erkennbar
+  MITTEL: Einfache Website, kein CRM erkennbar
+  NIEDRIG: Bereits professionell digitalisiert
+
+================================================================================
+4. TYPISCHE EINWÄNDE & UNSERE ANTWORTEN
+================================================================================
+
+PRINZIP: Nie verteidigen — immer mit einer Frage weiterdrehen.
+Einwände anerkennen ("Das verstehe ich"), dann konkret werden.
+
+------------------------------------------------------------
+PREIS-EINWÄNDE
+------------------------------------------------------------
+
+EINWAND: "Zu teuer" / "Das kann ich mir nicht leisten"
+ANTWORT:
+"Verstehe ich. Darf ich kurz fragen — im Vergleich wozu? Die meisten Betriebe
+sagen, dass ein einziger verlorener Auftrag durch einen verpassten Anruf schon
+€500–€1.000 kostet. Wenn das System auch nur 2 Aufträge pro Monat zusätzlich
+sichert, hat es sich in 2 Monaten amortisiert."
+VARIANTE: "Wir können auch mit einem kleineren Schritt anfangen, der genau einen
+Prozess löst."
+
+EINWAND: "Ich weiß nicht ob sich das rechnet"
+ANTWORT:
+"Das ist die richtige Frage. Ich zeige das gerne konkret: Wie viele Anrufe
+verpassen Sie ungefähr pro Woche wenn alle auf der Baustelle sind?"
+
+------------------------------------------------------------
+TIMING-EINWÄNDE
+------------------------------------------------------------
+
+EINWAND: "Keine Zeit gerade"
+ANTWORT:
+"Genau deshalb melde ich mich — mein Ziel ist es Ihnen Zeit zurückzugeben,
+nicht noch mehr zu nehmen. Darf ich in 2 Sätzen erklären wie das aussehen würde?"
+
+EINWAND: "Ruf mich nächsten Monat an"
+ANTWORT:
+"Kein Problem, mache ich. Damit ich dann gezielt vorbereitet bin: Was ist bei Ihnen
+gerade das Thema das am meisten Zeit frisst — Angebote, Anrufe, oder etwas anderes?"
+
+EINWAND: "Wir haben gerade viel um die Ohren"
+ANTWORT:
+"Das kenne ich — Hochsaison ist brutal. Genau dann läuft unser System am stärksten,
+weil es die Dinge übernimmt die sonst durchs Raster fallen. Hätten Sie 10 Minuten
+nächste Woche?"
+
+------------------------------------------------------------
+SKEPTIZISMUS / VERTRAUEN
+------------------------------------------------------------
+
+EINWAND: "Das funktioniert bei uns nicht"
+ANTWORT:
+"Was macht Sie skeptisch? Ich frage ehrlich, weil ich das oft höre und meistens
+steckt eine konkrete Erfahrung dahinter. Was hat Sie das letzte Mal enttäuscht?"
+
+EINWAND: "Ich hab das schon mal probiert und es hat nicht geklappt"
+ANTWORT:
+"Das tut mir leid zu hören — was war das damals? Ich frage, weil ich genau wissen
+will ob wir das gleiche Problem lösen oder ein anderes."
+
+EINWAND: "Ich vertrau sowas nicht"
+ANTWORT:
+"Das ist berechtigt. Deshalb starten wir immer mit zwei Wochen kostenlosem Test —
+Sie sehen ob es funktioniert, bevor Sie irgendetwas bezahlen. Wenn nicht, einfach stoppen."
+
+------------------------------------------------------------
+KEIN BEDARF
+------------------------------------------------------------
+
+EINWAND: "Läuft gut bei uns, wir brauchen das nicht"
+ANTWORT:
+"Freut mich zu hören. Nur aus Neugier: Wie lösen Sie das mit Anrufen wenn alle
+auf der Baustelle sind? Das ist bei fast allen der Engpass."
+
+EINWAND: "Meine Frau / Sekretärin macht das Büro"
+ANTWORT:
+"Super, dann haben Sie schon jemanden dafür. Ich frage trotzdem kurz: Was macht ihr
+am meisten Arbeit — Anrufe, Termine, oder Angebote?"
+
+EINWAND: "Wir haben schon eine Software"
+ANTWORT:
+"Gut zu wissen. Wir ersetzen keine Software — wir bauen einen unsichtbaren Mitarbeiter
+davor, der die Daten automatisch dort einträgt, damit niemand mehr abtippen muss.
+Nutzen Sie die Software auch für Terminbestätigungen?"
+
+EINWAND: "Schick mir einfach eine E-Mail"
+ANTWORT:
+"Mache ich gerne. Damit ich Ihnen nichts Unpassendes schicke: Was ist bei Ihnen
+gerade der größte Zeitfresser im Büro?"
+
+EINWAND: "Kein Interesse"
+ANTWORT:
+"Kein Problem, danke für Ihre Zeit. Darf ich nur kurz fragen — ist es das Thema
+generell, oder eher der Zeitpunkt?"
+
+------------------------------------------------------------
+ENTSCHEIDUNGSPROZESS
+------------------------------------------------------------
+
+EINWAND: "Ich entscheide das nicht alleine"
+ANTWORT:
+"Verstehe. Wer würde das mit entscheiden? Und wäre es okay wenn ich Ihnen kurze
+Unterlagen schicke die Sie intern weitergeben können?"
+
+================================================================================
+5. STANDARD-ABLAUF & ONBOARDING — VON ERSTGESPRÄCH BIS PROJEKTABSCHLUSS
+================================================================================
+
+------------------------------------------------------------
+PHASE 1: ERSTKONTAKT (Kalt-E-Mail oder Kaltakquise-Anruf)
+------------------------------------------------------------
+Methode: E-Mail (max. 5 Sätze) oder Telefon (Advice-Call Methode)
+Ziel: 10-Minuten-Gespräch oder Videocall vereinbaren — NICHT verkaufen
+Ton: Neugierig, nicht fordernd. Um Rat bitten, nicht pitchen.
+
+Anruf-Struktur (Kurzversion):
+1. Ehrlicher Einstieg: "Das ist ein Kaltakquise-Anruf — ich mache es kurz."
+2. Kernfrage: "Was ist die eine Verwaltungsaufgabe die Sie am meisten Zeit kostet?"
+3. Tiefer bohren: Genaue Worte des Kunden notieren
+4. Übergang: "Wenn es ein System gäbe das [Problem] automatisch löst..."
+5. Nächster Schritt: 10-Min Videocall oder 2-Wochen-Test anbieten
+
+------------------------------------------------------------
+PHASE 2: ADVICE-CALL / DISCOVERY (10–20 Minuten)
+------------------------------------------------------------
+Ziel: Den einen Hauptschmerz identifizieren — in Worten des Kunden
+Output: Klares Bild von Problem, Häufigkeit, finanziellem Schaden
+
+Schlüsselfragen:
+- "Was ist bei Ihnen der größte Engpass im Tagesgeschäft?"
+- "Wie viele Anrufe verpassen Sie pro Woche wenn alle auf der Baustelle sind?"
+- "Wie lange brauchen Sie für ein Angebot? Wie viele schreiben Sie pro Woche?"
+- "Was wäre das wert wenn das automatisch passieren würde?"
+
+------------------------------------------------------------
+PHASE 3: ANGEBOTSERSTELLUNG & VERSAND
+------------------------------------------------------------
+Format: 1-seitiges Angebot (Starter oder Growth Paket)
+Versand: Als PDF per E-Mail, spätestens 24h nach Gespräch
+Struktur des Angebots:
+  1. Titel (Outcome-orientiert, kein Technikjargon)
+  2. Situation (2–3 Sätze — Realität des Kunden)
+  3. Problem (in Worten des Kunden)
+  4. Lösung (was passiert — kein "KI", kein "Make.com")
+  5. Ergebnis (messbar: "Keine verpassten Anrufe mehr")
+  6. Preis + Umsetzungszeit + Garantie
+
+------------------------------------------------------------
+PHASE 4: DEAL-ABSCHLUSS
+------------------------------------------------------------
+Trigger: Kunde sagt "Ja" oder "Wie geht's weiter?"
+Sofortige Aktionen:
+  - Auftragsbestätigung per E-Mail senden
+  - 50% Anzahlungsrechnung ausstellen
+  - Kickoff-Termin innerhalb 48h vereinbaren
+  - CRM-Status auf "Closed Won" setzen
+  - Kurze Willkommensnachricht:
+    "Hallo [Vorname], freue mich auf die Zusammenarbeit! Ich melde mich in den
+    nächsten 24 Stunden mit einem Termin-Vorschlag für unser Kickoff. LG Anton"
+
+------------------------------------------------------------
+PHASE 5: KICKOFF (30 Minuten)
+------------------------------------------------------------
+Agenda:
+  00–05 Min: Begrüßung, Ablauf erklären
+  05–10 Min: Painkiller nochmals bestätigen (in Worten des Kunden)
+  10–20 Min: Technische & inhaltliche Infos sammeln (siehe Checkliste unten)
+  20–25 Min: Ablauf Woche 1 & 2 erklären
+  25–30 Min: Fragen klären, nächsten Kontaktpunkt festlegen
+
+Info-Sammlung (Checkliste):
+  Basis:
+    - Offizielle Firmenbezeichnung
+    - UID-Nummer (falls vorhanden)
+    - Rechnungsadresse
+    - Bevorzugter Kommunikationskanal (E-Mail / WhatsApp / Telefon)
+  Technisch:
+    - Telefonnummer die automatisiert werden soll
+    - E-Mail-Adresse für Anfragen
+    - Bestehende Software / Tools (CRM, Kalender, Buchungssystem)
+    - Wer soll Benachrichtigungen erhalten?
+    - Öffnungszeiten / Erreichbarkeitszeiten
+    - Ton der Kundenkommunikation (Du/Sie)
+  Inhaltlich:
+    - Welche Dienstleistungen werden angeboten?
+    - Häufige Kundenfragen
+    - Gewünschter nächster Schritt für Kunden (Termin / Angebot / Rückruf)
+
+------------------------------------------------------------
+PHASE 6: SETUP-WOCHE (Woche 1)
+------------------------------------------------------------
+- Automatisierungs-Projekt anlegen
+- Technische Verbindungen herstellen (Telefon-Weiterleitung, E-Mail-Integration)
+- Internen Test-Durchlauf machen
+- Update-Nachricht an Kunden (Tag 3–4):
+  "Hallo [Vorname], kurzes Update: die ersten Schritte laufen, wir sind gut in
+  der Zeit. Bis Ende der Woche machen wir den ersten Test-Lauf. LG Anton"
+
+------------------------------------------------------------
+PHASE 7: TEST & ÜBERGABE (Woche 2)
+------------------------------------------------------------
+- System mit echten Anfragen testen
+- Kunden einbeziehen: "Haben Sie erste Rückmeldungen?"
+- Feintuning basierend auf Feedback
+- Übergabe-Call (15 Min): System zeigen, Fragen klären
+- Kurze Dokumentation für den Kunden
+- Restbetrag in Rechnung stellen
+
+Übergabe-Nachricht:
+"Hallo [Vorname], das System ist bereit! Ich würde Ihnen kurz zeigen wie alles
+läuft — passt Ihnen [Tag] um [Uhrzeit] für 15 Minuten?"
+
+------------------------------------------------------------
+PHASE 8: NACH-PROJEKT (ab Woche 3)
+------------------------------------------------------------
+- Retainer-Angebot stellen (€590/Monat) wenn Wert sichtbar
+- Case Study anfragen: "Darf ich Ihre Ergebnisse als Referenz nutzen?"
+- Empfehlungsfrage: "Kennen Sie jemanden aus Ihrem Netzwerk mit ähnlichen Herausforderungen?"
+- Check-In nach 30 Tagen
+
+------------------------------------------------------------
+FOLLOW-UP SEQUENZ (bei keiner Antwort nach Erstkontakt)
+------------------------------------------------------------
+Tag 0:  Erstkontakt (E-Mail oder Anruf)
+Tag 3:  FU1 — Kurzes Follow-up ("Kurze Nachfrage...")
+Tag 7:  FU2 — Letzter Versuch mit konkretem Beispiel
+Tag 14: FU3 — Freundliche Verabschiedung, Tür offen lassen
+Tag 14+: In "später kontaktieren" Liste verschieben
+
+================================================================================
+6. INTERNE PROZESSE & TOOLS
+================================================================================
+
+CRM-SYSTEM: Google Sheets ("Novara CRM – Make.com Ready")
+Spalten: ID | Firma | Ansprechpartner | Email | Telefon | Status | Letzter_Kontakt
+
+CRM STATUS-WERTE:
+  - neu_importiert
+  - kontaktiert
+  - geantwortet
+  - gespräch_vereinbart
+  - angebot_gesendet
+  - closed_won
+  - closed_lost
+  - später_kontaktieren
+
+AUTOMATISIERTE MAKE.COM SZENARIEN (intern aktiv):
+  1. Gmail Reply Detection — aktualisiert CRM-Status auf "geantwortet"
+  2. CRM Daily Briefing — 08:00 Wien, zeigt actionable Leads
+  3. Gmail Sent-to-CRM — loggt neue Kontakte automatisch bei Versand
+
+TERMINBUCHUNG: calendly.com/anton-novaraautomation/30min
+
+RECHNUNGSSTELLUNG:
+  - Sequentielle Nummerierung (RE-2026-001, RE-2026-002, ...)
+  - 50/50 Zahlungsmodell (Anzahlung + Restbetrag bei Übergabe)
+  - Kleinunternehmer — kein USt-Ausweis, Hinweis auf §6 Abs. 1 Z 27 UStG
+
+VERTRAGSGRUNDLAGE:
+  - Werkvertrag (österreichisches Recht, Gerichtsstand Wien)
+  - Digitale Unterzeichnung via Sign.plus
+
+================================================================================
+7. KOMMUNIKATIONS-VORLAGEN
+================================================================================
+
+------------------------------------------------------------
+KALT-E-MAIL (Elektriker — Erstkontakt)
+------------------------------------------------------------
+Betreff: Frage zu Anrufen auf der Baustelle
+
+"Hallo [Vorname],
+
+ich bin Anton von Novara Automation aus Wien.
+
+Ich helfe Elektrikerbetrieben dabei, keine Aufträge mehr durch verpasste Anrufe
+zu verlieren — mit einem System das automatisch reagiert wenn niemand abnimmt.
+
+Wäre das auch bei Ihnen ein Thema? Ich erkläre das gerne in 10 Minuten.
+
+Freundliche Grüße,
+Anton"
+
+------------------------------------------------------------
+FOLLOW-UP 1 (Tag 3 — keine Antwort)
+------------------------------------------------------------
+"Hallo [Vorname],
+
+kurze Nachfrage zu meiner E-Mail von [Datum].
+
+Falls das kein Thema für Sie ist, kein Problem — sagen Sie mir kurz Bescheid.
+Falls Sie Fragen haben, stehe ich gerne zur Verfügung.
+
+LG, Anton"
+
+------------------------------------------------------------
+FOLLOW-UP 2 (Tag 7 — letzter Versuch)
+------------------------------------------------------------
+"Hallo [Vorname],
+
+ein letzter Versuch: Ich habe letzte Woche mit einem Elektriker aus Wien gesprochen,
+der 3–4 Anrufe pro Tag verpasst wenn sein Team auf der Baustelle ist.
+
+Falls das bei Ihnen auch vorkommt — ich hätte eine konkrete Lösung dafür.
+Passt es Ihnen für 10 Minuten nächste Woche?
+
+LG, Anton"
+
+------------------------------------------------------------
+ANGEBOT — STARTER-BEISPIEL (Elektriker)
+------------------------------------------------------------
+Titel: Kein verpasster Anruf mehr – Automatisches Anfragen-System für [Firmename]
+
+Situation:
+"Sie betreiben einen aktiven Elektrikerbetrieb in Wien. Wie bei den meisten
+Handwerksbetrieben läuft die eigentliche Arbeit gut — aber die Verwaltung
+frisst Zeit, die Sie nicht haben."
+
+Problem:
+"Wenn alle auf der Baustelle sind, klingelt das Telefon — und niemand ist da.
+Der Anrufer legt auf und ruft beim nächsten Elektriker an."
+
+Lösung:
+"Wir richten ein automatisches System ein: Wenn ein Anruf verpasst wird, bekommt
+der Anrufer sofort eine SMS mit dem Angebot, einen Rückruftermin zu buchen.
+Sie sehen alle Anfragen gesammelt in einer Übersicht — ohne dass Sie etwas
+manuell tun müssen."
+
+Ergebnis:
+"Keine verpassten Aufträge mehr durch verpasste Anrufe.
+Schätzung: 2–5 zusätzliche Anfragen pro Woche, die sonst verloren gegangen wären."
+
+Investition:
+Starter-Paket: €990 (einmalig, exkl. gesetzlicher Abgaben)
+Live in 5 Werktagen.
+Garantie: Wenn das System in den ersten 14 Tagen nicht funktioniert, zahlen Sie nichts.
+
+================================================================================
+ENDE DER WISSENSDATENBANK
+================================================================================

@@ -1,0 +1,47 @@
+from functools import lru_cache
+from pydantic import Field, SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    # LLM
+    anthropic_api_key: SecretStr = Field(default="mock-key", alias="ANTHROPIC_API_KEY")
+    anthropic_model: str = Field(default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL")
+
+    # API Security
+    api_secret_key: SecretStr = Field(default="dev-secret", alias="API_SECRET_KEY")
+    api_key_header: str = Field(default="X-API-Key", alias="API_KEY_HEADER")
+
+    # CRM / ERP
+    crm_endpoint: str = Field(default="https://crm.mock/api/v1", alias="CRM_ENDPOINT")
+    crm_api_key: SecretStr = Field(default="mock-key", alias="CRM_API_KEY")
+
+    # DSGVO
+    data_residency_region: str = Field(default="eu-central-1", alias="DATA_RESIDENCY_REGION")
+    enable_pii_redaction: bool = Field(default=True, alias="ENABLE_PII_REDACTION")
+
+    # Logging
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    log_format: str = Field(default="json", alias="LOG_FORMAT")
+
+    # Runtime
+    environment: str = Field(default="development", alias="ENVIRONMENT")
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment == "production"
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()
