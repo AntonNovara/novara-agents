@@ -283,6 +283,39 @@ async def voice_chat_completions(request: Request):
     )
 
 
+def _parse_vapi_params(raw) -> dict:
+    """Normalise Vapi parameters/arguments — may arrive as dict or JSON string."""
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _run_booking(params: dict) -> str:
+    """Execute book_appointment and return a human-readable result string."""
+    if _CALENDAR_TOOL is None:
+        return "Kalenderdienst nicht initialisiert."
+    result = _CALENDAR_TOOL.book(
+        date=params.get("date", ""),
+        time=params.get("time", ""),
+        name=params.get("name", ""),
+        company=params.get("company", ""),
+        phone=params.get("phone", ""),
+        # accept both "topic" (our name) and "summary" (alternative Vapi mapping)
+        topic=params.get("topic") or params.get("summary", ""),
+    )
+    if result.success:
+        log.info("Appointment booked", event_id=result.event_id, start=result.start)
+        return f"Termin erfolgreich eingetragen: {result.summary} am {result.start}."
+    log.error("Calendar booking failed", error=result.error)
+    return (
+        "Der Termin konnte leider nicht eingetragen werden. "
+        "Bitte versuchen Sie es später erneut."
+    )
+
+
 @app.post(
     "/api/v1/voice/webhook",
     tags=["Voice"],
@@ -293,37 +326,22 @@ async def voice_webhook(request: Request):
     msg = body.get("message", {})
     event_type = msg.get("type", "")
 
-    # ── Appointment booking — new Vapi format: tool-calls ─────────────────────
-    # Vapi sends this for server-side tools; response must be {"results": [...]}
+    # Full payload logged at INFO so Railway shows exact keys Vapi sends
+    log.info("Vapi webhook received", event_type=event_type, payload=body)
+
+    # ── New Vapi format: tool-calls ───────────────────────────────────────────
+    # Response must be {"results": [{"toolCallId": "...", "result": "..."}]}
     if event_type == "tool-calls":
         tool_call_list = msg.get("toolCallList", [])
         results = []
         for tc in tool_call_list:
             call_id = tc.get("id", "")
-            fn_name = tc.get("function", {}).get("name", "")
-            raw_args = tc.get("function", {}).get("arguments", "{}")
-            params = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            fn = tc.get("function", {})
+            fn_name = fn.get("name", "")
+            params = _parse_vapi_params(fn.get("arguments", {}))
 
-            if fn_name == "book_appointment" and _CALENDAR_TOOL is not None:
-                result = _CALENDAR_TOOL.book(
-                    date=params.get("date", ""),
-                    time=params.get("time", ""),
-                    name=params.get("name", ""),
-                    company=params.get("company", ""),
-                    phone=params.get("phone", ""),
-                    topic=params.get("topic", ""),
-                )
-                if result.success:
-                    log.info("Appointment booked", event_id=result.event_id, start=result.start)
-                    result_text = (
-                        f"Termin erfolgreich eingetragen: {result.summary} am {result.start}."
-                    )
-                else:
-                    log.error("Calendar booking failed", error=result.error)
-                    result_text = (
-                        "Der Termin konnte leider nicht eingetragen werden. "
-                        "Bitte versuchen Sie es später erneut."
-                    )
+            if fn_name == "book_appointment":
+                result_text = _run_booking(params)
             else:
                 result_text = f"Unbekanntes Tool: {fn_name}"
 
@@ -331,36 +349,16 @@ async def voice_webhook(request: Request):
 
         return {"results": results}
 
-    # ── Appointment booking — legacy Vapi format: function-call ───────────────
-    # Older Vapi setups; response must be {"result": "..."}
+    # ── Legacy Vapi format: function-call ─────────────────────────────────────
+    # Response must be {"result": "..."}
     if event_type == "function-call":
         fn = msg.get("functionCall", {})
-        if fn.get("name") == "book_appointment" and _CALENDAR_TOOL is not None:
-            params = fn.get("parameters", {})
-            result = _CALENDAR_TOOL.book(
-                date=params.get("date", ""),
-                time=params.get("time", ""),
-                name=params.get("name", ""),
-                company=params.get("company", ""),
-                phone=params.get("phone", ""),
-                topic=params.get("topic", ""),
-            )
-            if result.success:
-                log.info("Appointment booked", event_id=result.event_id, start=result.start)
-                return {
-                    "result": (
-                        f"Termin erfolgreich eingetragen: {result.summary} "
-                        f"am {result.start}."
-                    )
-                }
-            else:
-                log.error("Calendar booking failed", error=result.error)
-                return {
-                    "result": (
-                        "Der Termin konnte leider nicht eingetragen werden. "
-                        "Bitte versuchen Sie es später erneut."
-                    )
-                }
+        fn_name = fn.get("name", "")
+        # parameters may be a dict or a JSON string depending on Vapi version
+        params = _parse_vapi_params(fn.get("parameters", {}))
+
+        if fn_name == "book_appointment":
+            return {"result": _run_booking(params)}
 
     # ── Post-call SDR handoff ─────────────────────────────────────────────────
     if event_type == "end-of-call-report":
