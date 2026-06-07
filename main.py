@@ -102,8 +102,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if not settings.is_production else [],
-    allow_methods=["POST", "GET"],
+    allow_origins=["*"],           # Vapi und ngrok müssen immer durchkommen
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -322,54 +322,86 @@ def _run_booking(params: dict) -> str:
     summary="Vapi Server Webhook (end-of-call-report, function-call, tool-calls)",
 )
 async def voice_webhook(request: Request):
-    body = await request.json()
-    msg = body.get("message", {})
-    event_type = msg.get("type", "")
+    # ── JSON-Parse (Vapi schickt manchmal kaputte Bodies) ─────────────────────
+    try:
+        body = await request.json()
+    except Exception as parse_exc:
+        log.warning("Vapi webhook: ungültiger JSON-Body", error=str(parse_exc))
+        return {"received": False, "error": "invalid JSON body"}
 
-    # Full payload logged at INFO so Railway shows exact keys Vapi sends
-    log.info("Vapi webhook received", event_type=event_type, payload=body)
+    try:
+        msg = body.get("message", {})
+        event_type = msg.get("type", "")
 
-    # ── New Vapi format: tool-calls ───────────────────────────────────────────
-    # Response must be {"results": [{"toolCallId": "...", "result": "..."}]}
-    if event_type == "tool-calls":
-        tool_call_list = msg.get("toolCallList", [])
-        results = []
-        for tc in tool_call_list:
-            call_id = tc.get("id", "")
-            fn = tc.get("function", {})
+        # Full payload logged at INFO so Railway shows exact keys Vapi sends
+        log.info("Vapi webhook received", event_type=event_type, payload=body)
+
+        # ── New Vapi format: tool-calls ───────────────────────────────────────
+        # Response must be {"results": [{"toolCallId": "...", "result": "..."}]}
+        if event_type == "tool-calls":
+            tool_call_list = msg.get("toolCallList", [])
+            results = []
+            for tc in tool_call_list:
+                call_id = tc.get("id", "")
+                fn = tc.get("function", {})
+                fn_name = fn.get("name", "")
+                params = _parse_vapi_params(fn.get("arguments", {}))
+
+                try:
+                    if fn_name == "book_appointment":
+                        result_text = _run_booking(params)
+                    else:
+                        result_text = f"Unbekanntes Tool: {fn_name}"
+                except Exception as tool_exc:
+                    log.error("Tool-Ausführung fehlgeschlagen", tool=fn_name, error=str(tool_exc))
+                    result_text = "Ein interner Fehler ist aufgetreten. Bitte versuchen Sie es erneut."
+
+                results.append({"toolCallId": call_id, "result": result_text})
+
+            return {"results": results}
+
+        # ── Legacy Vapi format: function-call ─────────────────────────────────
+        # Response must be {"result": "..."}
+        if event_type == "function-call":
+            fn = msg.get("functionCall", {})
             fn_name = fn.get("name", "")
-            params = _parse_vapi_params(fn.get("arguments", {}))
+            # parameters may be a dict or a JSON string depending on Vapi version
+            params = _parse_vapi_params(fn.get("parameters", {}))
 
-            if fn_name == "book_appointment":
-                result_text = _run_booking(params)
-            else:
-                result_text = f"Unbekanntes Tool: {fn_name}"
+            try:
+                if fn_name == "book_appointment":
+                    return {"result": _run_booking(params)}
+            except Exception as fn_exc:
+                log.error("Function-Call fehlgeschlagen", function=fn_name, error=str(fn_exc))
+                return {"result": "Ein interner Fehler ist aufgetreten. Bitte versuchen Sie es erneut."}
 
-            results.append({"toolCallId": call_id, "result": result_text})
+        # ── Post-call SDR handoff (fire & forget im Thread-Pool) ─────────────
+        if event_type == "end-of-call-report":
+            transcript = msg.get("transcript", "")
+            session_id = msg.get("call", {}).get("id", str(uuid.uuid4()))
+            if transcript and _AGENT_REGISTRY.get("sdr"):
+                import asyncio
 
-        return {"results": results}
+                sdr = _AGENT_REGISTRY["sdr"]
+                req = AgentRequest(text=transcript, session_id=session_id)
 
-    # ── Legacy Vapi format: function-call ─────────────────────────────────────
-    # Response must be {"result": "..."}
-    if event_type == "function-call":
-        fn = msg.get("functionCall", {})
-        fn_name = fn.get("name", "")
-        # parameters may be a dict or a JSON string depending on Vapi version
-        params = _parse_vapi_params(fn.get("parameters", {}))
+                async def _run_sdr_bg():
+                    try:
+                        loop = asyncio.get_running_loop()
+                        await loop.run_in_executor(None, sdr.process, req)
+                        log.info("Voice call → SDR Agent abgeschlossen", session=session_id)
+                    except Exception as sdr_exc:
+                        log.error("SDR-Hintergrundtask fehlgeschlagen", error=str(sdr_exc))
 
-        if fn_name == "book_appointment":
-            return {"result": _run_booking(params)}
+                asyncio.create_task(_run_sdr_bg())
+                log.info("Voice call → SDR Agent gestartet (async)", session=session_id)
 
-    # ── Post-call SDR handoff ─────────────────────────────────────────────────
-    if event_type == "end-of-call-report":
-        transcript = msg.get("transcript", "")
-        session_id = msg.get("call", {}).get("id", str(uuid.uuid4()))
-        if transcript and _AGENT_REGISTRY.get("sdr"):
-            sdr = _AGENT_REGISTRY["sdr"]
-            sdr.process(AgentRequest(text=transcript, session_id=session_id))
-            log.info("Voice call → SDR Agent triggered", session=session_id)
+        return {"received": True}
 
-    return {"received": True}
+    except Exception as exc:
+        # Letzte Absicherung: niemals HTTP 500 an Vapi zurückgeben
+        log.error("Vapi webhook: unbehandelter Fehler", error=str(exc), exc_info=True)
+        return {"received": False, "error": "internal server error"}
 
 
 # ── Dev Runner ────────────────────────────────────────────────────────────────
