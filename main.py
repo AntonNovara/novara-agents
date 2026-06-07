@@ -5,6 +5,7 @@ Alle Agenten werden über /api/v1/agents/{agent_type}/process angesprochen.
 API-Key-Authentifizierung über X-API-Key Header (aus .env).
 Strukturiertes JSON-Logging für alle Requests (DSGVO-Audit-Trail).
 """
+import json
 import logging
 import sys
 import time
@@ -285,17 +286,56 @@ async def voice_chat_completions(request: Request):
 @app.post(
     "/api/v1/voice/webhook",
     tags=["Voice"],
-    summary="Vapi Server Webhook (end-of-call-report, function-call)",
+    summary="Vapi Server Webhook (end-of-call-report, function-call, tool-calls)",
 )
 async def voice_webhook(request: Request):
     body = await request.json()
     msg = body.get("message", {})
     event_type = msg.get("type", "")
 
-    # ── Appointment booking via Vapi function-call ────────────────────────────
+    # ── Appointment booking — new Vapi format: tool-calls ─────────────────────
+    # Vapi sends this for server-side tools; response must be {"results": [...]}
+    if event_type == "tool-calls":
+        tool_call_list = msg.get("toolCallList", [])
+        results = []
+        for tc in tool_call_list:
+            call_id = tc.get("id", "")
+            fn_name = tc.get("function", {}).get("name", "")
+            raw_args = tc.get("function", {}).get("arguments", "{}")
+            params = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+
+            if fn_name == "book_appointment" and _CALENDAR_TOOL is not None:
+                result = _CALENDAR_TOOL.book(
+                    date=params.get("date", ""),
+                    time=params.get("time", ""),
+                    name=params.get("name", ""),
+                    company=params.get("company", ""),
+                    phone=params.get("phone", ""),
+                    topic=params.get("topic", ""),
+                )
+                if result.success:
+                    log.info("Appointment booked", event_id=result.event_id, start=result.start)
+                    result_text = (
+                        f"Termin erfolgreich eingetragen: {result.summary} am {result.start}."
+                    )
+                else:
+                    log.error("Calendar booking failed", error=result.error)
+                    result_text = (
+                        "Der Termin konnte leider nicht eingetragen werden. "
+                        "Bitte versuchen Sie es später erneut."
+                    )
+            else:
+                result_text = f"Unbekanntes Tool: {fn_name}"
+
+            results.append({"toolCallId": call_id, "result": result_text})
+
+        return {"results": results}
+
+    # ── Appointment booking — legacy Vapi format: function-call ───────────────
+    # Older Vapi setups; response must be {"result": "..."}
     if event_type == "function-call":
         fn = msg.get("functionCall", {})
-        if fn.get("name") == "book_appointment":
+        if fn.get("name") == "book_appointment" and _CALENDAR_TOOL is not None:
             params = fn.get("parameters", {})
             result = _CALENDAR_TOOL.book(
                 date=params.get("date", ""),
@@ -306,11 +346,7 @@ async def voice_webhook(request: Request):
                 topic=params.get("topic", ""),
             )
             if result.success:
-                log.info(
-                    "Appointment booked",
-                    event_id=result.event_id,
-                    start=result.start,
-                )
+                log.info("Appointment booked", event_id=result.event_id, start=result.start)
                 return {
                     "result": (
                         f"Termin erfolgreich eingetragen: {result.summary} "

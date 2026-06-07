@@ -7,6 +7,7 @@ Uses OAuth2 with a long-lived refresh token from environment variables:
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -79,7 +80,8 @@ class GoogleCalendarTool:
             BookingResult with event details or error information
         """
         try:
-            start_dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
+            tz = ZoneInfo(timezone)
+            start_dt = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
             end_dt = start_dt + timedelta(minutes=duration_minutes)
 
             event_body = {

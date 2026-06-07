@@ -13,5 +13,5 @@ def load_novara_wissen() -> str:
     path = _ROOT / "novara_wissen.txt"
     try:
         return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except OSError:
         return "(Wissensdatenbank nicht gefunden — bitte novara_wissen.txt im Projektverzeichnis ablegen)"
