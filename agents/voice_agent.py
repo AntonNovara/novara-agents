@@ -8,7 +8,7 @@ Keine JSON-Ausgabe — konversationelle, kurze Sätze für TTS geeignet.
 import json
 import time
 import uuid
-from typing import Iterator
+from typing import Iterator, Any
 
 import anthropic
 
@@ -51,6 +51,44 @@ class VoiceAgent:
         self._client = anthropic.Anthropic(
             api_key=settings.anthropic_api_key.get_secret_value()
         )
+
+    def complete(self, messages: list[dict]) -> dict[str, Any]:
+        """Nicht-streamende Antwort im OpenAI chat.completion Format (für stream=false)."""
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+        created = int(time.time())
+        model = settings.anthropic_model
+
+        anthropic_messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in messages
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+
+        try:
+            response = self._client.messages.create(
+                model=model,
+                system=_SYSTEM_PROMPT,
+                messages=anthropic_messages,
+                max_tokens=300,
+            )
+            content = response.content[0].text if response.content else ""
+        except Exception:
+            content = "Entschuldigung, da ist kurz etwas schiefgelaufen. Können Sie das bitte wiederholen?"
+
+        return {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
 
     def stream(self, messages: list[dict]) -> Iterator[str]:
         """

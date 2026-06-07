@@ -18,7 +18,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Securi
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from agents.base_agent import AgentRequest, AgentResponse
 from agents.onboarding_agent import OnboardingAgent
@@ -264,13 +264,35 @@ async def process_invoice_file(
 @app.post(
     "/api/v1/voice/chat/chat/completions",
     tags=["Voice"],
-    summary="Vapi Custom LLM – OpenAI-kompatibler Streaming-Endpunkt",
+    summary="Vapi Custom LLM – OpenAI-kompatibler Endpunkt (streaming + non-streaming)",
 )
 async def voice_chat_completions(request: Request):
-    body = await request.json()
+    import asyncio
+
+    # JSON-Parse absichern — Vapi schickt manchmal kaputte Bodies
+    try:
+        body = await request.json()
+    except Exception as parse_exc:
+        log.warning("Custom LLM: ungültiger JSON-Body", error=str(parse_exc))
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+        )
+
     messages = body.get("messages", [])
     if not messages:
-        raise HTTPException(status_code=422, detail="messages array is required")
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"message": "messages array is required", "type": "invalid_request_error"}},
+        )
+
+    # Vapi sendet manchmal stream=false — dann reguläres JSON zurückgeben
+    stream_requested = body.get("stream", True)
+
+    if not stream_requested:
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _VOICE_AGENT.complete, messages)
+        return JSONResponse(content=result)
 
     return StreamingResponse(
         _VOICE_AGENT.stream(messages),
