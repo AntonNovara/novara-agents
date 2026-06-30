@@ -11,6 +11,7 @@ import uuid
 from typing import Iterator, Any
 
 import anthropic
+import httpx
 import structlog
 from anthropic import DefaultHttpxClient
 
@@ -52,15 +53,23 @@ class VoiceAgent:
     """Streaming-fähiger Konversationsagent für Telefongespräche via Vapi."""
 
     def __init__(self) -> None:
-        # HTTP/1.1 erzwingen (http2=False) verhindert Stream-Saettigung auf
-        # PaaS-Hosts wie Railway, die mit HTTP/2 zu APIConnectionError neigen.
-        # 30s-Timeout schuetzt davor, dass der Handshake sofort abreisst.
-        # DefaultHttpxClient (statt rohem httpx.Client) erhaelt die Connection-
-        # Limits der SDK. Synchroner Client -> Client, nicht AsyncClient.
+        # IPv4 erzwingen: local_address="0.0.0.0" bindet den lokalen Socket an
+        # eine IPv4-Adresse, sodass die Verbindung NICHT ueber IPv6 laeuft.
+        # Das behebt den APIConnectionError auf Railway, wo der Container einen
+        # AAAA-Record aufloest und der IPv6-Egress ins Leere laeuft.
+        # http2=False erzwingt zugleich HTTP/1.1 (verhindert Stream-Saettigung),
+        # retries=2 faengt transiente Verbindungsabbrueche ab. Der Transport
+        # traegt http2/IPv4; das 30s-Timeout sitzt auf dem Anthropic-Client.
+        # Synchroner Client -> httpx.HTTPTransport/Client, NICHT AsyncClient.
+        transport = httpx.HTTPTransport(
+            local_address="0.0.0.0",
+            http2=False,
+            retries=2,
+        )
         self._client = anthropic.Anthropic(
             api_key=settings.anthropic_api_key.get_secret_value(),
             timeout=30.0,
-            http_client=DefaultHttpxClient(http2=False),
+            http_client=DefaultHttpxClient(transport=transport),
         )
 
     def check_connectivity(self) -> dict[str, Any]:
