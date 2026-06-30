@@ -82,6 +82,10 @@ async def lifespan(app: FastAPI):
     global _AGENT_REGISTRY, _VOICE_AGENT, _CALENDAR_TOOL
     log.info("Novara Agent Factory starting", environment=settings.environment)
 
+    # Aufgeloeste Modell-ID beim Start loggen, damit ein falscher ANTHROPIC_MODEL-
+    # Env-Override in Railway sofort sichtbar ist (Ursache fuer model_not_found).
+    log.info("LLM-Modell konfiguriert", anthropic_model=settings.anthropic_model)
+
     # ANTHROPIC_API_KEY beim Start verifizieren – nicht erst beim ersten LLM-Call.
     if settings.anthropic_key_configured:
         log.info("ANTHROPIC_API_KEY geladen", source="environment")
