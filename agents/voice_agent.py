@@ -63,6 +63,30 @@ class VoiceAgent:
             http_client=DefaultHttpxClient(http2=False),
         )
 
+    def check_connectivity(self) -> dict[str, Any]:
+        """Leichter Egress-/Auth-Test gegen die Anthropic-API (kein Token-Verbrauch).
+
+        models.list prueft DNS, TLS, Egress und API-Key in einem einzigen GET.
+        Faengt alle Fehler ab und gibt error_type/error strukturiert zurueck,
+        damit ein APIConnectionError (Egress) von einem AuthenticationError klar
+        unterscheidbar ist.
+        """
+        t0 = time.perf_counter()
+        try:
+            models = self._client.models.list(limit=1)
+            return {
+                "ok": True,
+                "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+                "model_sample": models.data[0].id if models.data else None,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+
     def complete(self, messages: list[dict]) -> dict[str, Any]:
         """Nicht-streamende Antwort im OpenAI chat.completion Format (für stream=false)."""
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"

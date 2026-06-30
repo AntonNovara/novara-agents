@@ -105,6 +105,17 @@ async def lifespan(app: FastAPI):
     _VOICE_AGENT = VoiceAgent()
     _CALENDAR_TOOL = GoogleCalendarTool()
     log.info("Agent registry initialised", agents=list(_AGENT_REGISTRY.keys()))
+
+    # Egress/Auth gegen die Anthropic-API beim Start verifizieren, damit ein
+    # APIConnectionError (z. B. blockierter Egress auf Railway) sofort in den
+    # Logs steht statt erst beim ersten Anruf. Nicht fatal – nur Diagnose.
+    if settings.anthropic_key_configured:
+        check = _VOICE_AGENT.check_connectivity()
+        if check.get("ok"):
+            log.info("Anthropic-API erreichbar", **check)
+        else:
+            log.error("Anthropic-API NICHT erreichbar – Egress/Auth pruefen", **check)
+
     yield
     log.info("Novara Agent Factory shutting down")
 
@@ -180,6 +191,19 @@ async def health_check():
         "environment": settings.environment,
         "agents": list(_AGENT_REGISTRY.keys()),
     }
+
+
+@app.get("/health/llm", tags=["System"])
+async def health_llm():
+    """On-Demand-Egress-Test gegen die Anthropic-API – jederzeit per curl abrufbar,
+    ohne neu zu deployen. Unterscheidet APIConnectionError (Egress) von Auth-Fehlern."""
+    if _VOICE_AGENT is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "voice agent not initialised"})
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, _VOICE_AGENT.check_connectivity)
+    return JSONResponse(status_code=200 if result.get("ok") else 502, content=result)
 
 
 @app.get("/api/v1/agents", tags=["Agents"], dependencies=[Depends(require_api_key)])
