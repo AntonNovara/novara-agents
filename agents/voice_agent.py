@@ -11,9 +11,12 @@ import uuid
 from typing import Iterator, Any
 
 import anthropic
+import structlog
 
 from core.config import settings
 from core.knowledge import load_novara_wissen
+
+log = structlog.get_logger("novara.voice")
 
 _WISSEN = load_novara_wissen()
 
@@ -72,7 +75,13 @@ class VoiceAgent:
                 max_tokens=300,
             )
             content = response.content[0].text if response.content else ""
-        except Exception:
+        except Exception as exc:
+            log.error(
+                "Anthropic complete() fehlgeschlagen – Fallback ausgegeben",
+                model=model,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             content = "Entschuldigung, da ist kurz etwas schiefgelaufen. Können Sie das bitte wiederholen?"
 
         return {
@@ -118,6 +127,12 @@ class VoiceAgent:
                 for text in stream.text_stream:
                     yield _sse_chunk(completion_id, created, model, {"content": text}, None)
         except Exception as exc:
+            log.error(
+                "Anthropic stream() fehlgeschlagen – Fallback ausgegeben",
+                model=model,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             fallback = "Entschuldigung, da ist kurz etwas schiefgelaufen. Können Sie das bitte wiederholen?"
             yield _sse_chunk(completion_id, created, model, {"content": fallback}, None)
 
