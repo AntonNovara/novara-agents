@@ -81,6 +81,22 @@ def _build_registry() -> dict:
 async def lifespan(app: FastAPI):
     global _AGENT_REGISTRY, _VOICE_AGENT, _CALENDAR_TOOL
     log.info("Novara Agent Factory starting", environment=settings.environment)
+
+    # ANTHROPIC_API_KEY beim Start verifizieren – nicht erst beim ersten LLM-Call.
+    if settings.anthropic_key_configured:
+        log.info("ANTHROPIC_API_KEY geladen", source="environment")
+    elif settings.is_production:
+        log.error("ANTHROPIC_API_KEY fehlt oder ist Platzhalter – Abbruch in Production")
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY ist nicht gesetzt. Bitte als Environment Variable "
+            "in Railway hinterlegen (Settings → Variables)."
+        )
+    else:
+        log.warning(
+            "ANTHROPIC_API_KEY fehlt oder ist Platzhalter – LLM-Calls werden fehlschlagen",
+            environment=settings.environment,
+        )
+
     _AGENT_REGISTRY = _build_registry()
     _VOICE_AGENT = VoiceAgent()
     _CALENDAR_TOOL = GoogleCalendarTool()

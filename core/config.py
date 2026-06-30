@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     def is_production(self) -> bool:
         return self.environment == "production"
 
+    @property
+    def anthropic_key_configured(self) -> bool:
+        """True, wenn ein echter ANTHROPIC_API_KEY gesetzt ist (kein Platzhalter)."""
+        key = self.anthropic_api_key.get_secret_value().strip()
+        return bool(key) and key != "mock-key"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
