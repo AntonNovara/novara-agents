@@ -12,6 +12,7 @@ from typing import Iterator, Any
 
 import anthropic
 import structlog
+from anthropic import DefaultHttpxClient
 
 from core.config import settings
 from core.knowledge import load_novara_wissen
@@ -51,8 +52,15 @@ class VoiceAgent:
     """Streaming-fähiger Konversationsagent für Telefongespräche via Vapi."""
 
     def __init__(self) -> None:
+        # HTTP/1.1 erzwingen (http2=False) verhindert Stream-Saettigung auf
+        # PaaS-Hosts wie Railway, die mit HTTP/2 zu APIConnectionError neigen.
+        # 30s-Timeout schuetzt davor, dass der Handshake sofort abreisst.
+        # DefaultHttpxClient (statt rohem httpx.Client) erhaelt die Connection-
+        # Limits der SDK. Synchroner Client -> Client, nicht AsyncClient.
         self._client = anthropic.Anthropic(
-            api_key=settings.anthropic_api_key.get_secret_value()
+            api_key=settings.anthropic_api_key.get_secret_value(),
+            timeout=30.0,
+            http_client=DefaultHttpxClient(http2=False),
         )
 
     def complete(self, messages: list[dict]) -> dict[str, Any]:
