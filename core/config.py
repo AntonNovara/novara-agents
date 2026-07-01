@@ -1,5 +1,5 @@
 from functools import lru_cache
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +14,12 @@ class Settings(BaseSettings):
     # LLM
     anthropic_api_key: SecretStr = Field(default="mock-key", alias="ANTHROPIC_API_KEY")
     anthropic_model: str = Field(default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL")
+
+    @field_validator("anthropic_api_key", mode="before")
+    @classmethod
+    def strip_api_key(cls, v: object) -> object:
+        """Entfernt trailing Whitespace/Newlines aus dem API-Key (Railway copy-paste Fehler)."""
+        return v.strip() if isinstance(v, str) else v
 
     # API Security
     api_secret_key: SecretStr = Field(default="dev-secret", alias="API_SECRET_KEY")
