@@ -192,11 +192,16 @@ class OperationsGraph:
                     SystemMessage(content=_SYSTEM_EXTRACT),
                     HumanMessage(content=state["input_text"]),
                 ])
-                llm_data: dict = json.loads(response.content)
+                llm_data: dict = _parse_llm_json(response.content)
                 # Merge: only fill in gaps, don't override regex results
                 for field in missing_fields:
                     if llm_data.get(field) and not parsed.get(field):
                         parsed[field] = llm_data[field]
+                # Regex fallback for company_name if LLM also missed it
+                if not parsed.get("company_name"):
+                    m = re.search(r"(?:Firma|Unternehmen|Auftraggeber|Von)[:\s]+([^\n,]+)", state["input_text"], re.IGNORECASE)
+                    if m:
+                        parsed["company_name"] = m.group(1).strip()
                 llm_enriched = True
             except Exception as exc:
                 logger.warning("extract_fields LLM enrichment failed: %s", exc)
