@@ -193,6 +193,47 @@ async def health_check():
     }
 
 
+@app.get("/health/egress", tags=["System"])
+async def health_egress():
+    """Diagnosiert DNS-Auflösung und Raw-TCP-Verbindung zu api.anthropic.com.
+    Zeigt genau, ob Railway DNS, IPv4-TCP oder IPv6-TCP blockiert."""
+    import asyncio
+    import socket
+
+    host = "api.anthropic.com"
+    port = 443
+    loop = asyncio.get_running_loop()
+
+    results: dict = {}
+
+    # DNS — alle Records
+    try:
+        infos = await loop.run_in_executor(None, lambda: socket.getaddrinfo(host, port))
+        results["dns"] = {"ok": True, "addresses": [i[4][0] for i in infos[:6]]}
+    except Exception as e:
+        results["dns"] = {"ok": False, "error": str(e)}
+
+    def _tcp(family: int, label: str) -> dict:
+        try:
+            infos = socket.getaddrinfo(host, port, family)
+            if not infos:
+                return {"ok": None, "note": f"no {label} address"}
+            addr = infos[0][4]
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect(addr)
+            sock.close()
+            return {"ok": True, "addr": addr[0]}
+        except socket.gaierror as e:
+            return {"ok": None, "note": f"no {label} address", "error": str(e)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    results["tcp_ipv4"] = await loop.run_in_executor(None, _tcp, socket.AF_INET, "ipv4")
+    results["tcp_ipv6"] = await loop.run_in_executor(None, _tcp, socket.AF_INET6, "ipv6")
+    return results
+
+
 @app.get("/health/llm", tags=["System"])
 async def health_llm():
     """On-Demand-Egress-Test gegen die Anthropic-API – jederzeit per curl abrufbar,

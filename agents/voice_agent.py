@@ -6,6 +6,7 @@ Gibt OpenAI-kompatible SSE-Chunks zurück.
 Keine JSON-Ausgabe — konversationelle, kurze Sätze für TTS geeignet.
 """
 import json
+import socket as _socket
 import time
 import uuid
 from typing import Iterator, Any
@@ -17,6 +18,25 @@ from anthropic import DefaultHttpxClient
 
 from core.config import settings
 from core.knowledge import load_novara_wissen
+
+# Force IPv4 DNS for api.anthropic.com — Railway IPv6 egress fails silently.
+# httpx.HTTPTransport(local_address="0.0.0.0") was unreliable: httpcore creates
+# an AF_INET6 socket when AAAA comes first in DNS, then the IPv4 bind fails
+# without falling through to IPv4. Patching getaddrinfo before socket creation
+# ensures we only ever attempt IPv4 connections to Anthropic's API.
+_orig_getaddrinfo = _socket.getaddrinfo
+
+def _anthropic_ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+    if host and "anthropic.com" in str(host) and family == 0:
+        try:
+            results = _orig_getaddrinfo(host, port, _socket.AF_INET, type, proto, flags)
+            if results:
+                return results
+        except _socket.gaierror:
+            pass
+    return _orig_getaddrinfo(host, port, family, type, proto, flags)
+
+_socket.getaddrinfo = _anthropic_ipv4_only
 
 log = structlog.get_logger("novara.voice")
 
@@ -62,8 +82,7 @@ class VoiceAgent:
         # traegt http2/IPv4; das 30s-Timeout sitzt auf dem Anthropic-Client.
         # Synchroner Client -> httpx.HTTPTransport/Client, NICHT AsyncClient.
         transport = httpx.HTTPTransport(
-            local_address="0.0.0.0",
-            http2=False,
+            http2=False,  # HTTP/1.1 prevents stream saturation on PaaS
             retries=2,
         )
         self._client = anthropic.Anthropic(
@@ -76,9 +95,8 @@ class VoiceAgent:
         """Leichter Egress-/Auth-Test gegen die Anthropic-API (kein Token-Verbrauch).
 
         models.list prueft DNS, TLS, Egress und API-Key in einem einzigen GET.
-        Faengt alle Fehler ab und gibt error_type/error strukturiert zurueck,
-        damit ein APIConnectionError (Egress) von einem AuthenticationError klar
-        unterscheidbar ist.
+        Gibt die vollstaendige Exception-Kette zurueck, damit der Root-Cause
+        (z. B. socket.gaierror vs. ConnectionRefusedError) sichtbar ist.
         """
         t0 = time.perf_counter()
         try:
@@ -87,13 +105,21 @@ class VoiceAgent:
                 "ok": True,
                 "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
                 "model_sample": models.data[0].id if models.data else None,
+                "base_url": str(self._client.base_url),
             }
         except Exception as exc:
+            cause = exc.__cause__
+            cause2 = getattr(cause, "__cause__", None)
             return {
                 "ok": False,
                 "latency_ms": round((time.perf_counter() - t0) * 1000, 1),
                 "error_type": type(exc).__name__,
-                "error": str(exc),
+                "error": str(exc)[:300],
+                "cause_type": type(cause).__name__ if cause else None,
+                "cause": str(cause)[:300] if cause else None,
+                "cause2_type": type(cause2).__name__ if cause2 else None,
+                "cause2": str(cause2)[:300] if cause2 else None,
+                "base_url": str(self._client.base_url),
             }
 
     def complete(self, messages: list[dict]) -> dict[str, Any]:
