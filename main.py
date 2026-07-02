@@ -371,6 +371,17 @@ async def voice_chat_completions(request: Request):
             content={"error": {"message": "messages array is required", "type": "invalid_request_error"}},
         )
 
+    # Vapi schickt sein Dashboard-Modell im Body mit — wir ignorieren es komplett
+    # und erzwingen immer settings.anthropic_model, damit veraltete/ungültige
+    # Modell-Namen aus dem Vapi-Dashboard keinen 404 auf Anthropic-Seite auslösen.
+    vapi_model = body.get("model", "")
+    if vapi_model and vapi_model != settings.anthropic_model:
+        log.warning(
+            "Vapi-Modell überschrieben – verwende eigenes Modell",
+            vapi_model=vapi_model,
+            using=settings.anthropic_model,
+        )
+
     # Vapi sendet manchmal stream=false — dann reguläres JSON zurückgeben
     stream_requested = body.get("stream", True)
 
