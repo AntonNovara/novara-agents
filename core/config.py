@@ -13,7 +13,7 @@ class Settings(BaseSettings):
 
     # LLM
     anthropic_api_key: SecretStr = Field(default="mock-key", alias="ANTHROPIC_API_KEY")
-    anthropic_model: str = Field(default="claude-3-5-sonnet-latest", alias="ANTHROPIC_MODEL")
+    anthropic_model: str = Field(default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL")
 
     @field_validator("anthropic_api_key", mode="before")
     @classmethod

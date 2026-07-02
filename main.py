@@ -193,6 +193,25 @@ async def health_check():
     }
 
 
+@app.get("/health/models", tags=["System"])
+async def health_models():
+    """Listet alle auf diesem Anthropic-Account verfügbaren Modelle auf."""
+    if _VOICE_AGENT is None:
+        return JSONResponse(status_code=503, content={"ok": False, "error": "voice agent not initialised"})
+    import asyncio
+    loop = asyncio.get_running_loop()
+
+    def _list_models():
+        try:
+            models = _VOICE_AGENT._client.models.list()
+            return {"ok": True, "models": [m.id for m in models.data], "configured": settings.anthropic_model}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc), "configured": settings.anthropic_model}
+
+    result = await loop.run_in_executor(None, _list_models)
+    return JSONResponse(status_code=200 if result.get("ok") else 502, content=result)
+
+
 @app.get("/health/egress", tags=["System"])
 async def health_egress():
     """Diagnosiert DNS-Auflösung und Raw-TCP-Verbindung zu api.anthropic.com.
