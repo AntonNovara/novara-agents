@@ -7,10 +7,13 @@ Strukturiertes JSON-Logging für alle Requests (DSGVO-Audit-Trail).
 """
 import json
 import logging
+import re
 import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import structlog
@@ -420,6 +423,77 @@ async def voice_chat_completions(request: Request):
     )
 
 
+def _save_call_markdown(session_id: str, transcript: str, sdr_response, call_msg: dict) -> None:
+    """Speichert Transkript + SDR-Ergebnis als Markdown-Datei für Claude Cowork.
+
+    Zielordner: settings.calls_export_dir (Standard ~/novara-calls).
+    Dateiname:  YYYY-MM-DD_HH-MM_<Firma>.md
+    Auf Railway ist der Ordner flüchtig; für Persistenz Railway-Volume unter
+    /novara-calls einbinden und CALLS_EXPORT_DIR=/novara-calls setzen.
+    """
+    try:
+        export_dir = Path(settings.calls_export_dir).expanduser()
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now(timezone.utc)
+        date_str = now.strftime("%Y-%m-%d_%H-%M")
+
+        # Firmenname aus SDR-Ergebnis, sonst Session-ID als Fallback
+        company = ""
+        sdr_block = ""
+        if sdr_response and sdr_response.success:
+            r = sdr_response.result
+            company = r.get("company_name", "")
+            qualified = r.get("qualified", False)
+            score = r.get("lead_score", "–")
+            outreach = r.get("outreach") or {}
+            next_steps = r.get("next_steps") or []
+
+            sdr_block = f"""
+## SDR-Analyse
+
+| | |
+|---|---|
+| **Lead-Score** | {score}/100 |
+| **Qualifiziert** | {"✅ Ja" if qualified else "❌ Nein"} |
+| **Firma** | {r.get("company_name", "–")} |
+| **Kontakt** | {r.get("contact_name", "–")} ({r.get("contact_title", "–")}) |
+| **Kanal** | {outreach.get("channel", "–")} |
+
+### Outreach-Entwurf
+**Betreff:** {outreach.get("subject", "–")}
+
+{outreach.get("body", "– kein Entwurf –")}
+
+### Empfohlene Next Steps
+{"".join(f"- {ns}{chr(10)}" for ns in next_steps) or "– keine –"}
+"""
+
+        safe_name = re.sub(r"[^\w\-]", "-", company)[:40] if company else session_id[:8]
+        filepath = export_dir / f"{date_str}_{safe_name}.md"
+
+        call_duration = call_msg.get("call", {}).get("endedAt", "")
+        md = f"""# Novara Anruf-Protokoll
+
+| | |
+|---|---|
+| **Datum** | {now.strftime("%d.%m.%Y %H:%M")} UTC |
+| **Session** | `{session_id}` |
+| **Ende** | {call_duration or "–"} |
+{sdr_block}
+---
+
+## Gesprächstranskript
+
+{transcript.strip() or "– kein Transkript übermittelt –"}
+"""
+        filepath.write_text(md, encoding="utf-8")
+        log.info("Post-Call Markdown gespeichert", path=str(filepath), session=session_id)
+
+    except Exception as exc:
+        log.error("Post-Call Markdown konnte nicht gespeichert werden", error=str(exc), session=session_id)
+
+
 def _parse_vapi_params(raw) -> dict:
     """Normalise Vapi parameters/arguments — may arrive as dict or JSON string."""
     if isinstance(raw, str):
@@ -525,8 +599,12 @@ async def voice_webhook(request: Request):
                 async def _run_sdr_bg():
                     try:
                         loop = asyncio.get_running_loop()
-                        await loop.run_in_executor(None, sdr.process, req)
+                        sdr_response = await loop.run_in_executor(None, sdr.process, req)
                         log.info("Voice call → SDR Agent abgeschlossen", session=session_id)
+                        # Post-Call: Markdown für Claude Cowork speichern
+                        await loop.run_in_executor(
+                            None, _save_call_markdown, session_id, transcript, sdr_response, msg
+                        )
                     except Exception as sdr_exc:
                         log.error("SDR-Hintergrundtask fehlgeschlagen", error=str(sdr_exc))
 
@@ -539,6 +617,34 @@ async def voice_webhook(request: Request):
         # Letzte Absicherung: niemals HTTP 500 an Vapi zurückgeben
         log.error("Vapi webhook: unbehandelter Fehler", error=str(exc), exc_info=True)
         return {"received": False, "error": "internal server error"}
+
+
+# ── Post-Call Protokolle ──────────────────────────────────────────────────────
+
+@app.get("/api/v1/calls", tags=["Calls"], dependencies=[Depends(require_api_key)])
+async def list_calls():
+    """Listet alle gespeicherten Anruf-Protokolle (für Claude Cowork / Railway-Zugriff)."""
+    export_dir = Path(settings.calls_export_dir).expanduser()
+    if not export_dir.exists():
+        return {"calls": [], "export_dir": str(export_dir), "count": 0}
+    files = sorted(export_dir.glob("*.md"), reverse=True)
+    return {
+        "calls": [{"filename": f.name, "bytes": f.stat().st_size} for f in files[:100]],
+        "export_dir": str(export_dir),
+        "count": len(files),
+    }
+
+
+@app.get("/api/v1/calls/{filename}", tags=["Calls"], dependencies=[Depends(require_api_key)])
+async def get_call(filename: str):
+    """Gibt den Markdown-Inhalt eines Anruf-Protokolls zurück."""
+    if not re.match(r"^[\w\-]+\.md$", filename):
+        raise HTTPException(status_code=400, detail="Ungültiger Dateiname")
+    export_dir = Path(settings.calls_export_dir).expanduser()
+    filepath = export_dir / filename
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Protokoll nicht gefunden")
+    return {"filename": filename, "content": filepath.read_text(encoding="utf-8")}
 
 
 # ── Dev Runner ────────────────────────────────────────────────────────────────

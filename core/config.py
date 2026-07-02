@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     log_format: str = Field(default="json", alias="LOG_FORMAT")
 
+    # Post-Call Export (Claude Cowork Brücke)
+    calls_export_dir: str = Field(default="~/novara-calls", alias="CALLS_EXPORT_DIR")
+
     # Runtime
     environment: str = Field(default="development", alias="ENVIRONMENT")
 
