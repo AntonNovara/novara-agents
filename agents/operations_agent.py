@@ -26,7 +26,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import END, StateGraph
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
@@ -95,11 +95,43 @@ class InvoiceExtraction(BaseModel):
     invoice_date: Optional[str] = None
     invoice_number: Optional[str] = None
 
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _coerce_amount(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            parsed = DocumentParser._parse_amount(v)
+            if parsed is None:
+                raise ValueError(f"unparseable amount: {v!r}")
+            return parsed
+        return v
+
+
+def _coerce_llm_extraction(raw: dict) -> dict:
+    """
+    Validate each field of the LLM's raw extraction against InvoiceExtraction
+    independently, so one invalid field (e.g. an unparseable amount) doesn't
+    discard other fields that were extracted correctly.
+    """
+    coerced: dict = {}
+    for field_name in InvoiceExtraction.model_fields:
+        if field_name not in raw:
+            continue
+        try:
+            coerced[field_name] = getattr(
+                InvoiceExtraction(**{field_name: raw[field_name]}), field_name
+            )
+        except ValidationError as exc:
+            logger.warning(
+                "extract_fields: LLM field %r failed schema validation: %s",
+                field_name, exc,
+            )
+    return coerced
+
 
 _SYSTEM_EXTRACT = f"""\
 Du bist ein Dokumentenverarbeitungs-Assistent bei Novara Automation (Wien, Österreich).
 Novara stellt Rechnungen nach folgendem Schema aus (aus der Wissensdatenbank):
-  - Rechnungsnummern: RE-2026-001, RE-2026-002, ... (sequentiell)
+  - Rechnungsnummern: NA-2026-001, NA-2026-002, ... (sequentiell)
   - Kleinunternehmer — kein USt-Ausweis (§6 Abs. 1 Z 27 UStG)
   - Zahlungsmodell: 50% Anzahlung + 50% bei Übergabe
   - Pakete: Starter €990, Growth €2.490, Retainer €590/Monat
@@ -193,15 +225,12 @@ class OperationsGraph:
                     HumanMessage(content=state["input_text"]),
                 ])
                 raw_llm_data = _parse_llm_json(response.content)
-                try:
-                    # Validate/coerce against the schema before trusting it —
-                    # an LLM isn't guaranteed to honor the requested types
-                    # (e.g. amount as a string), and downstream code assumes
-                    # amount is a real number.
-                    llm_data = InvoiceExtraction(**raw_llm_data).model_dump()
-                except ValidationError as exc:
-                    logger.warning("extract_fields: LLM output failed schema validation: %s", exc)
-                    llm_data = {}
+                # Validate/coerce each field against the schema before trusting
+                # it — an LLM isn't guaranteed to honor the requested types
+                # (e.g. amount as a German-formatted string), and downstream
+                # code assumes amount is a real number. Fields are validated
+                # independently so one bad field doesn't discard the rest.
+                llm_data = _coerce_llm_extraction(raw_llm_data)
                 # Merge: only fill in gaps, don't override regex results
                 for field in missing_fields:
                     if llm_data.get(field) and not parsed.get(field):
