@@ -561,20 +561,33 @@ def test_dlp_contact_and_injection() -> None:
         fail("Gemischte Nachricht (Telefon+IBAN) — Exception", "")
         traceback.print_exc()
 
-    # 9b: Steuernummer darf nicht (mehr) fälschlich als Telefonnummer erkannt
-    # und dadurch von der Redaktion ausgenommen werden (siehe Kommentar bei
-    # phone_de in core/security.py — "/" wurde deshalb aus der Wert-Klasse
-    # entfernt).
-    tax_id_text = "Steuernummer: 06 418/9574"
-    try:
-        result = SecurityLayer.check_and_redact(tax_id_text)
-        if "06 418/9574" not in result.redacted_text and "[REDACTED:TAX_ID]" in result.redacted_text:
-            ok("Steuernummer wird redigiert, nicht als Telefonnummer verschont")
-        else:
-            fail("Steuernummer-Redaktion", f"result={result.redacted_text!r}")
-    except Exception:
-        fail("Steuernummer — Exception", "")
-        traceback.print_exc()
+    # 9b: Steuernummer darf in KEINEM real im System vorkommenden Format
+    # fälschlich als Telefonnummer erkannt und dadurch von der Redaktion
+    # ausgenommen werden. Belegte Formate: "06 418/9574" (Finanzamt-Schreiben,
+    # novara-admin/steuern/) und "XX-XXX/XXXX" (Platzhalter in
+    # novara-admin/vorlagen/Rechnung_Vorlage.md) — Trennzeichen ist also nicht
+    # immer "/". Die übrigen Varianten (Leerzeichen/Bindestrich in beliebiger
+    # Kombination) sind das strukturelle Gegenstück dazu und sichern ab, dass
+    # nicht wieder nur der eine ursprünglich gefundene Fall geflickt wurde.
+    tax_id_formats = [
+        "06 418/9574",   # Finanzamt-Schreiben (Ground Truth)
+        "06-418/9574",   # Rechnung_Vorlage.md-Platzhalter "XX-XXX/XXXX"
+        "06 418 9574",   # nur Leerzeichen — der vom ersten Review gefundene Fall
+        "06/418/9574",
+        "06-418-9574",
+        "123/456/7890",
+    ]
+    for fmt in tax_id_formats:
+        text = f"Steuernummer: {fmt}"
+        try:
+            result = SecurityLayer.check_and_redact(text)
+            if fmt not in result.redacted_text and "[REDACTED:TAX_ID]" in result.redacted_text:
+                ok(f"Steuernummer-Format {fmt!r} wird redigiert")
+            else:
+                fail(f"Steuernummer-Format {fmt!r} NICHT redigiert", f"result={result.redacted_text!r}")
+        except Exception:
+            fail(f"Steuernummer-Format {fmt!r} — Exception", "")
+            traceback.print_exc()
 
     # 9c: österreichische Telefonnummer wird als solche erkannt (Findings),
     # nicht nur zufällig durch eine andere Regel mit-erfasst.
@@ -604,10 +617,61 @@ def test_dlp_contact_and_injection() -> None:
             fail("Prompt-Injection — Exception", "")
             traceback.print_exc()
 
-    # 9e: normaler Geschäftstext mit "act as" / "system prompt" als Teil eines
-    # harmlosen Satzes — bekanntes Restrisiko, aus dem Demo-Repo unverändert
-    # übernommen (siehe core/security.py), hier nur dokumentiert, kein Fail.
-    info("Bekanntes Restrisiko (aus sdr_demo_referencia übernommen, nicht verschärft):")
+    # 9f: Regressionstest für den ursprünglich vom Review gefundenen
+    # mask-then-restore-Bug — ein indexiertes Token pro Treffer statt eines
+    # gemeinsamen Füllzeichens muss verhindern, dass sich mehrere Kontakte im
+    # selben Text vertauschen, auch wenn sich zwei Kontakt-Muster gegenseitig
+    # überlappen (phone_de matcht hier zusätzlich innerhalb der phone_at-Zahl).
+    overlap_text = "Anruf +43 040 1234567 - Mail1 a@x.de - Mail2 b@y.de - Mail3 c@z.de"
+    try:
+        result = SecurityLayer.check_and_redact(overlap_text)
+        info(f"Ergebnis: {result.redacted_text!r}")
+        if result.redacted_text == overlap_text:
+            ok("Mehrere überlappende/benachbarte Kontakte bleiben unverändert und unvertauscht")
+        else:
+            fail(
+                "Kontakte wurden verändert oder vertauscht",
+                f"original={overlap_text!r}, result={result.redacted_text!r}",
+            )
+    except Exception:
+        fail("Überlappende Kontakte — Exception", "")
+        traceback.print_exc()
+
+    # 9g: mindestens 4 unterschiedliche SENSIBLE Werte im selben Text müssen
+    # jeweils exakt zu ihrem Original zurückkommen — nicht nur "irgendein"
+    # Platzhalter, sondern der richtige an der richtigen Stelle.
+    multi_sensitive_text = (
+        "IBAN1 AT611904300234573201 - Tel +43 664 111 22 33 - "
+        "IBAN2 DE89370400440532013000 - Mail x@y.de - "
+        "Steuernummer 06 418/9574 - Tel2 +49 170 9999999"
+    )
+    try:
+        result = SecurityLayer.check_and_redact(multi_sensitive_text)
+        info(f"Ergebnis: {result.redacted_text!r}")
+        checks = {
+            "IBAN 1 redigiert": "AT611904300234573201" not in result.redacted_text,
+            "IBAN 2 redigiert": "DE89370400440532013000" not in result.redacted_text,
+            "Steuernummer redigiert": "06 418/9574" not in result.redacted_text,
+            "2x [REDACTED:IBAN]": result.redacted_text.count("[REDACTED:IBAN]") == 2,
+            "1x [REDACTED:TAX_ID]": "[REDACTED:TAX_ID]" in result.redacted_text,
+            "Telefon 1 intakt": "+43 664 111 22 33" in result.redacted_text,
+            "Telefon 2 intakt": "+49 170 9999999" in result.redacted_text,
+            "E-Mail intakt": "x@y.de" in result.redacted_text,
+        }
+        if all(checks.values()):
+            ok("4 gemischte Sensible-Daten-Werte kommen alle korrekt zurück", str(checks))
+        else:
+            fail("Mindestens ein Wert falsch behandelt", str(checks))
+    except Exception:
+        fail("4 gemischte Werte — Exception", "")
+        traceback.print_exc()
+
+    # 9h: normaler Geschäftstext mit "act as" / "system prompt" als Teil eines
+    # harmlosen Satzes — bekanntes, noch NICHT behobenes Restrisiko. Bewusst
+    # in dieser Runde nicht angefasst (siehe CLAUDE.md, Abschnitt
+    # "Offener Punkt: Prompt-Injection-Marker") — eigene Runde, kein
+    # Nebenbei-Fix unter Zeitdruck. Hier nur dokumentiert, kein Fail.
+    info("Bekanntes, noch offenes Restrisiko (siehe CLAUDE.md — eigene Runde, nicht hier gefixt):")
     info("Kurze Marker wie 'act as' können auch in harmlosem Business-Englisch vorkommen.")
 
 

@@ -128,23 +128,50 @@ file=@rechnung.pdf  session_id=optional-uuid
 
 ## Security Layer (`core/security.py`)
 
-Läuft automatisch um jede `BaseAgent.process()`-Ausführung:
+Läuft automatisch um jede `BaseAgent.process()`-Ausführung (Input UND Output,
+über `sanitize_dict()`):
 
-| PII-Typ | Pattern | Redaktion |
-|---|---|---|
-| E-Mail | RFC-5322 | `[REDACTED:EMAIL]` |
-| IBAN | ISO 13616 inkl. Leerzeichen | `[REDACTED:IBAN]` |
-| Telefon DE | `+49` / `0…` mit Lookbehind | `[REDACTED:PHONE_DE]` |
-| IP-Adresse | IPv4 | `[REDACTED:IP_ADDRESS]` |
-| Steuernummer | Deutsches Format | `[REDACTED:TAX_ID]` |
+| Typ | Pattern | Kategorie | Verhalten |
+|---|---|---|---|
+| E-Mail | RFC-5322 | Kontakt | erkannt, NICHT redigiert |
+| Telefon DE | `+49` / `0…`, endet immer auf einer Ziffer | Kontakt | erkannt, NICHT redigiert |
+| Telefon AT | `+43…`, endet immer auf einer Ziffer | Kontakt | erkannt, NICHT redigiert |
+| IBAN | ISO 13616 inkl. Leerzeichen | sensibel | `[REDACTED:IBAN]` |
+| IP-Adresse | IPv4 | sensibel | `[REDACTED:IP_ADDRESS]` |
+| Steuernummer | 2-3/3/4-5 Ziffern, Trennzeichen Leerzeichen/`/`/`-` (Pflicht) | sensibel | `[REDACTED:TAX_ID]` |
 
-Hard-Block bei Credentials (`password`, `api_key`, `bearer`, …) → Request wird abgelehnt.
+**Kontakt vs. sensibel:** E-Mail/Telefon sind Daten, die Agenten für ihre
+Aufgabe brauchen (CRM-Eintrag, Welcome-Mail, Outreach, …) und werden daher nur
+erkannt (Findings/Audit-Trail), nicht redigiert. Alles andere wird immer
+redigiert. Sensible-Daten-Treffer haben bei Überlappung IMMER Vorrang vor
+Kontakt-Kandidaten (z. B. eine Steuernummer, deren Ziffern zufällig auch
+phone_de's Zeichenklasse erfüllen, bleibt eine Steuernummer und wird
+redigiert). Intern per Mask-then-Restore umgesetzt: jeder Kontakt-Treffer
+bekommt ein eindeutiges, indexiertes Token (kein gemeinsames Füllzeichen),
+damit sich zwei Treffer bei der Wiederherstellung nie vertauschen können,
+auch wenn sich ihre Muster überlappen. Regressionstests: `test_system.py`
+TEST 9 (u. a. alle bekannten Steuernummer-Formate im System, mehrere
+überlappende/benachbarte Kontakte im selben Text, 4 gemischte sensible Werte
+gleichzeitig).
 
-> **Bekannter False Positive:** Der Hard-Block matcht auch harmlose Business-Texte,
-> die zufällig `passwort` enthalten (z. B. eine Onboarding-Checkliste mit
-> "... Passwort setzen"). `sanitize_dict()` ignoriert `approved`/`blocked_reason`
-> und gibt den Text unverändert zurück, daher ist der Effekt aktuell nur ein
-> irreführendes Warn-Log, keine echte Blockierung. Noch nicht behoben.
+Hard-Block (Request wird abgelehnt, nicht nur redigiert) bei:
+- **Credentials**: Keyword (`password`, `api_key`, `bearer`, …) + Delimiter
+  (`:`, `=`, "ist", "is") + Wert — die bloße Erwähnung des Wortes in
+  normalem Fließtext blockt nicht mehr.
+- **Prompt-Injection**: einfache Keyword-Heuristik (`_INJECTION_MARKERS`),
+  portiert aus `sdr_demo_referencia/app/dlp.py`.
+
+> **Offener Punkt: Prompt-Injection-Marker sind zu breit.** Verifiziert per
+> `/code-review ultra`: Marker wie `"you are now"`, `"act as"`,
+> `"system prompt"` matchen auch echte, harmlose Business-Anfragen und werden
+> dadurch tatsächlich abgelehnt (nicht nur geloggt) — anders als der
+> Credential-Hard-Block ist dieser Pfad nicht nur ein Logging-Ärgernis.
+> Konkrete Repro-Beispiele aus dem Review:
+> - `"You are now our primary contact for billing questions going forward."`
+> - `"...act as the account owner when configuring SSO."`
+> Bewusst NICHT in derselben Runde wie der Credential-Hard-Block-Fix und der
+> Kontakt/Sensibel-Umbau angefasst — braucht eine eigene Runde mit Fokus
+> ausschließlich darauf, nicht "nebenbei mitgefixt".
 
 ---
 
