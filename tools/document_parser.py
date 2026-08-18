@@ -137,9 +137,10 @@ class DocumentParser:
         (1,234.56) format.
 
         Both separators present → the rightmost one is the decimal separator.
-        Only one separator present → it's the decimal separator if exactly
-        two digits follow it (e.g. "1234,56" / "1234.56"), otherwise it's a
-        thousands separator with no cents (e.g. "1,234" / "1.234" → 1234).
+        Only one separator present → it's the decimal separator if one or
+        two digits follow it (e.g. "1234,5" / "1234,56" / "1234.5" /
+        "1234.56"), otherwise it's a thousands separator with no cents
+        (e.g. "1,234" / "1.234" → 1234).
         """
         raw = raw.strip()
         has_comma, has_dot = "," in raw, "." in raw
@@ -148,10 +149,10 @@ class DocumentParser:
                        if raw.rfind(",") > raw.rfind(".")
                        else raw.replace(",", ""))
         elif has_comma:
-            cleaned = (raw.replace(",", ".") if len(raw.split(",")[-1]) == 2
+            cleaned = (raw.replace(",", ".") if len(raw.split(",")[-1]) in (1, 2)
                        else raw.replace(",", ""))
         elif has_dot:
-            cleaned = (raw if len(raw.split(".")[-1]) == 2
+            cleaned = (raw if len(raw.split(".")[-1]) in (1, 2)
                        else raw.replace(".", ""))
         else:
             cleaned = raw
