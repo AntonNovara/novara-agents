@@ -26,7 +26,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import END, StateGraph
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
@@ -192,7 +192,16 @@ class OperationsGraph:
                     SystemMessage(content=_SYSTEM_EXTRACT),
                     HumanMessage(content=state["input_text"]),
                 ])
-                llm_data: dict = _parse_llm_json(response.content)
+                raw_llm_data = _parse_llm_json(response.content)
+                try:
+                    # Validate/coerce against the schema before trusting it —
+                    # an LLM isn't guaranteed to honor the requested types
+                    # (e.g. amount as a string), and downstream code assumes
+                    # amount is a real number.
+                    llm_data = InvoiceExtraction(**raw_llm_data).model_dump()
+                except ValidationError as exc:
+                    logger.warning("extract_fields: LLM output failed schema validation: %s", exc)
+                    llm_data = {}
                 # Merge: only fill in gaps, don't override regex results
                 for field in missing_fields:
                     if llm_data.get(field) and not parsed.get(field):
@@ -218,10 +227,15 @@ class OperationsGraph:
 
         if not p.get("company_name"):
             errors.append("company_name is missing")
-        if p.get("amount") is None:
+        amount = p.get("amount")
+        if amount is None:
             errors.append("amount is missing")
-        elif p["amount"] <= 0:
-            errors.append(f"amount must be positive, got {p['amount']}")
+        else:
+            try:
+                if float(amount) <= 0:
+                    errors.append(f"amount must be positive, got {amount}")
+            except (TypeError, ValueError):
+                errors.append(f"amount is not a valid number: {amount!r}")
         if not p.get("invoice_date"):
             errors.append("invoice_date is missing")
 
@@ -370,6 +384,14 @@ class OperationsAgent(BaseAgent):
         self._workflow = OperationsGraph(
             llm=_build_llm(),
             parser=DocumentParser(),
+            # TODO: vor Einsatz auf echtes CRM/ERP umstellen. CRMIntegration
+            # ist eine In-Memory-Mock-Implementierung (tools/crm_integration.py)
+            # — Datensätze werden bei jedem Neustart verworfen. Kein Swap auf
+            # crm_handler.py (la-maquina-de-confianza): das ist eine
+            # Google-Sheets-Sales-Lead-CRM mit interaktivem OAuth-Login, kein
+            # passendes Ziel für ERPRecord-Rechnungsdaten (anderes Schema/
+            # anderer Zweck) und nicht ohne Weiteres aus einem separaten Repo
+            # ohne Browser-Interaktion ansprechbar.
             crm=CRMIntegration(
                 endpoint=settings.crm_endpoint,
                 api_key=settings.crm_api_key.get_secret_value(),
