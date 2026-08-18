@@ -10,6 +10,7 @@ Prüft:
   5. Sales-Copilot-Agent: Signalerkennung unterscheidet Kaufsignale von Einwänden
   6. Onboarding-Agent: Checklisten-Generierung (deterministisch) + voller Graph-Durchlauf
   7. "Gmail-Entwurfs-Skript": Existenz-/Code-Prüfung der Google/E-Mail-Skripte
+  8. Security-Layer: DLP-Hard-Block unterscheidet Keyword-Erwähnung von echtem Credential
 
 Ausführen:  python3 test_system.py
 Macht echte (kleine) LLM-Calls, wenn ein gültiger ANTHROPIC_API_KEY vorliegt.
@@ -467,6 +468,55 @@ def test_gmail_script() -> None:
             info("get_token.py erwartet lokale credentials.json (sonst FileNotFoundError beim Ausführen)")
 
 
+# ── Test 8: Security-Layer – Hard-Block-Regression ──────────────────────────
+
+def test_dlp_hard_block_regression() -> None:
+    section("TEST 8 — Security-Layer: Hard-Block-Regression (Erwähnung vs. echtes Credential)")
+    info("Regressionstest für den DLP-Hard-Block-Fix: die bloße Erwähnung eines")
+    info("Keywords in normalem Fließtext darf NICHT mehr blockieren, ein echtes")
+    info("Credential-Muster (Keyword + Delimiter + Wert) MUSS weiterhin blockieren.")
+    try:
+        from core.security import SecurityLayer
+    except Exception as exc:
+        fail("Import SecurityLayer", str(exc))
+        return
+
+    cases: list[tuple[str, str, bool]] = [
+        (
+            "Onboarding-Checkliste (früherer False Positive)",
+            "Aktivierungslink in der Willkommens-E-Mail öffnen und Passwort setzen.",
+            False,
+        ),
+        (
+            "Echtes Credential (Delimiter ':')",
+            "passwort: Xk9#mPz2",
+            True,
+        ),
+        (
+            "Echtes Credential (Delimiter '=')",
+            "api_key=sk-ant-xxxxxxxxxxxx",
+            True,
+        ),
+        (
+            "Bearer-Token (HTTP Authorization Header)",
+            "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+            True,
+        ),
+    ]
+
+    for label, text, expect_block in cases:
+        try:
+            result = SecurityLayer.check_and_redact(text)
+            got_block = not result.approved
+            if got_block == expect_block:
+                ok(label, f"blocked={got_block} (erwartet {expect_block})")
+            else:
+                fail(label, f"blocked={got_block}, erwartet {expect_block} — Text: {text!r}")
+        except Exception:
+            fail(f"{label} — Exception", "")
+            traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -488,6 +538,7 @@ def main() -> int:
     test_onboarding_checklist()
     test_onboarding_agent_live(live)
     test_gmail_script()
+    test_dlp_hard_block_regression()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

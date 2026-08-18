@@ -26,11 +26,25 @@ _PII_PATTERNS: dict[str, re.Pattern] = {
     "tax_id":     re.compile(r"\b\d{2,3}[/\s]?\d{3}[/\s]?\d{4,5}\b"),
 }
 
-# Strings that immediately block transmission (DLP hard-stop)
-_BLOCKED_KEYWORDS: frozenset[str] = frozenset({
-    "password", "passwort", "geheimnis", "secret", "private_key",
-    "access_token", "bearer ", "api_key",
-})
+# Credential-Keywords, die auf ein Hard-Stop-Muster hindeuten. Ein reiner
+# Substring-Treffer (z. B. "Passwort" in "...Passwort setzen.") ist KEIN Leak
+# und darf nicht blockieren — daher verlangt _CREDENTIAL_PATTERN zusätzlich
+# einen Delimiter + einen nachfolgenden Wert: "passwort:", "pwd=",
+# "password ist xyz123". Die bloße Erwähnung des Wortes in normalem
+# Fließtext (Business-Text, Checklisten, Anleitungen) triggert nicht mehr.
+_CREDENTIAL_KEYWORDS: tuple[str, ...] = (
+    "password", "passwort", "pwd", "geheimnis", "secret",
+    "private_key", "access_token", "api_key",
+)
+_CREDENTIAL_DELIMITER = r"(?::\s*|=\s*|\s+ist\s+|\s+is\s+)"
+_CREDENTIAL_PATTERN = re.compile(
+    r"\b(?:" + "|".join(_CREDENTIAL_KEYWORDS) + r")\b" + _CREDENTIAL_DELIMITER + r"\S+",
+    re.IGNORECASE,
+)
+# "Bearer <token>" (HTTP Authorization Header) — hier ist das Leerzeichen
+# selbst der natürliche Delimiter, "bearer" ist kein Wort in normalem
+# deutschen/englischen Fließtext, daher kein eigenes False-Positive-Risiko.
+_BEARER_PATTERN = re.compile(r"\bbearer\s+\S+", re.IGNORECASE)
 
 
 @dataclass
@@ -54,17 +68,17 @@ class SecurityLayer:
         2. PII redaction: replace detected PII with typed placeholders.
         Returns a DLPResult the caller must inspect before proceeding.
         """
-        lower = text.lower()
-
-        # Hard-stop: credentials in payload are never acceptable
-        for keyword in _BLOCKED_KEYWORDS:
-            if keyword in lower:
-                logger.warning("DLP hard-block triggered", extra={"keyword": keyword})
-                return DLPResult(
-                    approved=False,
-                    redacted_text=text,
-                    blocked_reason=f"Blocked keyword detected: '{keyword}'",
-                )
+        # Hard-stop: eine tatsächliche Credential-Zuweisung im Payload ist nie
+        # akzeptabel. Erfordert Keyword + Delimiter + Wert (siehe
+        # _CREDENTIAL_PATTERN oben), NICHT die bloße Erwähnung des Wortes.
+        match = _CREDENTIAL_PATTERN.search(text) or _BEARER_PATTERN.search(text)
+        if match:
+            logger.warning("DLP hard-block triggered", extra={"match": match.group(0)})
+            return DLPResult(
+                approved=False,
+                redacted_text=text,
+                blocked_reason=f"Blocked credential pattern detected: '{match.group(0)}'",
+            )
 
         if not settings.enable_pii_redaction:
             return DLPResult(approved=True, redacted_text=text)
