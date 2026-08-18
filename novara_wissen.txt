@@ -347,7 +347,7 @@ AUTOMATISIERTE MAKE.COM SZENARIEN (intern aktiv):
 TERMINBUCHUNG: calendly.com/anton-novaraautomation/30min
 
 RECHNUNGSSTELLUNG:
-  - Sequentielle Nummerierung (RE-2026-001, RE-2026-002, ...)
+  - Sequentielle Nummerierung (NA-2026-001, NA-2026-002, ...)
   - 50/50 Zahlungsmodell (Anzahlung + Restbetrag bei Übergabe)
   - Kleinunternehmer — kein USt-Ausweis, Hinweis auf §6 Abs. 1 Z 27 UStG
 
