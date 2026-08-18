@@ -186,8 +186,8 @@ class FAQDatabase:
 
     FAQ_ESCALATION_THRESHOLD = 0.30  # below this → escalate to ticket
 
-    def __init__(self, entries: list[FAQEntry] = _FAQ_ENTRIES) -> None:
-        self._entries = entries
+    def __init__(self, entries: list[FAQEntry] | None = None) -> None:
+        self._entries = entries if entries is not None else _FAQ_ENTRIES
 
     def search(self, query: str, top_k: int = 3) -> list[FAQSearchResult]:
         query_tokens = self._tokenize(query)
