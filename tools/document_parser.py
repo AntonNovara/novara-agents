@@ -122,15 +122,43 @@ class DocumentParser:
         for pattern in (self._AMOUNT_PATTERN, self._AMOUNT_FALLBACK):
             match = pattern.search(text)
             if match:
-                raw_amount = match.group(1).replace(".", "").replace(",", ".")
-                try:
-                    amount = float(raw_amount)
-                except ValueError:
+                amount = self._parse_amount(match.group(1))
+                if amount is None:
                     continue
                 currency_raw = match.group(2) or "EUR"
                 currency = self._CURRENCY_MAP.get(currency_raw.strip(), currency_raw.upper())
                 return amount, currency
         return None, "EUR"
+
+    @staticmethod
+    def _parse_amount(raw: str) -> float | None:
+        """
+        Parse a monetary string in either German (1.234,56) or English/US
+        (1,234.56) format.
+
+        Both separators present → the rightmost one is the decimal separator.
+        Only one separator present → it's the decimal separator if exactly
+        two digits follow it (e.g. "1234,56" / "1234.56"), otherwise it's a
+        thousands separator with no cents (e.g. "1,234" / "1.234" → 1234).
+        """
+        raw = raw.strip()
+        has_comma, has_dot = "," in raw, "." in raw
+        if has_comma and has_dot:
+            cleaned = (raw.replace(".", "").replace(",", ".")
+                       if raw.rfind(",") > raw.rfind(".")
+                       else raw.replace(",", ""))
+        elif has_comma:
+            cleaned = (raw.replace(",", ".") if len(raw.split(",")[-1]) == 2
+                       else raw.replace(",", ""))
+        elif has_dot:
+            cleaned = (raw if len(raw.split(".")[-1]) == 2
+                       else raw.replace(".", ""))
+        else:
+            cleaned = raw
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
 
     def _extract_date(self, text: str) -> str | None:
         match = self._DATE_PATTERN.search(text)
