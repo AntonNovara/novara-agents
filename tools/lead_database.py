@@ -207,8 +207,8 @@ class LeadDatabase:
     In Produktion: CRM-API-Call oder Sales-Navigator-Integration.
     """
 
-    def __init__(self, entries: list[ProspectContact] = _DB) -> None:
-        self._entries = entries
+    def __init__(self, entries: list[ProspectContact] | None = None) -> None:
+        self._entries = entries if entries is not None else _DB
 
     def search(
         self,
