@@ -6,7 +6,10 @@ Prüft:
   2. SDR-Agent: interne Routing-Logik mit fiktivem Lead (qualifiziert vs. disqualifiziert)
   3. Operations-Agent: tatsächliches Verhalten mit einem Lead + mit einer Rechnung
      (belegt, dass es KEIN operations->sdr-Routing gibt)
-  4. "Gmail-Entwurfs-Skript": Existenz-/Code-Prüfung der Google/E-Mail-Skripte
+  4. Support-Agent: Routing FAQ-Antwort vs. Ticket-Eskalation (Beschwerde+Dringlichkeit)
+  5. Sales-Copilot-Agent: Signalerkennung unterscheidet Kaufsignale von Einwänden
+  6. Onboarding-Agent: Checklisten-Generierung (deterministisch) + voller Graph-Durchlauf
+  7. "Gmail-Entwurfs-Skript": Existenz-/Code-Prüfung der Google/E-Mail-Skripte
 
 Ausführen:  python3 test_system.py
 Macht echte (kleine) LLM-Calls, wenn ein gültiger ANTHROPIC_API_KEY vorliegt.
@@ -86,6 +89,37 @@ SAMPLE_INVOICE = (
     "Gesamtbetrag: 990,00 EUR\n"
     "Rechnungsdatum: 15.06.2026\n"
     "Zahlungsziel: 50% Anzahlung bei Auftragsbestaetigung\n"
+)
+
+SUPPORT_FAQ_QUERY = (
+    "Wie starte ich mit Novara Automation? Wie richte ich meinen Account ein?"
+)
+
+SUPPORT_ESCALATION_QUERY = (
+    "Das System ist seit heute Morgen komplett ausgefallen und wir verlieren "
+    "dadurch Kundendaten! Das ist absolut inakzeptabel, ich bin sehr verärgert "
+    "und brauche SOFORT eine Lösung."
+)
+
+SALES_STRONG_SIGNALS_TRANSCRIPT = (
+    "Call mit Elektro Huber GmbH am 15.06.2026, Kontakt: Josef Huber (Inhaber). "
+    "Kunde sagt: 'Das klingt genau nach dem, was wir brauchen, wir wollen so "
+    "schnell wie moeglich starten. Koennen wir naechste Woche unterschreiben?' "
+    "Naechster Schritt: Vertrag wird am 20.06. verschickt."
+)
+
+SALES_MANY_OBJECTIONS_TRANSCRIPT = (
+    "Call mit GlobalTech Enterprise AG am 15.06.2026, Kontakt: Dr. Klein (CTO). "
+    "Kunde sagt: 'Das ist uns viel zu teuer, wir haben aktuell kein Budget dafuer. "
+    "Ausserdem nutzen wir bereits ein Konkurrenzprodukt und ich bin nicht sicher, "
+    "ob ich das intern durchsetzen kann. Wir muessten das erstmal langfristig "
+    "evaluieren.' Kein konkreter naechster Schritt vereinbart."
+)
+
+ONBOARDING_TEXT = (
+    "Neuer Kunde: Elektro Huber GmbH, Kontakt Josef Huber (Inhaber), "
+    "josef.huber@example.com. Plan: Pro. Branche: Elektrohandwerk. "
+    "Teamgroesse: 6. Hauptanwendungsfall: Terminbuchung und Angebotserstellung."
 )
 
 
@@ -239,10 +273,171 @@ def test_operations_and_routing_claim(live: bool) -> None:
         traceback.print_exc()
 
 
-# ── Test 4: "Gmail-Entwurfs-Skript" ─────────────────────────────────────────
+# ── Test 4: Support-Routing (FAQ-Antwort vs. Ticket-Eskalation) ─────────────
+
+def test_support_routing(live: bool) -> None:
+    section("TEST 4 — Support-Agent: Routing (FAQ-Antwort vs. Ticket-Eskalation)")
+    if not live:
+        warn("Support-Live-Test übersprungen", "kein gültiger ANTHROPIC_API_KEY lokal")
+        return
+    try:
+        from agents.support_agent import SupportAgent
+        from agents.base_agent import AgentRequest
+    except Exception as exc:
+        fail("Import SupportAgent", str(exc))
+        return
+
+    agent = SupportAgent()
+
+    # 4a: FAQ-Treffer -> route_after_faq -> compose_faq_response
+    try:
+        resp = agent.process(AgentRequest(text=SUPPORT_FAQ_QUERY))
+        if not resp.success:
+            fail("Support FAQ-Anfrage", resp.error or "unbekannter Fehler")
+        else:
+            r = resp.result
+            info(f"action={r.get('action')}, faq_confidence={r.get('faq_match', {}).get('confidence')}")
+            if r.get("action") == "faq_response":
+                ok("Routing FAQ-Treffer → compose_faq_response", f"confidence {r['faq_match'].get('confidence')}")
+            else:
+                warn("FAQ-Anfrage eskalierte zu Ticket", "Konfidenz inhaltlich prüfen")
+    except Exception:
+        fail("Support FAQ-Anfrage — Exception", "")
+        traceback.print_exc()
+
+    # 4b: Beschwerde + hohe Dringlichkeit -> forced escalate -> create_ticket
+    try:
+        resp = agent.process(AgentRequest(text=SUPPORT_ESCALATION_QUERY))
+        if not resp.success:
+            fail("Support Eskalations-Anfrage", resp.error or "")
+        else:
+            r = resp.result
+            info(f"action={r.get('action')}, analysis={_short(r.get('analysis'), 300)}")
+            if r.get("action") == "ticket_created":
+                priority = (r.get("ticket") or {}).get("priority")
+                ok("Routing Beschwerde+Dringlichkeit → create_ticket", f"priority {priority}")
+            else:
+                warn("Eskalation wurde nicht ausgelöst", "Intent/Urgency-Klassifikation inhaltlich prüfen")
+    except Exception:
+        fail("Support Eskalations-Anfrage — Exception", "")
+        traceback.print_exc()
+
+
+# ── Test 5: Sales-Copilot – Signalerkennung (Kaufsignale vs. Einwände) ──────
+
+def test_sales_copilot_signals(live: bool) -> None:
+    section("TEST 5 — Sales-Copilot-Agent: Signalerkennung (Kaufsignale vs. Einwände)")
+    info("ARCHITEKTUR-BEFUND: Der Graph ist linear (kein Conditional Routing) —")
+    info("getestet wird, ob detect_signals inhaltlich zwischen den Szenarien unterscheidet.")
+    if not live:
+        warn("Sales-Copilot-Live-Test übersprungen", "kein gültiger ANTHROPIC_API_KEY lokal")
+        return
+    try:
+        from agents.sales_copilot_agent import SalesCopilotAgent
+        from agents.base_agent import AgentRequest
+    except Exception as exc:
+        fail("Import SalesCopilotAgent", str(exc))
+        return
+
+    agent = SalesCopilotAgent()
+    scores: dict[str, float] = {}
+
+    for label, transcript in (
+        ("strong_signals", SALES_STRONG_SIGNALS_TRANSCRIPT),
+        ("many_objections", SALES_MANY_OBJECTIONS_TRANSCRIPT),
+    ):
+        try:
+            resp = agent.process(AgentRequest(text=transcript))
+            if not resp.success:
+                fail(f"Sales-Copilot {label}", resp.error or "unbekannter Fehler")
+                continue
+            analysis = resp.result.get("analysis", {})
+            health = analysis.get("deal_health_score")
+            scores[label] = health
+            info(
+                f"{label}: deal_health_score={health}, "
+                f"objections={len(analysis.get('objections', []))}, "
+                f"buying_signals={len(analysis.get('buying_signals', []))}"
+            )
+            ok(f"Sales-Copilot verarbeitet Transkript ({label})")
+        except Exception:
+            fail(f"Sales-Copilot {label} — Exception", "")
+            traceback.print_exc()
+
+    if "strong_signals" in scores and "many_objections" in scores:
+        if scores["strong_signals"] > scores["many_objections"]:
+            ok(
+                "Deal-Health-Score unterscheidet Szenarien korrekt",
+                f"{scores['strong_signals']} (Kaufsignale) > {scores['many_objections']} (Einwände)",
+            )
+        else:
+            warn(
+                "Deal-Health-Score unterscheidet Szenarien NICHT wie erwartet",
+                f"strong_signals={scores['strong_signals']}, many_objections={scores['many_objections']}",
+            )
+
+
+# ── Test 6: Onboarding – Checklisten-Generierung (deterministisch) ─────────
+
+def test_onboarding_checklist() -> None:
+    section("TEST 6 — Onboarding-Agent: Checklisten-Generierung (deterministisch, kein LLM)")
+    try:
+        from tools.onboarding_tracker import build_checklist
+    except Exception as exc:
+        fail("Import build_checklist", str(exc))
+        return
+
+    # generate_checklist() ruft build_checklist() OHNE LLM auf — daher hier
+    # unabhängig vom ANTHROPIC_API_KEY direkt und deterministisch testbar.
+    expected = {"starter": 5, "pro": 9, "enterprise": 14}
+    for plan, exp_count in expected.items():
+        items = build_checklist(plan, "other")
+        if len(items) == exp_count:
+            ok(f"Checkliste '{plan}'", f"{len(items)} Items (erwartet {exp_count})")
+        else:
+            fail(f"Checkliste '{plan}'", f"{len(items)} Items, erwartet {exp_count}")
+
+    # Branchen-Block wird zusätzlich angehängt, wenn die Branche erkannt wird
+    items_healthcare = build_checklist("enterprise", "healthcare")
+    if len(items_healthcare) == expected["enterprise"] + 1:
+        ok("Branchen-Block wird angehängt", f"enterprise+healthcare = {len(items_healthcare)} Items")
+    else:
+        fail("Branchen-Block fehlt/falsch", f"{len(items_healthcare)} Items")
+
+
+def test_onboarding_agent_live(live: bool) -> None:
+    section("TEST 6b — Onboarding-Agent: voller Graph-Durchlauf")
+    if not live:
+        warn("Onboarding-Live-Test übersprungen", "kein gültiger ANTHROPIC_API_KEY lokal")
+        return
+    try:
+        from agents.onboarding_agent import OnboardingAgent
+        from agents.base_agent import AgentRequest
+    except Exception as exc:
+        fail("Import OnboardingAgent", str(exc))
+        return
+
+    try:
+        resp = OnboardingAgent().process(AgentRequest(text=ONBOARDING_TEXT))
+        if not resp.success:
+            fail("Onboarding voller Durchlauf", resp.error or "unbekannter Fehler")
+        else:
+            r = resp.result
+            info("Ergebnis (Auszug):")
+            print(_short(r, 600))
+            ok(
+                "Onboarding verarbeitet Kundendaten (bestimmungsgemäß)",
+                f"checklist_total={r.get('onboarding', {}).get('checklist_total')}",
+            )
+    except Exception:
+        fail("Onboarding voller Durchlauf — Exception", "")
+        traceback.print_exc()
+
+
+# ── Test 7: "Gmail-Entwurfs-Skript" ─────────────────────────────────────────
 
 def test_gmail_script() -> None:
-    section("TEST 4 — 'Gmail-Entwurfs-Skript': Existenz- und Code-Prüfung")
+    section("TEST 7 — 'Gmail-Entwurfs-Skript': Existenz- und Code-Prüfung")
     import os
     import py_compile
 
@@ -288,6 +483,10 @@ def main() -> int:
     test_knowledge_base()
     test_sdr_routing(live)
     test_operations_and_routing_claim(live)
+    test_support_routing(live)
+    test_sales_copilot_signals(live)
+    test_onboarding_checklist()
+    test_onboarding_agent_live(live)
     test_gmail_script()
 
     # Zusammenfassung
