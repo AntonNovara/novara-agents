@@ -21,14 +21,13 @@ import logging
 import re
 from typing import Any, Optional
 
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
-from core.config import settings
 from core.knowledge import load_novara_wissen
+from core.llm import build_llm
 from tools.notification_system import NotificationSystem
 from tools.onboarding_tracker import OnboardingRecord, OnboardingTracker, build_checklist
 
@@ -38,15 +37,6 @@ _WISSEN = load_novara_wissen()
 
 
 # ── LLM singleton ─────────────────────────────────────────────────────────────
-
-def _build_llm() -> ChatAnthropic:
-    return ChatAnthropic(
-        model=settings.anthropic_model,
-        api_key=settings.anthropic_api_key.get_secret_value(),
-        temperature=0,
-        max_tokens=1024,
-    )
-
 
 def _parse_llm_json(text: str) -> dict:
     text = text.strip()
@@ -155,7 +145,7 @@ Format:
 
 class OnboardingGraph:
 
-    def __init__(self, llm: ChatAnthropic, notifier: NotificationSystem,
+    def __init__(self, llm: Any, notifier: NotificationSystem,
                  tracker: OnboardingTracker) -> None:
         self._llm = llm
         self._notifier = notifier
@@ -380,7 +370,7 @@ class OnboardingAgent(BaseAgent):
     def __init__(self) -> None:
         super().__init__()
         self._workflow = OnboardingGraph(
-            llm=_build_llm(),
+            llm=build_llm(max_tokens=1024),
             notifier=NotificationSystem(),
             tracker=OnboardingTracker(),
         )

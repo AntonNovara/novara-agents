@@ -22,7 +22,6 @@ import logging
 import re
 from typing import Any, Literal, Optional
 
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import END, StateGraph
@@ -32,6 +31,7 @@ from typing_extensions import TypedDict
 from agents.base_agent import AgentRequest, BaseAgent
 from core.config import settings
 from core.knowledge import load_novara_wissen
+from core.llm import build_llm
 from tools.crm_integration import CRMIntegration, ERPRecord
 from tools.document_parser import DocumentParser, ParsedDocument
 
@@ -48,15 +48,6 @@ def _parse_llm_json(text: str) -> dict:
         text = re.sub(r"^```(?:json)?\s*\n?", "", text)
         text = re.sub(r"\n?```\s*$", "", text)
     return json.loads(text.strip())
-
-
-def _build_llm() -> ChatAnthropic:
-    return ChatAnthropic(
-        model=settings.anthropic_model,
-        api_key=settings.anthropic_api_key.get_secret_value(),
-        temperature=0,
-        max_tokens=512,
-    )
 
 
 # ── Graph State ───────────────────────────────────────────────────────────────
@@ -167,7 +158,7 @@ class OperationsGraph:
     und dann pro Request ausgeführt (run).
     """
 
-    def __init__(self, llm: ChatAnthropic, parser: DocumentParser, crm: CRMIntegration) -> None:
+    def __init__(self, llm: Any, parser: DocumentParser, crm: CRMIntegration) -> None:
         self._llm = llm
         self._parser = parser
         self._crm = crm
@@ -411,7 +402,7 @@ class OperationsAgent(BaseAgent):
     def __init__(self) -> None:
         super().__init__()
         self._workflow = OperationsGraph(
-            llm=_build_llm(),
+            llm=build_llm(max_tokens=512),
             parser=DocumentParser(),
             # TODO: vor Einsatz auf echtes CRM/ERP umstellen. CRMIntegration
             # ist eine In-Memory-Mock-Implementierung (tools/crm_integration.py)

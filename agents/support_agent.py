@@ -26,14 +26,13 @@ import logging
 import re
 from typing import Any, Literal, Optional
 
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
-from core.config import settings
 from core.knowledge import load_novara_wissen
+from core.llm import build_llm
 from tools.faq_database import FAQDatabase, FAQSearchResult
 from tools.ticket_system import TicketPriority, TicketRecord, TicketSystem
 
@@ -51,17 +50,6 @@ def _parse_llm_json(text: str) -> dict:
 logger = logging.getLogger(__name__)
 
 _WISSEN = load_novara_wissen()
-
-
-# ── LLM singleton ─────────────────────────────────────────────────────────────
-
-def _build_llm() -> ChatAnthropic:
-    return ChatAnthropic(
-        model=settings.anthropic_model,
-        api_key=settings.anthropic_api_key.get_secret_value(),
-        temperature=0,
-        max_tokens=512,
-    )
 
 
 # ── Graph State ────────────────────────────────────────────────────────────────
@@ -152,7 +140,7 @@ Antworte NUR mit dem Antworttext, kein JSON, keine Präambel.
 class SupportGraph:
     """LangGraph-Workflow für den Support Agent."""
 
-    def __init__(self, llm: ChatAnthropic, faq: FAQDatabase, tickets: TicketSystem) -> None:
+    def __init__(self, llm: Any, faq: FAQDatabase, tickets: TicketSystem) -> None:
         self._llm = llm
         self._faq = faq
         self._tickets = tickets
@@ -399,7 +387,7 @@ class SupportAgent(BaseAgent):
     def __init__(self) -> None:
         super().__init__()
         self._workflow = SupportGraph(
-            llm=_build_llm(),
+            llm=build_llm(max_tokens=512),
             faq=FAQDatabase(),
             tickets=TicketSystem(),
         )

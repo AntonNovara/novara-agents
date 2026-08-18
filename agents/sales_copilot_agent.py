@@ -19,7 +19,6 @@ import logging
 import re
 from typing import Any, Optional
 
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
@@ -27,6 +26,7 @@ from typing_extensions import TypedDict
 from agents.base_agent import AgentRequest, BaseAgent
 from core.config import settings
 from core.knowledge import load_novara_wissen
+from core.llm import build_llm
 from tools.deal_tracker import DealRecord, DealStage, DealTracker
 
 logger = logging.getLogger(__name__)
@@ -35,15 +35,6 @@ _WISSEN = load_novara_wissen()
 
 
 # ── LLM singleton ─────────────────────────────────────────────────────────────
-
-def _build_llm() -> ChatAnthropic:
-    return ChatAnthropic(
-        model=settings.anthropic_model,
-        api_key=settings.anthropic_api_key.get_secret_value(),
-        temperature=0,
-        max_tokens=1024,
-    )
-
 
 def _parse_llm_json(text: str) -> dict:
     text = text.strip()
@@ -184,7 +175,7 @@ Format:
 
 class SalesCopilotGraph:
 
-    def __init__(self, llm: ChatAnthropic, tracker: DealTracker) -> None:
+    def __init__(self, llm: Any, tracker: DealTracker) -> None:
         self._llm = llm
         self._tracker = tracker
         self._graph = self._build_graph()
@@ -415,7 +406,7 @@ class SalesCopilotAgent(BaseAgent):
     def __init__(self) -> None:
         super().__init__()
         self._workflow = SalesCopilotGraph(
-            llm=_build_llm(),
+            llm=build_llm(max_tokens=1024),
             tracker=DealTracker(endpoint=settings.crm_endpoint),
         )
 

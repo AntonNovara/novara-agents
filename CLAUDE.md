@@ -140,6 +140,36 @@ Läuft automatisch um jede `BaseAgent.process()`-Ausführung:
 
 Hard-Block bei Credentials (`password`, `api_key`, `bearer`, …) → Request wird abgelehnt.
 
+> **Bekannter False Positive:** Der Hard-Block matcht auch harmlose Business-Texte,
+> die zufällig `passwort` enthalten (z. B. eine Onboarding-Checkliste mit
+> "... Passwort setzen"). `sanitize_dict()` ignoriert `approved`/`blocked_reason`
+> und gibt den Text unverändert zurück, daher ist der Effekt aktuell nur ein
+> irreführendes Warn-Log, keine echte Blockierung. Noch nicht behoben.
+
+---
+
+## LLM-Factory & Demo-Modus (`core/llm.py`)
+
+Alle 5 Text-Agenten (nicht `voice_agent.py`, der die Anthropic-SDK direkt für
+Streaming nutzt) beziehen ihren LLM-Client über die zentrale Factory
+`core.llm.build_llm(max_tokens=...)` statt über eine pro-Agent duplizierte
+`_build_llm()`-Funktion.
+
+**Demo-Modus** (`settings.effective_demo_mode`) ersetzt den echten
+`ChatAnthropic`-Call durch einen Fake-Client (`_DemoChatModel`), der anhand des
+System-Prompts erkennt, ob JSON oder Freitext (`SUBJECT:`-Format) erwartet wird,
+und einen generischen Platzhalter zurückgibt — kein Netzwerk-Call, keine Kosten.
+
+Aktiv, wenn:
+- kein echter `ANTHROPIC_API_KEY` gesetzt ist (Default `mock-key`), **oder**
+- `DEMO_MODE=true` explizit gesetzt ist — auch mit echtem Key, z. B. um beim
+  lokalen Entwickeln keine echten Calls zu verbrauchen.
+
+> **Nur Entwicklungs-/Kosten-Bequemlichkeit, kein Sicherheits-Mechanismus.**
+> Sobald ein Agent öffentlich als Demo exponiert wird (wie
+> `sdr_demo_referencia/`), muss dort Demo-Modus zum Fail-Safe-Default werden
+> (an, sofern nicht explizit für Prod freigeschaltet) — das ist noch offen.
+
 ---
 
 ## Implementierte Agenten
@@ -354,6 +384,7 @@ novara-agents/
 │
 ├── core/
 │   ├── config.py                   # pydantic-settings, Singleton via lru_cache
+│   ├── llm.py                      # Zentrale LLM-Factory + Demo-Modus-Fake-Client
 │   └── security.py                 # DLP/PII-Redaktion, Hard-Block-Keywords
 │
 ├── agents/

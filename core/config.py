@@ -48,6 +48,15 @@ class Settings(BaseSettings):
     # Runtime
     environment: str = Field(default="development", alias="ENVIRONMENT")
 
+    # Demo-Modus: erzwingt Fake-LLM-Antworten statt echter API-Calls, auch wenn
+    # ein echter ANTHROPIC_API_KEY gesetzt ist. Aktuell reine Entwicklungs-/
+    # Kosten-Bequemlichkeit für den internen Gebrauch (lokale Tests ohne echte
+    # Calls) – KEIN Sicherheits-Mechanismus. Sobald ein Agent öffentlich als
+    # Demo exponiert wird, muss dort ein echter Fail-Safe-Default eingeführt
+    # werden (Demo-Modus an, sofern nicht explizit für Prod freigeschaltet) –
+    # das ist bewusst noch nicht Teil dieses Flags.
+    demo_mode: bool = Field(default=False, alias="DEMO_MODE")
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
@@ -57,6 +66,15 @@ class Settings(BaseSettings):
         """True, wenn ein echter ANTHROPIC_API_KEY gesetzt ist (kein Platzhalter)."""
         key = self.anthropic_api_key.get_secret_value().strip()
         return bool(key) and key != "mock-key"
+
+    @property
+    def effective_demo_mode(self) -> bool:
+        """
+        True, wenn LLM-Calls durch Fake-Antworten ersetzt werden sollen:
+        entweder explizit über DEMO_MODE=true, oder implizit, weil kein
+        echter API-Key konfiguriert ist (verhindert Abstürze bei fehlendem Key).
+        """
+        return self.demo_mode or not self.anthropic_key_configured
 
 
 @lru_cache(maxsize=1)

@@ -30,7 +30,6 @@ import re
 import uuid
 from typing import Any, Literal, Optional
 
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
@@ -38,6 +37,7 @@ from typing_extensions import TypedDict
 from agents.base_agent import AgentRequest, BaseAgent
 from core.config import settings
 from core.knowledge import load_novara_wissen
+from core.llm import build_llm
 from tools.crm_integration import CRMIntegrationSDR, LeadRecord
 from tools.lead_database import LeadDatabase, LeadSearchResult, ProspectContact
 
@@ -57,15 +57,6 @@ _WISSEN = load_novara_wissen()
 
 
 # ── LLM singleton ─────────────────────────────────────────────────────────────
-
-def _build_llm() -> ChatAnthropic:
-    return ChatAnthropic(
-        model=settings.anthropic_model,
-        api_key=settings.anthropic_api_key.get_secret_value(),
-        temperature=0,
-        max_tokens=1024,
-    )
-
 
 def _parse_llm_json(text: str) -> dict:
     """Parse JSON from LLM output, stripping markdown code fences if present."""
@@ -208,7 +199,7 @@ Sprache: {{language}}
 class SDRGraph:
     """LangGraph-Workflow für den SDR Agent."""
 
-    def __init__(self, llm: ChatAnthropic, db: LeadDatabase, crm: CRMIntegrationSDR) -> None:
+    def __init__(self, llm: Any, db: LeadDatabase, crm: CRMIntegrationSDR) -> None:
         self._llm = llm
         self._db = db
         self._crm = crm
@@ -567,7 +558,7 @@ class SDRAgent(BaseAgent):
     def __init__(self) -> None:
         super().__init__()
         self._workflow = SDRGraph(
-            llm=_build_llm(),
+            llm=build_llm(max_tokens=1024),
             db=LeadDatabase(),
             # TODO: vor Einsatz auf echtes CRM umstellen. CRMIntegrationSDR
             # ist eine In-Memory-Mock-Implementierung (tools/crm_integration.py)
