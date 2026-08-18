@@ -380,6 +380,8 @@ class SDRGraph:
         return {**state, "outreach_text": body, "outreach_subject": subject}
 
     # ── Node: write_to_crm ───────────────────────────────────────────────────
+    # TODO: icp_tier-Berechnung ist dupliziert mit score_lead(), sollte
+    # zentralisiert werden — siehe Session vom 20.07.2026.
 
     def write_to_crm(self, state: SDRState) -> SDRState:
         logger.info("Node: write_to_crm", extra={"session": state["session_id"]})
@@ -567,6 +569,18 @@ class SDRAgent(BaseAgent):
         self._workflow = SDRGraph(
             llm=_build_llm(),
             db=LeadDatabase(),
+            # TODO: vor Einsatz auf echtes CRM umstellen. CRMIntegrationSDR
+            # ist eine In-Memory-Mock-Implementierung (tools/crm_integration.py)
+            # — Leads werden bei jedem Neustart verworfen. Ein direkter Swap
+            # auf crm_handler.py (Repo la-maquina-de-confianza) ist nicht ohne
+            # Weiteres möglich: dessen Google Sheets API nutzt einen
+            # interaktiven Desktop-OAuth-Login (InstalledAppFlow), der in
+            # einem automatisierten Agenten-Workflow nicht ausgelöst werden
+            # kann, und crm_handler.py liegt in einem separaten Repo ohne
+            # Paketierung für einen Cross-Repo-Import. LeadRecord ließe sich
+            # inhaltlich auf add_lead_to_crm() abbilden (firma=company_name,
+            # ansprechpartner=contact_name, email=contact_email, ...) — das
+            # müsste aber gezielt implementiert werden, nicht "by the way".
             crm=CRMIntegrationSDR(
                 endpoint=settings.crm_endpoint,
                 api_key=settings.crm_api_key.get_secret_value(),

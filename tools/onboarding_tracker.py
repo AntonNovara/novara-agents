@@ -1,6 +1,10 @@
 """
 Onboarding Tracker – personalisierte Checklisten und Kunden-Aktivierungs-Tracking.
 In Produktion: httpx-Client gegen internes CS-System oder HubSpot Onboarding-Pipeline.
+
+TODO: vor Einsatz auf echtes CS-System/HubSpot umstellen. Aktuell rein
+in-memory (_mock_store), Onboarding-Datensätze gehen bei jedem
+Prozess-Neustart verloren.
 """
 from __future__ import annotations
 

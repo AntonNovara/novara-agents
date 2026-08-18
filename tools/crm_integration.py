@@ -2,6 +2,11 @@
 CRM / ERP Integration Tool – Mock-Implementierung.
 In Produktion: Ersetze _post_to_erp() durch echten HTTP-Client (httpx).
 Das Interface bleibt identisch – keine Änderungen am aufrufenden Code nötig.
+
+TODO: vor Einsatz auf echtes CRM/ERP umstellen. Aktuell rein in-memory
+(_mock_store), Daten gehen bei jedem Prozess-Neustart verloren. Siehe
+operations_agent.py/sdr_agent.py für den genauen Stand & warum ein Swap auf
+crm_handler.py (Repo la-maquina-de-confianza) nicht 1:1 möglich ist.
 """
 from __future__ import annotations
 
