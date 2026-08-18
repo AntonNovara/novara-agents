@@ -80,7 +80,7 @@ DISQUALIFIED_LEAD = {
 }
 
 SAMPLE_INVOICE = (
-    "Rechnung RE-2026-042\n"
+    "Rechnung NA-2026-042\n"
     "Novara Automation, Wien\n"
     "Leistung: Starter-Paket Prozessautomatisierung\n"
     "Gesamtbetrag: 990,00 EUR\n"

@@ -119,7 +119,7 @@ Analysiere die eingehende Kundenanfrage und gib AUSSCHLIESSLICH valides JSON zur
 Regeln:
   - "complaint" = Kunde äußert Unzufriedenheit oder Ärger
   - "billing" = Fragen zu Preisen (Starter €990, Growth €2.490, Retainer €590/Monat),
-    Rechnungen (RE-2026-xxx), Zahlungsmodell (50/50)
+    Rechnungen (NA-2026-xxx), Zahlungsmodell (50/50)
   - urgency "high" = Kunde ist blockiert, System ausgefallen, Datenverlust
   - language "de" wenn Anfrage primär auf Deutsch, sonst "en"
 
