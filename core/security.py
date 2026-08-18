@@ -17,14 +17,48 @@ logger = logging.getLogger(__name__)
 
 _PII_PATTERNS: dict[str, re.Pattern] = {
     "email":      re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"),
+    # phone_de: (?<![A-Za-z0-9\-]) prevents matching mid-UUID ("b96a-0532...") or mid-date ("2026-05-19").
+    # KEIN "/" in der Wert-Klasse: das würde mit dem "/"-getrennten
+    # Steuernummer-Format kollidieren (siehe tax_id) — ohne diese Einschränkung
+    # matcht die führende "0"-Variante fälschlich Texte wie "06 418/9574".
+    "phone_de":   re.compile(r"(?<![A-Za-z0-9\-])(\+49|0)\s*[\d\s\-]{6,15}(?!\d)"),
+    # phone_at: gleiche Logik für österreichische Nummern (+43) — Novaras
+    # gesamtes ICP ist Wien/Österreich, das fehlte bisher komplett und liess
+    # AT-Telefonnummern unerkannt durchrutschen.
+    "phone_at":   re.compile(r"(?<![A-Za-z0-9\-])(\+43)\s*[\d\s\-]{6,15}(?!\d)"),
     # IBAN: matches both compact (DE89370400440532013000) and spaced (DE89 3704 0044 0532 0130 00)
     "iban":       re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]{4}){3,8}(?:[ ]?[A-Z0-9]{0,4})?\b"),
-    # phone_de: (?<![A-Za-z0-9\-]) prevents matching mid-UUID ("b96a-0532...") or mid-date ("2026-05-19")
-    "phone_de":   re.compile(r"(?<![A-Za-z0-9\-])(\+49|0)\s*[\d\s\-/]{6,15}(?!\d)"),
     "ip_address": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
     # German tax ID (Steuernummer) – 10-13 digits, sometimes with slashes
     "tax_id":     re.compile(r"\b\d{2,3}[/\s]?\d{3}[/\s]?\d{4,5}\b"),
 }
+
+# Kontaktdaten, die Agenten für ihre eigentliche Aufgabe benötigen (CRM-Eintrag,
+# Welcome-Mail, Ticket-Zuordnung, Outreach, ...). Werden weiterhin ERKANNT
+# (Findings/Audit-Trail, DSGVO Art. 30), aber NICHT redigiert — anders als
+# echte Gefahrendaten (IBAN, Steuernummer, IP, Credentials), die immer ersetzt
+# werden. check_and_redact() maskiert diese Treffer vor der Redaktion der
+# übrigen Muster und stellt sie danach unverändert wieder her, damit z. B.
+# tax_id nicht versehentlich einen Teil einer Telefonnummer mitredigiert.
+_CONTACT_TYPES: frozenset[str] = frozenset({"email", "phone_de", "phone_at"})
+
+# Prompt-Injection-Heuristik (portiert aus sdr_demo_referencia/app/dlp.py,
+# gleicher Stil wie der bestehende Credential-Hard-Block: einfacher
+# Substring-Abgleich auf mehrwortigen Phrasen).
+_INJECTION_MARKERS: tuple[str, ...] = (
+    "ignoriere die vorherigen anweisungen",
+    "ignore previous instructions",
+    "ignore all previous instructions",
+    "du bist jetzt",
+    "you are now",
+    "system prompt",
+    "systemanweisung",
+    "reveal your instructions",
+    "zeige deine anweisungen",
+    "vergiss deine regeln",
+    "act as",
+    "verhalte dich als",
+)
 
 # Credential-Keywords, die auf ein Hard-Stop-Muster hindeuten. Ein reiner
 # Substring-Treffer (z. B. "Passwort" in "...Passwort setzen.") ist KEIN Leak
@@ -80,17 +114,59 @@ class SecurityLayer:
                 blocked_reason=f"Blocked credential pattern detected: '{match.group(0)}'",
             )
 
+        # Hard-stop: Prompt-Injection-Versuch.
+        lower = text.lower()
+        injection_marker = next((m for m in _INJECTION_MARKERS if m in lower), None)
+        if injection_marker:
+            logger.warning("DLP hard-block triggered", extra={"injection_marker": injection_marker})
+            return DLPResult(
+                approved=False,
+                redacted_text=text,
+                blocked_reason=f"Prompt injection marker detected: '{injection_marker}'",
+            )
+
         if not settings.enable_pii_redaction:
             return DLPResult(approved=True, redacted_text=text)
 
-        redacted = text
         findings: list[str] = []
 
+        # 1) Kontaktdaten (E-Mail/Telefon) im UNVERÄNDERTEN Text erkennen und
+        # deren Positionen merken (nicht ersetzen) — verhindert, dass ein
+        # nachfolgendes Sensible-Daten-Pattern (z. B. tax_id) versehentlich
+        # einen Teil einer nicht zu redigierenden Telefonnummer mit-erfasst
+        # (das genaue Bug-Szenario, das diesen Fix motiviert hat). Nach
+        # Ursprungsposition sortiert, damit Schritt 3 sie in Textreihenfolge
+        # wiederherstellen kann, unabhängig davon, welcher Kontakt-Typ zuerst
+        # gefunden wurde.
+        contact_spans: list[tuple[int, int, str]] = []
+        for contact_type in _CONTACT_TYPES:
+            type_matches = list(_PII_PATTERNS[contact_type].finditer(text))
+            if type_matches:
+                findings.append(f"{contact_type}: {len(type_matches)} occurrence(s) detected (nicht redigiert)")
+            contact_spans.extend((m.start(), m.end(), m.group(0)) for m in type_matches)
+        contact_spans.sort(key=lambda span: span[0])
+
+        # 2) Diese Stellen mit \0 maskieren (gleiche Länge wie das Original,
+        # \0 kann in keinem PII-Muster vorkommen), dann alles redigieren, was
+        # NICHT Kontaktdaten ist.
+        masked = text
+        for start, end, _ in contact_spans:
+            masked = masked[:start] + ("\0" * (end - start)) + masked[end:]
+
+        redacted = masked
         for pii_type, pattern in _PII_PATTERNS.items():
+            if pii_type in _CONTACT_TYPES:
+                continue
             matches = pattern.findall(redacted)
             if matches:
                 findings.append(f"{pii_type}: {len(matches)} occurrence(s) redacted")
                 redacted = pattern.sub(f"[REDACTED:{pii_type.upper()}]", redacted)
+
+        # 3) Maskierte Kontaktdaten wieder durch die Originalwerte ersetzen,
+        # in derselben Reihenfolge, in der sie im Text vorkommen.
+        if contact_spans:
+            originals = iter(original for _, _, original in contact_spans)
+            redacted = re.sub(r"\0+", lambda _m: next(originals), redacted)
 
         if findings:
             logger.info("PII redaction applied", extra={"findings": findings})
