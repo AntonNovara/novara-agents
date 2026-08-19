@@ -194,7 +194,10 @@ Hard-Block (Request wird abgelehnt, nicht nur redigiert) bei:
     wurde in Runde 5 komplett entfernt — siehe unten, warum. Alle Cue-Wörter
     sind exakte Wortformen (`\bwort\b`), KEINE Wortstämme mit
     Wildcard-Suffix — siehe Runde 4d unten. Portiert (Stufe-1-Kernidee) aus
-    `sdr_demo_referencia/app/dlp.py`.
+    `sdr_demo_referencia/app/dlp.py`
+    (https://github.com/AntonNovara/sdr_demo_referencia, privates Repo) — die
+    dortige Stufe-2-Logik wurde inzwischen umgekehrt aus dieser, verfeinerten
+    Fassung zurückportiert.
 
 **Ehemaliger offener Punkt "Prompt-Injection-Marker sind zu breit" — behoben,
 über drei Nachbesserungsrunden.** Ursprünglich per `/code-review ultra`
@@ -313,8 +316,12 @@ Runde-5 korrigiert, indem beiden Sätzen ein Marker hinzugefügt wurde.
 >
 > **Bedingung für die nächste Runde:** Sobald IRGENDEINER dieser Agenten
 > öffentlich exponiert wird (Endnutzer aus dem Internet, ohne Novara als
-> Gatekeeper dazwischen) — so wie es `sdr_demo_referencia/` bereits ist —
-> MUSS diese Lücke vor dem Go-Live neu bewertet werden, dann mit einer
+> Gatekeeper dazwischen) — so wie es `sdr_demo_referencia/`
+> (https://github.com/AntonNovara/sdr_demo_referencia, privates Repo)
+> laut README werden SOLL, aber Stand heute NICHT ist: geprüft am
+> 2026-08-19, keine Deployment-Spuren lokal, die zuvor dokumentierte
+> Railway-URL liefert Railways eigenes "Application not found" statt der
+> App — MUSS diese Lücke vor dem Go-Live neu bewertet werden, dann mit einer
 > LLM-basierten Klassifikation für genau diese Randfälle
 > (`core/llm.py`-Factory existiert bereits) statt einer siebten
 > Wortlisten-/Phrasenmatching-Runde. Nicht früher — eine weitere Runde
@@ -372,7 +379,9 @@ Aktiv, wenn:
 
 > **Nur Entwicklungs-/Kosten-Bequemlichkeit, kein Sicherheits-Mechanismus.**
 > Sobald ein Agent öffentlich als Demo exponiert wird (wie
-> `sdr_demo_referencia/`), muss dort Demo-Modus zum Fail-Safe-Default werden
+> `sdr_demo_referencia/`, https://github.com/AntonNovara/sdr_demo_referencia
+> — laut eigenem README als öffentliche Demo gedacht, Stand 2026-08-19 aber
+> noch nicht deployed), muss dort Demo-Modus zum Fail-Safe-Default werden
 > (an, sofern nicht explizit für Prod freigeschaltet) — das ist noch offen.
 
 ---
