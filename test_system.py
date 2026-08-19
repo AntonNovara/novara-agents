@@ -676,14 +676,16 @@ def test_prompt_injection_precision() -> None:
     info(
         "Regressionstest für die verschärfte, zweistufige Heuristik (löst den "
         "in CLAUDE.md dokumentierten 'Offener Punkt: Prompt-Injection-Marker "
-        "sind zu breit' ab, inkl. Nachbesserung aus /code-review ultra Runde "
-        "4): mehrdeutige Rollenumdefinitions-Marker ('you are now', 'act as', "
-        "'du bist jetzt', 'verhalte dich als') blocken nur noch zusammen mit "
-        "einem eindeutigen KI-Identitätswort ODER einem Einschränkungsbegriff "
-        "+ Verneinungssignal GEMEINSAM in der Nähe — ein einzelnes Wort wie "
-        "'Regeln'/'filter'/'character'/'assistant' reicht bewusst NICHT mehr "
-        "allein. Drei Gruppen MÜSSEN unterschiedlich behandelt werden — alle "
-        "werden unten separat ausgewertet."
+        "sind zu breit' ab, über drei Nachbesserungsrunden aus /code-review "
+        "ultra Runde 4a/b/c/d): mehrdeutige Rollenumdefinitions-Marker ('you "
+        "are now', 'act as', 'du bist jetzt', 'verhalte dich als') blocken "
+        "nur noch zusammen mit ENTWEDER 'jailbreak'/'developer mode' allein "
+        "(kein plausibler Business-Fall) ODER einem KI-/Einschränkungswort + "
+        "Verneinungssignal GEMEINSAM in der Nähe — weder ein einzelnes Wort "
+        "wie 'Regeln'/'filter'/'character' NOCH das für sich mittlerweile "
+        "ganz normale Geschäftswort 'AI' reicht mehr allein. Drei Gruppen "
+        "MÜSSEN unterschiedlich behandelt werden — alle werden unten "
+        "separat ausgewertet."
     )
 
     try:
@@ -715,6 +717,35 @@ def test_prompt_injection_precision() -> None:
         "Bitte verhalte dich als Vertreter und befolge unsere Regeln.",
         "Please act as a character reference for this rental application.",
         "Please act as a filter for spam inquiries and forward the rest to me.",
+        # Konkrete False Positives der ZWEITEN Fassung von Stufe 2, gefunden
+        # per /code-review ultra Runde 4d — "AI" allein reichte dort schon
+        # als eigenständig ausreichender Cue, obwohl es 2026 ein ganz
+        # normales Geschäftswort ist:
+        "You are now working with our AI team lead on this integration project.",
+        "Please act as the point of contact for our AI vendor evaluation.",
+        # Wortstamm-Overmatches derselben Fassung, ebenfalls Runde 4d --
+        # "persona"-Stamm fing "personal", "polic"-Stamm fing "police",
+        # "limit"-Stamm fing "Limited" (Firmensuffix):
+        "You are now our contact, please handle personal data carefully, no exceptions.",
+        "Please act as the listing agent, this property has no police reports on file.",
+        "You are now the primary contact - our company is XYZ Limited, no changes needed otherwise.",
+        # "lift" als Verneinungssignal kollidierte mit dem österreichischen
+        # Alltagswort "Lift" (Aufzug) -- Runde 4d, direkt relevant für
+        # Novaras Immobilienmakler-ICP:
+        "Verhalte dich als Hausverwalter: Regel fuer den Lift beachten, danke.",
+        # Eigene Nachprüfung (nicht vom Reviewer gefunden, aber dieselbe
+        # Klasse von Wortstamm-/Wortlisten-Kollision): "regel"-Stamm hätte
+        # "regelmäßig" gefangen, "ohne"-Stamm hätte "ohnehin" gefangen,
+        # "characteristics" enthält "character", "disable"/"safeguard"
+        # kollidieren mit barrierefreiem Zugang (Immobilien-Compliance) bzw.
+        # Elektriker-Vokabular (Sicherung/Schutzschalter):
+        "Bitte kontaktieren Sie uns regelmäßig für Wartungstermine, "
+        "wir kümmern uns ohnehin um alles.",
+        "Please note the technical characteristics of this product before ordering.",
+        "You are now the site electrician, please turn off the power and "
+        "check the safeguard breaker.",
+        "Please act as the site electrician, note the building lacks "
+        "disabled access, no exceptions for compliance rules.",
     )
     legit_pass = 0
     for txt in legit_business_texts:

@@ -88,21 +88,38 @@ _INJECTION_MARKERS_STRICT: tuple[str, ...] = (
 #
 # Blockt nur, wenn ZUSÄTZLICH in der Nähe (±_ROLE_REDEFINITION_WINDOW
 # Zeichen) ENTWEDER
-#   (a) ein eindeutiges KI-/System-Identitätswort auftaucht
-#       (_AI_IDENTITY_*, z. B. "AI", "chatbot", "jailbreak") — kommt in
-#       echtem Geschäftstext praktisch nie vor, reicht daher allein, ODER
-#   (b) ein Einschränkungsbegriff UND ein Aufhebungs-/Verneinungssignal
-#       GEMEINSAM auftauchen (_CONSTRAINT_NOUN_CUES + _NEGATION_SIGNAL_*,
-#       z. B. "no rules", "without restrictions", "free from ... limits").
-# Ein einzelnes Einschränkungswort wie "Regeln"/"filter"/"character"/
-# "assistant" ist dagegen ein GANZ NORMALES Geschäftswort und darf NICHT
-# allein blocken — genau das war der Fehler der ersten Fassung dieser
-# Stufe (verifiziert per /code-review ultra, 4. Runde): "act as a
-# character reference for this rental application", "act as a filter for
-# spam inquiries", "verhalte dich als Vertreter und befolge unsere
-# Regeln" wurden alle fälschlich geblockt, weil "character"/"filter"/
-# "regel" allein schon als Cue zählten. Erst das Zusammentreffen mit einem
-# Verneinungssignal macht daraus ein plausibles Jailbreak-Muster.
+#   (a) ein Wort auftaucht, das für sich GENOMMEN schon eindeutig ist
+#       (_STANDALONE_SUFFICIENT_CUES: "jailbreak", "developer mode",
+#       "entwicklermodus" — kein plausibler Business-Anwendungsfall in
+#       Novaras ICP, egal in welchem Satz), ODER
+#   (b) ein Einschränkungs-/KI-Begriff UND ein Aufhebungs-/Verneinungssignal
+#       GEMEINSAM auftauchen (_PAIRED_CUES + _NEGATION_SIGNAL_*, z. B.
+#       "no rules", "without restrictions", "free from ... limits", "an
+#       unrestricted AI").
+#
+# Zwei Lektionen aus vorherigen Runden sind hier eingearbeitet
+# (verifiziert per /code-review ultra, jeweils):
+#
+# 1. (Runde 4b) Ein einzelnes Einschränkungswort wie "Regeln"/"filter"/
+#    "character" ist ein GANZ NORMALES Geschäftswort und darf NICHT allein
+#    blocken ("act as a character reference for this rental application",
+#    "act as a filter for spam inquiries"). Deshalb Pairing-Pflicht (b).
+#
+# 2. (Runde 4d) "AI" ist mittlerweile SELBST ein normales Geschäftswort
+#    ("our AI vendor evaluation", "our AI team lead") und darf deshalb
+#    NICHT mehr eigenständig ausreichen — anders als in Runde 4c
+#    angenommen. KI-Identitätswörter (ai/ki/chatbot/llm/...) sind daher
+#    Teil von _PAIRED_CUES, nicht mehr von _STANDALONE_SUFFICIENT_CUES.
+#    Nur "jailbreak"/"developer mode"/"entwicklermodus" bleiben eigenständig
+#    ausreichend, weil dafür in Novaras ICP (Elektriker, Steuerberater,
+#    Immobilienmakler) kein plausibler harmloser Anwendungsfall existiert.
+#
+# Alle Wortlisten unten verwenden explizite Formen statt Wortstämme mit
+# Wildcard-Suffix (`\bstamm\w*`) — Stämme overmatchen unvorhersehbar auf
+# ähnlich geschriebene, völlig unverwandte Wörter (ebenfalls Runde 4d):
+# "persona" matchte "personal", "polic" matchte "police", "limit" matchte
+# "Limited" (Firmensuffix), "regel" (als Stamm) hätte "regelmäßig" matchen
+# können, "ohne" (als Stamm) hätte "ohnehin" gematcht.
 _ROLE_REDEFINITION_PATTERNS: tuple[re.Pattern, ...] = tuple(
     re.compile(r"\b" + phrase + r"\b")
     for phrase in (
@@ -114,42 +131,56 @@ _ROLE_REDEFINITION_PATTERNS: tuple[re.Pattern, ...] = tuple(
 )
 _ROLE_REDEFINITION_WINDOW = 60  # Zeichen vor/nach dem Marker, die auf Cues geprüft werden
 
-_AI_IDENTITY_CUES_EXACT: tuple[str, ...] = ("ai", "ki", "bot", "bots", "llm")
-_AI_IDENTITY_CUES_PREFIX: tuple[str, ...] = (
-    "artificial intelligence", "künstliche intelligenz", "chatbot",
-    "jailbreak", "developer mode", "entwicklermodus", "large language model",
+_STANDALONE_SUFFICIENT_CUES: tuple[str, ...] = (
+    "jailbreak", "developer mode", "entwicklermodus",
 )
 
-# Einschränkungsbegriffe -- bewusst OHNE eigenständige Blockierwirkung, siehe
-# Kommentar oben. Kurzstämme (z. B. "boundar", "polic") statt vollständiger
-# Wörter, damit Deklinationen/Pluralformen greifen ("boundary"/"boundaries",
-# "policy"/"policies").
-_CONSTRAINT_NOUN_CUES: tuple[str, ...] = (
-    "rule", "regel", "filter", "restriction", "einschränkung", "guideline",
-    "richtlinie", "boundar", "limit", "character", "persona", "creator",
-    "polic", "safeguard",
+# KI-Identität + Einschränkungsbegriffe -- bewusst OHNE eigenständige
+# Blockierwirkung (siehe Punkt 2 und Lektion 1 oben). Explizite Wortformen
+# statt Stämme (siehe Lektion oben) -- z. B. "regel"/"regeln" statt eines
+# "regel"-Stamms, der "regelmäßig" mitgefangen hätte.
+_PAIRED_CUES: tuple[str, ...] = (
+    "ai", "ki", "llm", "artificial intelligence", "künstliche intelligenz",
+    "chatbot", "large language model",
+    "rule", "rules", "regel", "regeln",
+    "filter", "filters",
+    "restriction", "restrictions", "einschränkung", "einschränkungen",
+    "guideline", "guidelines", "richtlinie", "richtlinien",
+    "boundary", "boundaries",
+    "limit", "limits", "limitation", "limitations",
+    "character", "characters",
+    "persona", "personas",
+    "creator", "creators",
+    "policy", "policies",
 )
-_NEGATION_SIGNAL_CUES_EXACT: tuple[str, ...] = ("no", "none", "keine")
-_NEGATION_SIGNAL_CUES_PREFIX: tuple[str, ...] = (
-    "without", "ohne", "free from", "remove", "bypass", "override",
-    "disable", "ignore", "forget", "disregard", "lift", "turn off",
+_NEGATION_SIGNAL_CUES: tuple[str, ...] = (
+    "no", "none", "keine", "ohne", "without", "free from", "remove",
+    "bypass", "override", "ignore", "forget", "disregard", "turn off",
     "unrestricted", "uneingeschränkt", "unlimited", "unlock",
 )
+# "lift" (Aufhebungs-Verb) bewusst NICHT aufgenommen -- kollidiert mit dem
+# österreichischen Alltagswort "Lift" (Aufzug), direkt relevant für Novaras
+# Immobilienmakler-ICP. "disable"/"safeguard" ebenfalls bewusst nicht
+# aufgenommen -- "disabled access" ist Standardvokabular in
+# Immobilien-Compliance-Texten, "safeguard" kollidiert mit
+# Elektriker-Vokabular (Sicherung/Schutzschalter).
 
 
-def _compile_cues(exact: tuple[str, ...], prefix: tuple[str, ...]) -> tuple[re.Pattern, ...]:
-    return tuple(re.compile(r"\b" + re.escape(c) + r"\b") for c in exact) + tuple(
-        re.compile(r"\b" + re.escape(c) + r"\w*") for c in prefix
-    )
+def _compile_word_patterns(words: tuple[str, ...]) -> tuple[re.Pattern, ...]:
+    # Ausschließlich exakte Wort-/Phrasengrenzen (\b...\b), KEIN
+    # Wildcard-Suffix -- siehe Lektion zu Wortstämmen oben. Mehrwortige
+    # Phrasen (z. B. "free from") funktionieren genauso, \b greift an
+    # beiden Enden der ganzen Phrase.
+    return tuple(re.compile(r"\b" + re.escape(word) + r"\b") for word in words)
 
 
-_AI_IDENTITY_PATTERNS = _compile_cues(_AI_IDENTITY_CUES_EXACT, _AI_IDENTITY_CUES_PREFIX)
-_CONSTRAINT_NOUN_PATTERNS = _compile_cues((), _CONSTRAINT_NOUN_CUES)
-_NEGATION_SIGNAL_PATTERNS = _compile_cues(_NEGATION_SIGNAL_CUES_EXACT, _NEGATION_SIGNAL_CUES_PREFIX)
+_STANDALONE_SUFFICIENT_PATTERNS = _compile_word_patterns(_STANDALONE_SUFFICIENT_CUES)
+_PAIRED_CUE_PATTERNS = _compile_word_patterns(_PAIRED_CUES)
+_NEGATION_SIGNAL_PATTERNS = _compile_word_patterns(_NEGATION_SIGNAL_CUES)
 
 
 def _cue_spans(patterns: tuple[re.Pattern, ...], haystack: str) -> list[tuple[int, int]]:
-    # Läuft EINMAL über den vollständigen (unveränderten) Text statt über ein
+    # Läuft über den vollständigen (unveränderten) Text statt über ein
     # zeichenweise zugeschnittenes Fenster -- ein Fensterausschnitt, der
     # zufällig mitten in einem Wort beginnt, würde sonst dem \b-Muster eine
     # Wortgrenze vortäuschen, die im Originaltext gar nicht existiert
@@ -227,26 +258,31 @@ class SecurityLayer:
             )
 
         # Hard-stop: Prompt-Injection-Versuch, Stufe 2 (Rollenumdefinition +
-        # KI-Identität ODER Einschränkung+Verneinung in der Nähe — siehe
-        # Kommentar bei den Pattern-Definitionen oben). Cue-Treffer werden
-        # einmal über den ganzen Text ermittelt, die "Nähe"-Prüfung ist dann
-        # nur noch ein numerischer Bereichsvergleich (kein erneutes Suchen
-        # auf einem zugeschnittenen Substring, siehe _cue_spans).
-        ai_identity_spans = _cue_spans(_AI_IDENTITY_PATTERNS, lower)
-        constraint_spans = _cue_spans(_CONSTRAINT_NOUN_PATTERNS, lower)
-        negation_spans = _cue_spans(_NEGATION_SIGNAL_PATTERNS, lower)
+        # Cue in der Nähe — siehe Kommentar bei den Pattern-Definitionen
+        # oben). Cue-Spans werden nur berechnet, wenn überhaupt mindestens
+        # ein Rollenumdefinitions-Marker im Text vorkommt -- auf dem
+        # weitaus häufigsten Pfad (kein Marker vorhanden) entfällt damit die
+        # ~15 Regex-Scans teure Cue-Suche komplett (verifiziert per
+        # /code-review ultra, 4. Runde: check_and_redact läuft auf jedem
+        # Agenten-Input UND -Output).
+        role_matches = [
+            match for pattern in _ROLE_REDEFINITION_PATTERNS for match in pattern.finditer(lower)
+        ]
+        if role_matches:
+            standalone_spans = _cue_spans(_STANDALONE_SUFFICIENT_PATTERNS, lower)
+            paired_spans = _cue_spans(_PAIRED_CUE_PATTERNS, lower)
+            negation_spans = _cue_spans(_NEGATION_SIGNAL_PATTERNS, lower)
 
-        for pattern in _ROLE_REDEFINITION_PATTERNS:
-            for match in pattern.finditer(lower):
+            for match in role_matches:
                 window_start = match.start() - _ROLE_REDEFINITION_WINDOW
                 window_end = match.end() + _ROLE_REDEFINITION_WINDOW
                 triggered_by = None
-                if _overlaps_window(ai_identity_spans, window_start, window_end):
-                    triggered_by = "AI-identity cue"
-                elif _overlaps_window(constraint_spans, window_start, window_end) and _overlaps_window(
+                if _overlaps_window(standalone_spans, window_start, window_end):
+                    triggered_by = "standalone AI/jailbreak cue"
+                elif _overlaps_window(paired_spans, window_start, window_end) and _overlaps_window(
                     negation_spans, window_start, window_end
                 ):
-                    triggered_by = "constraint+negation cue pair"
+                    triggered_by = "constraint/AI-identity + negation cue pair"
                 if triggered_by:
                     logger.warning(
                         "DLP hard-block triggered",
