@@ -85,10 +85,24 @@ _INJECTION_MARKERS_STRICT: tuple[str, ...] = (
 # ("You are now our primary contact...", "act as the account owner...",
 # "Ab sofort verhalte dich als Hauptansprechpartner..."). \b-Grenzen zudem,
 # damit z. B. "react as soon as possible" nicht fälschlich "act as" matcht.
-# Blockt nur noch, wenn ZUSÄTZLICH ein KI-/System-Bezugswort in
-# unmittelbarer Nähe steht (siehe _AI_ROLE_CUE_PATTERNS/_has_ai_role_cue
-# unten) — ein echter Jailbreak-Versuch redefiniert nie eine menschliche
-# Geschäftsrolle, sondern immer die Rolle/Beschränkungen des Modells selbst.
+#
+# Blockt nur, wenn ZUSÄTZLICH in der Nähe (±_ROLE_REDEFINITION_WINDOW
+# Zeichen) ENTWEDER
+#   (a) ein eindeutiges KI-/System-Identitätswort auftaucht
+#       (_AI_IDENTITY_*, z. B. "AI", "chatbot", "jailbreak") — kommt in
+#       echtem Geschäftstext praktisch nie vor, reicht daher allein, ODER
+#   (b) ein Einschränkungsbegriff UND ein Aufhebungs-/Verneinungssignal
+#       GEMEINSAM auftauchen (_CONSTRAINT_NOUN_CUES + _NEGATION_SIGNAL_*,
+#       z. B. "no rules", "without restrictions", "free from ... limits").
+# Ein einzelnes Einschränkungswort wie "Regeln"/"filter"/"character"/
+# "assistant" ist dagegen ein GANZ NORMALES Geschäftswort und darf NICHT
+# allein blocken — genau das war der Fehler der ersten Fassung dieser
+# Stufe (verifiziert per /code-review ultra, 4. Runde): "act as a
+# character reference for this rental application", "act as a filter for
+# spam inquiries", "verhalte dich als Vertreter und befolge unsere
+# Regeln" wurden alle fälschlich geblockt, weil "character"/"filter"/
+# "regel" allein schon als Cue zählten. Erst das Zusammentreffen mit einem
+# Verneinungssignal macht daraus ein plausibles Jailbreak-Muster.
 _ROLE_REDEFINITION_PATTERNS: tuple[re.Pattern, ...] = tuple(
     re.compile(r"\b" + phrase + r"\b")
     for phrase in (
@@ -98,29 +112,54 @@ _ROLE_REDEFINITION_PATTERNS: tuple[re.Pattern, ...] = tuple(
         "verhalte dich als",
     )
 )
-_ROLE_REDEFINITION_WINDOW = 60  # Zeichen vor/nach dem Marker, die auf ein Cue geprüft werden
+_ROLE_REDEFINITION_WINDOW = 60  # Zeichen vor/nach dem Marker, die auf Cues geprüft werden
 
-# Kurze/mehrdeutige Cues (z. B. "ai") NUR als exaktes Wort, sonst matcht
-# "ai" versehentlich in "again", "air", "certain", ... Längere Cues dürfen
-# als Präfix matchen, damit deutsche Flexionsformen greifen
-# ("uneingeschränkt" -> "uneingeschränkter", "uneingeschränkte", ...).
-_AI_ROLE_CUES_EXACT: tuple[str, ...] = ("ai", "ki", "bot", "bots")
-_AI_ROLE_CUES_PREFIX: tuple[str, ...] = (
-    "assistant", "assistent", "artificial intelligence",
-    "künstliche intelligenz", "chatbot", "prompt", "instruction",
-    "anweisung", "rule", "regel", "restriction", "einschränkung",
-    "filter", "persona", "character", "unrestricted", "uneingeschränkt",
-    "jailbreak", "developer mode", "entwicklermodus",
-)
-_AI_ROLE_CUE_PATTERNS: tuple[re.Pattern, ...] = tuple(
-    re.compile(r"\b" + re.escape(cue) + r"\b") for cue in _AI_ROLE_CUES_EXACT
-) + tuple(
-    re.compile(r"\b" + re.escape(cue) + r"\w*") for cue in _AI_ROLE_CUES_PREFIX
+_AI_IDENTITY_CUES_EXACT: tuple[str, ...] = ("ai", "ki", "bot", "bots", "llm")
+_AI_IDENTITY_CUES_PREFIX: tuple[str, ...] = (
+    "artificial intelligence", "künstliche intelligenz", "chatbot",
+    "jailbreak", "developer mode", "entwicklermodus", "large language model",
 )
 
+# Einschränkungsbegriffe -- bewusst OHNE eigenständige Blockierwirkung, siehe
+# Kommentar oben. Kurzstämme (z. B. "boundar", "polic") statt vollständiger
+# Wörter, damit Deklinationen/Pluralformen greifen ("boundary"/"boundaries",
+# "policy"/"policies").
+_CONSTRAINT_NOUN_CUES: tuple[str, ...] = (
+    "rule", "regel", "filter", "restriction", "einschränkung", "guideline",
+    "richtlinie", "boundar", "limit", "character", "persona", "creator",
+    "polic", "safeguard",
+)
+_NEGATION_SIGNAL_CUES_EXACT: tuple[str, ...] = ("no", "none", "keine")
+_NEGATION_SIGNAL_CUES_PREFIX: tuple[str, ...] = (
+    "without", "ohne", "free from", "remove", "bypass", "override",
+    "disable", "ignore", "forget", "disregard", "lift", "turn off",
+    "unrestricted", "uneingeschränkt", "unlimited", "unlock",
+)
 
-def _has_ai_role_cue(window: str) -> bool:
-    return any(pattern.search(window) for pattern in _AI_ROLE_CUE_PATTERNS)
+
+def _compile_cues(exact: tuple[str, ...], prefix: tuple[str, ...]) -> tuple[re.Pattern, ...]:
+    return tuple(re.compile(r"\b" + re.escape(c) + r"\b") for c in exact) + tuple(
+        re.compile(r"\b" + re.escape(c) + r"\w*") for c in prefix
+    )
+
+
+_AI_IDENTITY_PATTERNS = _compile_cues(_AI_IDENTITY_CUES_EXACT, _AI_IDENTITY_CUES_PREFIX)
+_CONSTRAINT_NOUN_PATTERNS = _compile_cues((), _CONSTRAINT_NOUN_CUES)
+_NEGATION_SIGNAL_PATTERNS = _compile_cues(_NEGATION_SIGNAL_CUES_EXACT, _NEGATION_SIGNAL_CUES_PREFIX)
+
+
+def _cue_spans(patterns: tuple[re.Pattern, ...], haystack: str) -> list[tuple[int, int]]:
+    # Läuft EINMAL über den vollständigen (unveränderten) Text statt über ein
+    # zeichenweise zugeschnittenes Fenster -- ein Fensterausschnitt, der
+    # zufällig mitten in einem Wort beginnt, würde sonst dem \b-Muster eine
+    # Wortgrenze vortäuschen, die im Originaltext gar nicht existiert
+    # (verifiziert per /code-review ultra, 4. Runde: Fensterschnitt mitten in
+    # "chai..." täuschte fälschlich das eigenständige Wort "ai" vor).
+    return [m.span() for pattern in patterns for m in pattern.finditer(haystack)]
+
+
+def _overlaps_window(spans: list[tuple[int, int]], window_start: int, window_end: int) -> bool:
+    return any(start < window_end and end > window_start for start, end in spans)
 
 # Credential-Keywords, die auf ein Hard-Stop-Muster hindeuten. Ein reiner
 # Substring-Treffer (z. B. "Passwort" in "...Passwort setzen.") ist KEIN Leak
@@ -188,25 +227,37 @@ class SecurityLayer:
             )
 
         # Hard-stop: Prompt-Injection-Versuch, Stufe 2 (Rollenumdefinition +
-        # KI-/System-Bezugswort in der Nähe — siehe Kommentar bei den
-        # Pattern-Definitionen oben).
+        # KI-Identität ODER Einschränkung+Verneinung in der Nähe — siehe
+        # Kommentar bei den Pattern-Definitionen oben). Cue-Treffer werden
+        # einmal über den ganzen Text ermittelt, die "Nähe"-Prüfung ist dann
+        # nur noch ein numerischer Bereichsvergleich (kein erneutes Suchen
+        # auf einem zugeschnittenen Substring, siehe _cue_spans).
+        ai_identity_spans = _cue_spans(_AI_IDENTITY_PATTERNS, lower)
+        constraint_spans = _cue_spans(_CONSTRAINT_NOUN_PATTERNS, lower)
+        negation_spans = _cue_spans(_NEGATION_SIGNAL_PATTERNS, lower)
+
         for pattern in _ROLE_REDEFINITION_PATTERNS:
             for match in pattern.finditer(lower):
-                window = lower[
-                    max(0, match.start() - _ROLE_REDEFINITION_WINDOW):
-                    match.end() + _ROLE_REDEFINITION_WINDOW
-                ]
-                if _has_ai_role_cue(window):
+                window_start = match.start() - _ROLE_REDEFINITION_WINDOW
+                window_end = match.end() + _ROLE_REDEFINITION_WINDOW
+                triggered_by = None
+                if _overlaps_window(ai_identity_spans, window_start, window_end):
+                    triggered_by = "AI-identity cue"
+                elif _overlaps_window(constraint_spans, window_start, window_end) and _overlaps_window(
+                    negation_spans, window_start, window_end
+                ):
+                    triggered_by = "constraint+negation cue pair"
+                if triggered_by:
                     logger.warning(
                         "DLP hard-block triggered",
-                        extra={"injection_marker": match.group(0), "ai_role_cue_window": window},
+                        extra={"injection_marker": match.group(0), "triggered_by": triggered_by},
                     )
                     return DLPResult(
                         approved=False,
                         redacted_text=text,
                         blocked_reason=(
                             f"Prompt injection marker detected: '{match.group(0)}' "
-                            "(paired with an AI/system role cue nearby)"
+                            f"({triggered_by} nearby)"
                         ),
                     )
 
