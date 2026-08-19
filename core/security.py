@@ -58,23 +58,69 @@ _PII_PATTERNS: dict[str, re.Pattern] = {
 # beiden Kategorien dazukommen.
 _CONTACT_TYPES: frozenset[str] = frozenset({"email", "phone_de", "phone_at"})
 
-# Prompt-Injection-Heuristik (portiert aus sdr_demo_referencia/app/dlp.py,
-# gleicher Stil wie der bestehende Credential-Hard-Block: einfacher
-# Substring-Abgleich auf mehrwortigen Phrasen).
-_INJECTION_MARKERS: tuple[str, ...] = (
+# Prompt-Injection-Heuristik, zweistufig (Nachfolger der ursprünglichen,
+# aus sdr_demo_referencia/app/dlp.py portierten Fassung mit einer flachen
+# Marker-Liste — siehe CLAUDE.md, "Offener Punkt: Prompt-Injection-Marker
+# sind zu breit", jetzt behoben).
+#
+# Stufe 1 — eindeutige Marker: referenzieren immer explizit "Anweisungen"/
+# "instructions"/"Regeln"/"prompt", also die Steuerungsebene des Modells
+# selbst. Echter Geschäftstext (Elektriker, Steuerberater, Immobilien-
+# makler, ...) redet praktisch nie in diesen Begriffen über sich selbst —
+# reiner Substring-Treffer bleibt hier ausreichend spezifisch.
+_INJECTION_MARKERS_STRICT: tuple[str, ...] = (
     "ignoriere die vorherigen anweisungen",
     "ignore previous instructions",
     "ignore all previous instructions",
-    "du bist jetzt",
-    "you are now",
-    "system prompt",
-    "systemanweisung",
+    "disregard previous instructions",
     "reveal your instructions",
     "zeige deine anweisungen",
     "vergiss deine regeln",
-    "act as",
-    "verhalte dich als",
+    "system prompt",
+    "systemanweisung",
 )
+
+# Stufe 2 — Rollenumdefinitions-Marker: für sich allein zu breit. Echte
+# Kundentexte reden ständig in genau diesen Worten über MENSCHLICHE Rollen
+# ("You are now our primary contact...", "act as the account owner...",
+# "Ab sofort verhalte dich als Hauptansprechpartner..."). \b-Grenzen zudem,
+# damit z. B. "react as soon as possible" nicht fälschlich "act as" matcht.
+# Blockt nur noch, wenn ZUSÄTZLICH ein KI-/System-Bezugswort in
+# unmittelbarer Nähe steht (siehe _AI_ROLE_CUE_PATTERNS/_has_ai_role_cue
+# unten) — ein echter Jailbreak-Versuch redefiniert nie eine menschliche
+# Geschäftsrolle, sondern immer die Rolle/Beschränkungen des Modells selbst.
+_ROLE_REDEFINITION_PATTERNS: tuple[re.Pattern, ...] = tuple(
+    re.compile(r"\b" + phrase + r"\b")
+    for phrase in (
+        "you are now",
+        "du bist jetzt",
+        "act as",
+        "verhalte dich als",
+    )
+)
+_ROLE_REDEFINITION_WINDOW = 60  # Zeichen vor/nach dem Marker, die auf ein Cue geprüft werden
+
+# Kurze/mehrdeutige Cues (z. B. "ai") NUR als exaktes Wort, sonst matcht
+# "ai" versehentlich in "again", "air", "certain", ... Längere Cues dürfen
+# als Präfix matchen, damit deutsche Flexionsformen greifen
+# ("uneingeschränkt" -> "uneingeschränkter", "uneingeschränkte", ...).
+_AI_ROLE_CUES_EXACT: tuple[str, ...] = ("ai", "ki", "bot", "bots")
+_AI_ROLE_CUES_PREFIX: tuple[str, ...] = (
+    "assistant", "assistent", "artificial intelligence",
+    "künstliche intelligenz", "chatbot", "prompt", "instruction",
+    "anweisung", "rule", "regel", "restriction", "einschränkung",
+    "filter", "persona", "character", "unrestricted", "uneingeschränkt",
+    "jailbreak", "developer mode", "entwicklermodus",
+)
+_AI_ROLE_CUE_PATTERNS: tuple[re.Pattern, ...] = tuple(
+    re.compile(r"\b" + re.escape(cue) + r"\b") for cue in _AI_ROLE_CUES_EXACT
+) + tuple(
+    re.compile(r"\b" + re.escape(cue) + r"\w*") for cue in _AI_ROLE_CUES_PREFIX
+)
+
+
+def _has_ai_role_cue(window: str) -> bool:
+    return any(pattern.search(window) for pattern in _AI_ROLE_CUE_PATTERNS)
 
 # Credential-Keywords, die auf ein Hard-Stop-Muster hindeuten. Ein reiner
 # Substring-Treffer (z. B. "Passwort" in "...Passwort setzen.") ist KEIN Leak
@@ -130,16 +176,39 @@ class SecurityLayer:
                 blocked_reason=f"Blocked credential pattern detected: '{match.group(0)}'",
             )
 
-        # Hard-stop: Prompt-Injection-Versuch.
+        # Hard-stop: Prompt-Injection-Versuch, Stufe 1 (eindeutige Marker).
         lower = text.lower()
-        injection_marker = next((m for m in _INJECTION_MARKERS if m in lower), None)
-        if injection_marker:
-            logger.warning("DLP hard-block triggered", extra={"injection_marker": injection_marker})
+        strict_marker = next((m for m in _INJECTION_MARKERS_STRICT if m in lower), None)
+        if strict_marker:
+            logger.warning("DLP hard-block triggered", extra={"injection_marker": strict_marker})
             return DLPResult(
                 approved=False,
                 redacted_text=text,
-                blocked_reason=f"Prompt injection marker detected: '{injection_marker}'",
+                blocked_reason=f"Prompt injection marker detected: '{strict_marker}'",
             )
+
+        # Hard-stop: Prompt-Injection-Versuch, Stufe 2 (Rollenumdefinition +
+        # KI-/System-Bezugswort in der Nähe — siehe Kommentar bei den
+        # Pattern-Definitionen oben).
+        for pattern in _ROLE_REDEFINITION_PATTERNS:
+            for match in pattern.finditer(lower):
+                window = lower[
+                    max(0, match.start() - _ROLE_REDEFINITION_WINDOW):
+                    match.end() + _ROLE_REDEFINITION_WINDOW
+                ]
+                if _has_ai_role_cue(window):
+                    logger.warning(
+                        "DLP hard-block triggered",
+                        extra={"injection_marker": match.group(0), "ai_role_cue_window": window},
+                    )
+                    return DLPResult(
+                        approved=False,
+                        redacted_text=text,
+                        blocked_reason=(
+                            f"Prompt injection marker detected: '{match.group(0)}' "
+                            "(paired with an AI/system role cue nearby)"
+                        ),
+                    )
 
         if not settings.enable_pii_redaction:
             return DLPResult(approved=True, redacted_text=text)

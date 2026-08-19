@@ -170,20 +170,32 @@ Hard-Block (Request wird abgelehnt, nicht nur redigiert) bei:
 - **Credentials**: Keyword (`password`, `api_key`, `bearer`, …) + Delimiter
   (`:`, `=`, "ist", "is") + Wert — die bloße Erwähnung des Wortes in
   normalem Fließtext blockt nicht mehr.
-- **Prompt-Injection**: einfache Keyword-Heuristik (`_INJECTION_MARKERS`),
-  portiert aus `sdr_demo_referencia/app/dlp.py`.
+- **Prompt-Injection**: zweistufige Heuristik in `core/security.py`.
+  - Stufe 1 (`_INJECTION_MARKERS_STRICT`): eindeutige Marker, die immer
+    explizit "Anweisungen"/"instructions"/"Regeln"/"prompt" referenzieren
+    (z. B. `"ignore all previous instructions"`, `"system prompt"`) —
+    reiner Substring-Treffer, da Geschäftstext praktisch nie in diesen
+    Begriffen über sich selbst redet.
+  - Stufe 2 (`_ROLE_REDEFINITION_PATTERNS` + `_AI_ROLE_CUE_PATTERNS`):
+    mehrdeutige Rollenumdefinitions-Marker (`"you are now"`, `"act as"`,
+    `"du bist jetzt"`, `"verhalte dich als"`, jeweils mit `\b`-Wortgrenzen)
+    blocken NUR, wenn zusätzlich ein KI-/System-Bezugswort (assistant, AI,
+    prompt, unrestricted, filter, jailbreak, …) innerhalb von ±60 Zeichen
+    auftaucht. Portiert (Stufe-1-Kernidee) aus
+    `sdr_demo_referencia/app/dlp.py`.
 
-> **Offener Punkt: Prompt-Injection-Marker sind zu breit.** Verifiziert per
-> `/code-review ultra`: Marker wie `"you are now"`, `"act as"`,
-> `"system prompt"` matchen auch echte, harmlose Business-Anfragen und werden
-> dadurch tatsächlich abgelehnt (nicht nur geloggt) — anders als der
-> Credential-Hard-Block ist dieser Pfad nicht nur ein Logging-Ärgernis.
-> Konkrete Repro-Beispiele aus dem Review:
-> - `"You are now our primary contact for billing questions going forward."`
-> - `"...act as the account owner when configuring SSO."`
-> Bewusst NICHT in derselben Runde wie der Credential-Hard-Block-Fix und der
-> Kontakt/Sensibel-Umbau angefasst — braucht eine eigene Runde mit Fokus
-> ausschließlich darauf, nicht "nebenbei mitgefixt".
+**Ehemaliger offener Punkt "Prompt-Injection-Marker sind zu breit" — behoben.**
+Ursprünglich per `/code-review ultra` verifiziert: die alte flache
+Marker-Liste blockte auch echte, harmlose Business-Anfragen wie
+`"You are now our primary contact for billing questions going forward."`
+oder `"...act as the account owner when configuring SSO."` tatsächlich (nicht
+nur geloggt). Fix: siehe Stufe 2 oben — die reine Rollenphrase reicht nicht
+mehr, es braucht zusätzlich ein KI-/System-Bezugswort in der Nähe. Als
+Nebeneffekt der `\b`-Wortgrenzen ist auch die alte Substring-Kollision
+behoben (`"react as"` matchte vorher fälschlich `"act as"`). Regressionstests
+mit beiden Gruppen (legitime Geschäftssprache aus dem echten ICP — Elektriker,
+Steuerberater, Immobilienmakler — MUSS durchgehen; echte Angriffsversuche
+MÜSSEN weiterhin blocken) in `test_system.py` TEST 10.
 
 ---
 
