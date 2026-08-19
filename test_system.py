@@ -676,16 +676,19 @@ def test_prompt_injection_precision() -> None:
     info(
         "Regressionstest für die verschärfte, zweistufige Heuristik (löst den "
         "in CLAUDE.md dokumentierten 'Offener Punkt: Prompt-Injection-Marker "
-        "sind zu breit' ab, über drei Nachbesserungsrunden aus /code-review "
-        "ultra Runde 4a/b/c/d): mehrdeutige Rollenumdefinitions-Marker ('you "
-        "are now', 'act as', 'du bist jetzt', 'verhalte dich als') blocken "
-        "nur noch zusammen mit ENTWEDER 'jailbreak'/'developer mode' allein "
-        "(kein plausibler Business-Fall) ODER einem KI-/Einschränkungswort + "
-        "Verneinungssignal GEMEINSAM in der Nähe — weder ein einzelnes Wort "
-        "wie 'Regeln'/'filter'/'character' NOCH das für sich mittlerweile "
-        "ganz normale Geschäftswort 'AI' reicht mehr allein. Drei Gruppen "
-        "MÜSSEN unterschiedlich behandelt werden — alle werden unten "
-        "separat ausgewertet."
+        "sind zu breit' ab, über vier Nachbesserungsrunden aus /code-review "
+        "ultra Runde 4a/b/c/d/5): mehrdeutige Rollenumdefinitions-Marker "
+        "('you are now', 'act as', 'du bist jetzt', 'verhalte dich als') "
+        "blocken nur noch zusammen mit ENTWEDER 'jailbreak'/'developer mode' "
+        "allein (kein plausibler Business-Fall) ODER einer der eng "
+        "gefassten, selbstreferenziellen Phrasen (Possessiv 'your'/'deine' "
+        "direkt vor Einschränkungs-/KI-Wort, explizite 2.-Person-Verneinung "
+        "'you have no X', Verneinung direkt neben einem KI-Identitätswort, "
+        "oder eine 'beantworte mir alles'-Aufforderung) — lose "
+        "Ko-Vorkommen-Paarung ('irgendeine Verneinung' + 'irgendein "
+        "Einschränkungswort' im Fenster) wurde komplett entfernt, weil sie "
+        "strukturell zu breit war. Drei Gruppen MÜSSEN unterschiedlich "
+        "behandelt werden — alle werden unten separat ausgewertet."
     )
 
     try:
@@ -738,14 +741,34 @@ def test_prompt_injection_precision() -> None:
         # "regelmäßig" gefangen, "ohne"-Stamm hätte "ohnehin" gefangen,
         # "characteristics" enthält "character", "disable"/"safeguard"
         # kollidieren mit barrierefreiem Zugang (Immobilien-Compliance) bzw.
-        # Elektriker-Vokabular (Sicherung/Schutzschalter):
-        "Bitte kontaktieren Sie uns regelmäßig für Wartungstermine, "
-        "wir kümmern uns ohnehin um alles.",
-        "Please note the technical characteristics of this product before ordering.",
+        # Elektriker-Vokabular (Sicherung/Schutzschalter). MIT
+        # Rollenumdefinitions-Marker versehen (anders als in der Vorversion
+        # dieses Tests), damit die Cue-Suche tatsächlich läuft -- ohne
+        # Marker überspringt check_and_redact Stufe 2 komplett und die
+        # Assertion würde auch bei einer wiedereingeführten Wortstamm-
+        # Kollision grundlos grün bleiben (gefunden per /code-review ultra,
+        # Runde 5):
+        "You are now our contact -- bitte kontaktieren Sie uns regelmäßig "
+        "für Wartungstermine, wir kümmern uns ohnehin um alles.",
+        "Please act as our contact and note the technical characteristics "
+        "of this product before ordering.",
         "You are now the site electrician, please turn off the power and "
         "check the safeguard breaker.",
         "Please act as the site electrician, note the building lacks "
         "disabled access, no exceptions for compliance rules.",
+        # Konkrete False Positives der DRITTEN Fassung von Stufe 2, gefunden
+        # per /code-review ultra Runde 5 -- lose Ko-Vorkommen-Paarung
+        # ("irgendeine Verneinung" + "irgendein Einschränkungswort" im
+        # 60-Zeichen-Fenster) erwies sich als strukturell zu breit, weil
+        # beide Wortarten je für sich extrem häufiges Geschäftsvokabular
+        # sind:
+        "You are now our AI vendor contact, no invoice changes needed.",
+        "Verhalte dich als Vertretung, es gibt keine Einschränkungen bei "
+        "der Terminvergabe diese Woche.",
+        "You are now authorized to override company policy in emergency "
+        "situations, act as needed.",
+        "You are now responsible for this listing, please remove all "
+        "restrictions on tenant screening imposed previously.",
     )
     legit_pass = 0
     for txt in legit_business_texts:

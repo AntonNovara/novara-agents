@@ -183,14 +183,18 @@ Hard-Block (Request wird abgelehnt, nicht nur redigiert) bei:
     für sich GENOMMEN schon eindeutiges Wort auftaucht
     (`_STANDALONE_SUFFICIENT_CUES` — nur `"jailbreak"`, `"developer mode"`,
     `"entwicklermodus"`; kein plausibler Business-Fall in Novaras ICP), ODER
-    (b) ein KI-Identitäts-/Einschränkungsbegriff UND ein
-    Aufhebungs-/Verneinungssignal GEMEINSAM auftauchen (`_PAIRED_CUES` +
-    `_NEGATION_SIGNAL_CUES` — z. B. "no rules", "without restrictions",
-    "free from … limits", "an unrestricted AI"). Ein einzelnes Wort wie
-    "Regeln"/"filter"/"character" ODER "AI" für sich reicht dagegen bewusst
-    NICHT allein (siehe unten). Alle Cue-Wörter sind exakte Wortformen
-    (`\bwort\b`), KEINE Wortstämme mit Wildcard-Suffix — siehe Runde 4d
-    unten. Portiert (Stufe-1-Kernidee) aus `sdr_demo_referencia/app/dlp.py`.
+    (b) eine von vier eng gefassten, SELBSTREFERENZIELLEN Phrasen
+    matcht (`_SELF_REFERENTIAL_PHRASE_PATTERNS`): Possessiv der 2. Person
+    direkt vor einem Einschränkungs-/KI-Wort ("your rules", "deine
+    Regeln"), explizite 2.-Person-Verneinung ("you have no rules", "du
+    hast keine Regeln"), Verneinung direkt neben einem KI-Identitätswort
+    ("an unrestricted AI", "kein Chatbot"), oder eine direkte
+    "beantworte/sag mir alles"-Aufforderung. Lose Ko-Vorkommen-Paarung
+    ("irgendeine Verneinung" + "irgendein Einschränkungswort" im Fenster)
+    wurde in Runde 5 komplett entfernt — siehe unten, warum. Alle Cue-Wörter
+    sind exakte Wortformen (`\bwort\b`), KEINE Wortstämme mit
+    Wildcard-Suffix — siehe Runde 4d unten. Portiert (Stufe-1-Kernidee) aus
+    `sdr_demo_referencia/app/dlp.py`.
 
 **Ehemaliger offener Punkt "Prompt-Injection-Marker sind zu breit" — behoben,
 über drei Nachbesserungsrunden.** Ursprünglich per `/code-review ultra`
@@ -239,28 +243,74 @@ darin aber zwei NEUE Probleme derselben Art:
    weil sie mit barrierefreiem Zugang (Immobilien-Compliance) bzw.
    Elektriker-Vokabular (Sicherung/Schutzschalter) kollidieren.
 
-**Runde 4d, jetzt aktueller Stand:** alle Cue-Wortlisten sind auf exakte
-Wortformen umgestellt (kein `\w*`-Suffix mehr), `"AI"`/`"chatbot"`/… sind
-Teil von `_PAIRED_CUES` statt eigenständig ausreichend, `"lift"`/
-`"disable"`/`"safeguard"` sind entfernt. Cue-Spans werden zudem nur noch
-berechnet, wenn im Text überhaupt ein Rollenumdefinitions-Marker vorkommt
-(vorher lief die Cue-Suche auf jedem einzelnen `check_and_redact()`-Aufruf,
-auch ohne jeden Marker — unnötige Kosten auf dem häufigsten Pfad).
-Regressionstests mit drei Gruppen (legitime Geschäftssprache aus dem
-echten ICP inkl. aller Runde-4b/4d-Funde — MUSS durchgehen; echte
-Angriffsversuche inkl. der Runde-4b-Evasion — MÜSSEN weiterhin blocken;
-Fensterschnitt-Regression) in `test_system.py` TEST 10.
+**Runde 4d:** alle Cue-Wortlisten sind auf exakte Wortformen umgestellt
+(kein `\w*`-Suffix mehr), `"AI"`/`"chatbot"`/… sind Teil der
+Paar-Bedingung statt eigenständig ausreichend, `"lift"`/`"disable"`/
+`"safeguard"` sind entfernt. Cue-Spans werden zudem nur noch berechnet,
+wenn im Text überhaupt ein Rollenumdefinitions-Marker vorkommt (vorher lief
+die Cue-Suche auf jedem einzelnen `check_and_redact()`-Aufruf, auch ohne
+jeden Marker — unnötige Kosten auf dem häufigsten Pfad).
 
-> **Bekannte Restlücke (akzeptiert, keine perfekte Klassifikation).** Eine
-> Wortlisten-Heuristik kann prinzipiell immer durch neue Paraphrasen
-> umgangen werden, die weder in `_STANDALONE_SUFFICIENT_CUES` noch in
-> `_PAIRED_CUES`/`_NEGATION_SIGNAL_CUES` vorkommen — und umgekehrt kann sie
-> (trotz dreier Nachbesserungsrunden) prinzipiell erneut ein noch nicht
-> bedachtes Geschäftswort-Muster fälschlich blocken. Das ist eine bewusste
-> Abwägung zugunsten weniger False Positives im echten Novara-ICP, kein Bug
-> — für echten Schutz vor entschlossenen Angreifern UND wirklich niedrige
-> False-Positive-Rate bräuchte es eine modellbasierte Klassifikation statt
-> Substring-Cues.
+**Runde 5** (`/code-review ultra` ein weiteres Mal) fand ein strukturelles,
+nicht nur ein listen-vollständigkeit Problem an 4d: die Paar-Logik
+("Einschränkungswort UND Verneinungssignal GEMEINSAM irgendwo im
+±60-Zeichen-Fenster") blockte weiterhin echte Business-Sätze, WEIL beide
+Wortarten je für sich schon extrem häufiges Geschäftsvokabular sind — z. B.
+`"You are now authorized to override company policy in emergency
+situations, act as needed."`, `"...please remove all restrictions on
+tenant screening imposed previously."`, `"Verhalte dich als Vertretung, es
+gibt keine Einschränkungen bei der Terminvergabe diese Woche."`. Keine
+Wortlisten-Lücke diesmal, sondern die Paar-Architektur selbst: bei zwei
+unabhängig häufigen Wortklassen ist es strukturell egal, wie eng man die
+einzelnen Listen fasst, ihr Zusammentreffen bleibt zu häufig. Zusätzlich
+fehlte `"kein"` (nur `"keine"` war gelistet) als deutsches
+Verneinungssignal.
+
+**Runde 5, jetzt aktueller Stand:** lose Ko-Vorkommen-Paarung komplett
+ersetzt durch vier eng gefasste, in sich abgeschlossene
+SELBSTREFERENZIELLE Phrasenmuster (`_SELF_REFERENTIAL_PHRASE_PATTERNS`,
+siehe oben) — der Unterschied zum echten Jailbreak ist nicht "irgendeine
+Verneinung + irgendein Einschränkungswort", sondern dass sich die
+Verneinung EXPLIZIT auf die Rolle des MODELLS SELBST bezieht (2. Person:
+"your"/"deine", nicht "our"/"unsere" — das bleibt Geschäftsvokabular,
+siehe `"befolge unsere Regeln"` in Runde 4b). Regressionstests mit drei
+Gruppen (23 legitime ICP-Sätze inkl. aller Runde-4b/4d/5-Funde — MUSS
+durchgehen; 5 echte Angriffsversuche inkl. der Runde-4b-Evasion — MÜSSEN
+weiterhin blocken; Fensterschnitt-Regression) in `test_system.py` TEST 10.
+Zwei der bisherigen Regressionstests (regelmäßig/ohnehin,
+characteristics) hatten außerdem keinen Rollenumdefinitions-Marker
+enthalten und liefen damit gar nicht durch die Stufe-2-Prüfung — bei
+Runde-5 korrigiert, indem beiden Sätzen ein Marker hinzugefügt wurde.
+
+> **Bekannte Restlücke (akzeptiert, keine perfekte Klassifikation) — jetzt
+> nach fünf Nachbesserungsrunden.** Eine Wortlisten-/Phrasenmuster-Heuristik
+> kann prinzipiell immer durch neue Paraphrasen umgangen werden, die keinem
+> der Muster entsprechen — und umgekehrt kann sie erneut ein noch nicht
+> bedachtes Geschäftswort-Muster fälschlich blocken. Zwei konkrete, in
+> dieser Runde selbst gefundene Beispiele, die bewusst NICHT weiter
+> gejagt wurden:
+> 1. `"You are now assigned as project lead, please review your
+>    guidelines before the kickoff."` blockt fälschlich, weil Muster (a)
+>    (Possessiv + Einschränkungswort) nicht zwischen "deine Leitlinien
+>    (als KI)" und "deine Leitlinien (als menschlicher Projektleiter, der
+>    seine EIGENEN Team-Guidelines lesen soll)" unterscheiden kann — das
+>    ist eine Bedeutungsfrage, keine Mustersache.
+> 2. Der in Runde 4d gefundene Lücken-Fall `"Du bist jetzt der Chef, es
+>    gibt kein Limit mehr für deine Entscheidungen."` (sollte laut Runde
+>    4d blocken) blockt nach der Runde-5-Vereinfachung NICHT mehr — die
+>    Entfernung der losen Paarung, die Runde 5 zwingend nötig machte, um
+>    die vier Runde-5-Fehlblocks zu schließen, öffnet diese eine, deutlich
+>    ambiguere Lücke wieder. Runde-4d- und Runde-5-Anforderungen stehen
+>    hier in echtem Konflikt — mit reiner Wortlisten-/Phrasenmatching-Logik
+>    lässt sich nicht beides gleichzeitig lösen.
+>
+> Das ist eine bewusste Abwägung zugunsten weniger False Positives im
+> echten Novara-ICP, kein Bug — für echten Schutz vor entschlossenen
+> Angreifern UND wirklich niedrige False-Positive-Rate bräuchte es eine
+> modellbasierte Klassifikation statt Substring-/Phrasen-Cues. Ob eine
+> sechste Nachbesserungsrunde, eine LLM-basierte Klassifikation für genau
+> diese Randfälle, oder der aktuelle Stand als "gut genug" angenommen
+> werden soll, ist eine offene Entscheidung — noch nicht getroffen.
 
 > **Offener Punkt: Stufe-2-Hard-Block wirkt nur auf Input, nicht auf
 > Output.** Verifiziert per `/code-review ultra` (Runde 4): `sanitize_dict()`

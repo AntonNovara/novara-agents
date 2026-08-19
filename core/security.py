@@ -92,42 +92,52 @@ _INJECTION_MARKERS_STRICT: tuple[str, ...] = (
 #       (_STANDALONE_SUFFICIENT_CUES: "jailbreak", "developer mode",
 #       "entwicklermodus" — kein plausibler Business-Anwendungsfall in
 #       Novaras ICP, egal in welchem Satz), ODER
-#   (b) ein Einschränkungs-/KI-Begriff UND ein Aufhebungs-/Verneinungssignal
-#       GEMEINSAM auftauchen (_PAIRED_CUES + _NEGATION_SIGNAL_*, z. B.
-#       "no rules", "without restrictions", "free from ... limits", "an
-#       unrestricted AI").
+#   (b) eine der eng gefassten, SELBSTREFERENZIELLEN Phrasen aus
+#       _SELF_REFERENTIAL_PHRASE_PATTERNS matcht (siehe deren
+#       Kommentar unten).
 #
-# Zwei Lektionen aus vorherigen Runden sind hier eingearbeitet
+# Drei Lektionen aus vorherigen Runden sind hier eingearbeitet
 # (verifiziert per /code-review ultra, jeweils):
 #
 # 1. (Runde 4b) Ein einzelnes Einschränkungswort wie "Regeln"/"filter"/
 #    "character" ist ein GANZ NORMALES Geschäftswort und darf NICHT allein
 #    blocken ("act as a character reference for this rental application",
-#    "act as a filter for spam inquiries"). Deshalb Pairing-Pflicht (b).
+#    "act as a filter for spam inquiries").
 #
 # 2. (Runde 4d) "AI" ist mittlerweile SELBST ein normales Geschäftswort
 #    ("our AI vendor evaluation", "our AI team lead") und darf deshalb
-#    NICHT mehr eigenständig ausreichen — anders als in Runde 4c
-#    angenommen. KI-Identitätswörter (ai/ki/chatbot/llm/...) sind daher
-#    Teil von _PAIRED_CUES, nicht mehr von _STANDALONE_SUFFICIENT_CUES.
-#    Nur "jailbreak"/"developer mode"/"entwicklermodus" bleiben eigenständig
-#    ausreichend, weil dafür in Novaras ICP (Elektriker, Steuerberater,
-#    Immobilienmakler) kein plausibler harmloser Anwendungsfall existiert.
+#    NICHT eigenständig ausreichen. Nur "jailbreak"/"developer mode"/
+#    "entwicklermodus" bleiben eigenständig ausreichend, weil dafür in
+#    Novaras ICP (Elektriker, Steuerberater, Immobilienmakler) kein
+#    plausibler harmloser Anwendungsfall existiert.
 #
-# Alle Wortlisten unten verwenden explizite Formen statt Wortstämme mit
+# 3. (Runde 5) Ein generisches Verneinungswort ("no", "remove", "keine",
+#    "override") IRGENDWO im Fenster zusammen mit einem generischen
+#    Einschränkungswort ("policy", "restrictions", "rules") IRGENDWO im
+#    Fenster ist STRUKTURELL zu breit, unabhängig von der Fenstergröße --
+#    beide Wortarten sind je für sich extrem häufiges Geschäftsvokabular:
+#    "override company policy in emergency situations", "remove all
+#    restrictions on tenant screening", "keine Einschränkungen bei der
+#    Terminvergabe diese Woche" sind allesamt plausible ICP-Sätze, die mit
+#    reiner Ko-Vorkommen-Paarung fälschlich blockten. Der eigentliche
+#    Jailbreak-Unterschied ist nicht "irgendeine Verneinung + irgendein
+#    Einschränkungswort", sondern dass sich die Verneinung EXPLIZIT auf die
+#    Rolle/Grenzen des MODELLS SELBST bezieht (2. Person: "your"/"deine",
+#    oder eine direkte "beantworte mir alles"-Aufforderung) -- nicht auf
+#    einen Geschäftsprozess. Lose Ko-Vorkommen-Paarung ist deshalb ganz
+#    entfernt, ersetzt durch die vier eng gefassten Phrasenformen unten.
+#
+# Alle Wortlisten verwenden explizite Formen statt Wortstämme mit
 # Wildcard-Suffix (`\bstamm\w*`) — Stämme overmatchen unvorhersehbar auf
-# ähnlich geschriebene, völlig unverwandte Wörter (ebenfalls Runde 4d):
-# "persona" matchte "personal", "polic" matchte "police", "limit" matchte
-# "Limited" (Firmensuffix), "regel" (als Stamm) hätte "regelmäßig" matchen
-# können, "ohne" (als Stamm) hätte "ohnehin" gematcht.
-_ROLE_REDEFINITION_PATTERNS: tuple[re.Pattern, ...] = tuple(
-    re.compile(r"\b" + phrase + r"\b")
-    for phrase in (
-        "you are now",
-        "du bist jetzt",
-        "act as",
-        "verhalte dich als",
-    )
+# ähnlich geschriebene, völlig unverwandte Wörter (Runde 4d): "persona"
+# matchte "personal", "polic" matchte "police", "limit" matchte "Limited"
+# (Firmensuffix), "regel" (als Stamm) hätte "regelmäßig" matchen können,
+# "ohne" (als Stamm) hätte "ohnehin" gematcht.
+_ROLE_REDEFINITION_CUES: tuple[str, ...] = (
+    "you are now",
+    "du bist jetzt",
+    "act as",
+    "verhalte dich als",
 )
 _ROLE_REDEFINITION_WINDOW = 60  # Zeichen vor/nach dem Marker, die auf Cues geprüft werden
 
@@ -135,13 +145,7 @@ _STANDALONE_SUFFICIENT_CUES: tuple[str, ...] = (
     "jailbreak", "developer mode", "entwicklermodus",
 )
 
-# KI-Identität + Einschränkungsbegriffe -- bewusst OHNE eigenständige
-# Blockierwirkung (siehe Punkt 2 und Lektion 1 oben). Explizite Wortformen
-# statt Stämme (siehe Lektion oben) -- z. B. "regel"/"regeln" statt eines
-# "regel"-Stamms, der "regelmäßig" mitgefangen hätte.
-_PAIRED_CUES: tuple[str, ...] = (
-    "ai", "ki", "llm", "artificial intelligence", "künstliche intelligenz",
-    "chatbot", "large language model",
+_CONSTRAINT_NOUN_WORDS: tuple[str, ...] = (
     "rule", "rules", "regel", "regeln",
     "filter", "filters",
     "restriction", "restrictions", "einschränkung", "einschränkungen",
@@ -153,10 +157,9 @@ _PAIRED_CUES: tuple[str, ...] = (
     "creator", "creators",
     "policy", "policies",
 )
-_NEGATION_SIGNAL_CUES: tuple[str, ...] = (
-    "no", "none", "keine", "ohne", "without", "free from", "remove",
-    "bypass", "override", "ignore", "forget", "disregard", "turn off",
-    "unrestricted", "uneingeschränkt", "unlimited", "unlock",
+_AI_IDENTITY_WORDS: tuple[str, ...] = (
+    "ai", "ki", "llm", "llms", "artificial intelligence",
+    "künstliche intelligenz", "chatbot", "chatbots", "large language model",
 )
 # "lift" (Aufhebungs-Verb) bewusst NICHT aufgenommen -- kollidiert mit dem
 # österreichischen Alltagswort "Lift" (Aufzug), direkt relevant für Novaras
@@ -170,13 +173,71 @@ def _compile_word_patterns(words: tuple[str, ...]) -> tuple[re.Pattern, ...]:
     # Ausschließlich exakte Wort-/Phrasengrenzen (\b...\b), KEIN
     # Wildcard-Suffix -- siehe Lektion zu Wortstämmen oben. Mehrwortige
     # Phrasen (z. B. "free from") funktionieren genauso, \b greift an
-    # beiden Enden der ganzen Phrase.
+    # beiden Enden der ganzen Phrase. re.escape schützt zusätzlich davor,
+    # dass eine künftig hinzugefügte Phrase mit Regex-Sonderzeichen
+    # (Klammern, Punkt, ...) das Muster kaputt kompiliert.
     return tuple(re.compile(r"\b" + re.escape(word) + r"\b") for word in words)
 
 
+def _alternation(words: tuple[str, ...]) -> str:
+    # Längere Phrasen zuerst, rein zur Lesbarkeit der kompilierten Regex --
+    # bei \b-begrenzter Alternation ohne gemeinsame Präfixe macht die
+    # Reihenfolge inhaltlich keinen Unterschied.
+    return "|".join(re.escape(word) for word in sorted(words, key=len, reverse=True))
+
+
+_ROLE_REDEFINITION_PATTERNS = _compile_word_patterns(_ROLE_REDEFINITION_CUES)
 _STANDALONE_SUFFICIENT_PATTERNS = _compile_word_patterns(_STANDALONE_SUFFICIENT_CUES)
-_PAIRED_CUE_PATTERNS = _compile_word_patterns(_PAIRED_CUES)
-_NEGATION_SIGNAL_PATTERNS = _compile_word_patterns(_NEGATION_SIGNAL_CUES)
+
+_CONSTRAINT_OR_AI_ALTERNATION = _alternation(_CONSTRAINT_NOUN_WORDS + _AI_IDENTITY_WORDS)
+_AI_IDENTITY_ALTERNATION = _alternation(_AI_IDENTITY_WORDS)
+
+# Vier eng gefasste Phrasenformen statt loser Ko-Vorkommen-Paarung (siehe
+# Lektion 3 oben) -- jede für sich bereits ein vollständiges, spezifisches
+# Signal, kein Zusammenspiel mehrerer unabhängig zu häufiger Wörter mehr:
+_SELF_REFERENTIAL_PHRASE_PATTERNS: tuple[re.Pattern, ...] = (
+    # (a) Possessiv der 2. Person DIREKT vor einem Einschränkungs-/
+    # KI-Wort (max. 2 Füllwörter dazwischen, z. B. "your own strict
+    # rules"): "your rules", "your creators", "deine Regeln". Nicht
+    # "our"/"unsere" -- das referenziert die Regeln des GESCHÄFTS, nicht
+    # die des Modells ("verhalte dich als Vertreter und befolge unsere
+    # Regeln" bleibt dadurch erlaubt, siehe Runde 4b).
+    re.compile(
+        r"\b(?:your|yours|dein|deine|deinen|deiner|deines|euer|eure|euren|eurer|eures)\b"
+        r"(?:\s+\w+){0,2}\s+\b(?:" + _CONSTRAINT_OR_AI_ALTERNATION + r")\b"
+    ),
+    # (b) explizite Verneinung in der 2. Person: "you have no rules",
+    # "du hast keine Regeln" -- eindeutig an das Modell selbst gerichtet,
+    # anders als eine unpersönliche Aussage wie "es gibt keine
+    # Einschränkungen bei der Terminvergabe" (Runde 5).
+    re.compile(
+        r"\byou\s+(?:have|'ve|has)\s+no\b(?:\s+\w+){0,3}\s+\b(?:"
+        + _CONSTRAINT_OR_AI_ALTERNATION + r")\b"
+    ),
+    re.compile(
+        r"\bdu\s+(?:hast|habt)\s+kein\w*\b(?:\s+\w+){0,3}\s+\b(?:"
+        + _CONSTRAINT_OR_AI_ALTERNATION + r")\b"
+    ),
+    # (c) Verneinung DIREKT (max. 1 Füllwort) neben einem KI-Identitätswort
+    # speziell -- NICHT neben generischen Geschäftswörtern wie
+    # "policy"/"restrictions", das war der Runde-5-Fehler: "an unrestricted
+    # AI", "without AI", "kein Chatbot".
+    re.compile(
+        r"\b(?:no|without|keine?|ohne|unrestricted|uneingeschränkt\w*|unlimited|unlock\w*)\b"
+        r"(?:\s+\w+){0,1}\s+\b(?:" + _AI_IDENTITY_ALTERNATION + r")\b"
+    ),
+    # (d) direkte Aufforderung, uneingeschränkt/vollständig zu antworten --
+    # kommt in Kombination mit einem Rollenumdefinitions-Marker in
+    # normalem Geschäftstext praktisch nie vor (als eigenständige
+    # Kundenfrage schon, z. B. "Tell me everything about the Starter
+    # package" -- deshalb bleibt auch dieses Muster an die Nähe zu einem
+    # Rollenumdefinitions-Marker gebunden, wie alle Stufe-2-Muster).
+    re.compile(
+        r"\b(?:tell me everything|tell me anything|answer everything|"
+        r"answer anything|reveal everything|beantworte alles|sag mir alles|"
+        r"gib mir alles|erzähl mir alles|verrate mir alles)\b"
+    ),
+)
 
 
 def _cue_spans(patterns: tuple[re.Pattern, ...], haystack: str) -> list[tuple[int, int]]:
@@ -270,8 +331,7 @@ class SecurityLayer:
         ]
         if role_matches:
             standalone_spans = _cue_spans(_STANDALONE_SUFFICIENT_PATTERNS, lower)
-            paired_spans = _cue_spans(_PAIRED_CUE_PATTERNS, lower)
-            negation_spans = _cue_spans(_NEGATION_SIGNAL_PATTERNS, lower)
+            phrase_spans = _cue_spans(_SELF_REFERENTIAL_PHRASE_PATTERNS, lower)
 
             for match in role_matches:
                 window_start = match.start() - _ROLE_REDEFINITION_WINDOW
@@ -279,10 +339,8 @@ class SecurityLayer:
                 triggered_by = None
                 if _overlaps_window(standalone_spans, window_start, window_end):
                     triggered_by = "standalone AI/jailbreak cue"
-                elif _overlaps_window(paired_spans, window_start, window_end) and _overlaps_window(
-                    negation_spans, window_start, window_end
-                ):
-                    triggered_by = "constraint/AI-identity + negation cue pair"
+                elif _overlaps_window(phrase_spans, window_start, window_end):
+                    triggered_by = "self-referential constraint-redefinition phrase"
                 if triggered_by:
                     logger.warning(
                         "DLP hard-block triggered",
