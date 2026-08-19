@@ -154,6 +154,18 @@ TEST 9 (u. a. alle bekannten Steuernummer-Formate im System, mehrere
 überlappende/benachbarte Kontakte im selben Text, 4 gemischte sensible Werte
 gleichzeitig).
 
+> **Offener Punkt: Audit-Trail unterzählt bei zwei Telefonnummern, die nur
+> durch ein Leerzeichen getrennt sind.** Verifiziert per `/code-review
+> ultra` (3. Durchlauf auf `ca3c6e3`). `phone_de`s Muster
+> (`(?:[\s\-]?\d){5,14}`) ist gierig genug, um über das trennende Leerzeichen
+> hinweg in eine direkt anschließende zweite Nummer hineinzumatchen — die
+> beiden Nummern werden dann als EIN Treffer gezählt statt als zwei. Der
+> ausgegebene Text ändert sich dadurch NICHT (Kontaktdaten werden ohnehin nie
+> redigiert, nur gezählt), betroffen ist ausschließlich die Findings/
+> Audit-Trail-Zahl in `dlp_findings`. Keine Sicherheitslücke, aber ein
+> ungenauer Audit-Trail. Bewusst nicht in derselben Runde gefixt — braucht
+> eigene Runde.
+
 Hard-Block (Request wird abgelehnt, nicht nur redigiert) bei:
 - **Credentials**: Keyword (`password`, `api_key`, `bearer`, …) + Delimiter
   (`:`, `=`, "ist", "is") + Wert — die bloße Erwähnung des Wortes in
@@ -191,6 +203,17 @@ Aktiv, wenn:
 - kein echter `ANTHROPIC_API_KEY` gesetzt ist (Default `mock-key`), **oder**
 - `DEMO_MODE=true` explizit gesetzt ist — auch mit echtem Key, z. B. um beim
   lokalen Entwickeln keine echten Calls zu verbrauchen.
+
+> **Offener Punkt: `test_system.py`s `live`-Gating prüft nicht
+> `settings.effective_demo_mode`.** Verifiziert per `/code-review ultra`
+> (3. Durchlauf auf `ca3c6e3`). Die Live-Test-Weiche (`live =
+> settings.anthropic_key_configured`, Zeile ~684) fragt nur ab, ob ein
+> echter Key gesetzt ist — nicht, ob `DEMO_MODE=true` zusätzlich aktiv ist.
+> Ist beides der Fall (echter Key + `DEMO_MODE=true`), laufen die
+> "Live"-Tests tatsächlich gegen `_DemoChatModel` statt gegen Claude, werden
+> in der Testausgabe aber als echte LLM-Calls behandelt/beschriftet. Kein
+> Sicherheitsproblem, nur eine irreführende Testbeschriftung/-abdeckung.
+> Bewusst nicht in derselben Runde gefixt — braucht eigene Runde.
 
 > **Nur Entwicklungs-/Kosten-Bequemlichkeit, kein Sicherheits-Mechanismus.**
 > Sobald ein Agent öffentlich als Demo exponiert wird (wie
