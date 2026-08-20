@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     # das ist bewusst noch nicht Teil dieses Flags.
     demo_mode: bool = Field(default=False, alias="DEMO_MODE")
 
+    # Voice Agent Sicherheits-Gate: VoiceAgent (agents/voice_agent.py) hat
+    # während des laufenden Live-Telefongesprächs KEINE DLP-Schicht -- siehe
+    # CLAUDE.md, Abschnitt "Voice Agent". Muss explizit auf true gesetzt
+    # werden, sonst verweigert VoiceAgent den Start. Verhindert, dass eine
+    # (versehentliche oder kontextlose) Reaktivierung des Voice-Service auf
+    # Railway stillschweigend wieder live geht, ohne dass jemand diese Lücke
+    # bewusst geprüft hat.
+    voice_agent_dlp_reviewed: bool = Field(default=False, alias="VOICE_AGENT_DLP_REVIEWED")
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

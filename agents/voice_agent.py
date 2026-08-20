@@ -73,6 +73,29 @@ class VoiceAgent:
     """Streaming-fähiger Konversationsagent für Telefongespräche via Vapi."""
 
     def __init__(self) -> None:
+        # Sicherheits-Gate, KEINE optionale Warnung: dieser Agent hat während
+        # des laufenden Live-Gesprächs keine DLP-Schicht (kein PII-Schutz,
+        # kein Prompt-Injection-Schutz -- siehe CLAUDE.md, Abschnitt "Voice
+        # Agent"). Eine reine Log-Warnung würde in einem Railway-Logstream
+        # untergehen; eine dokumentierte Notiz in CLAUDE.md hilft nichts, wenn
+        # niemand sie vor dem Redeploy liest. Deshalb hart am Start verweigern,
+        # bis das bewusst bestätigt wurde -- eine versehentliche oder
+        # kontextlose Reaktivierung des Voice-Service (z. B. durch simples
+        # Wieder-Anschalten auf Railway) darf nicht stillschweigend wieder live
+        # gehen.
+        if not settings.voice_agent_dlp_reviewed:
+            raise RuntimeError(
+                "VoiceAgent-Start verweigert: VOICE_AGENT_DLP_REVIEWED ist nicht "
+                "gesetzt (oder nicht 'true').\n"
+                "Dieser Voice-Agent hat WÄHREND des laufenden Live-Telefongesprächs "
+                "KEINE DLP-Schicht -- kein PII-Schutz, kein Prompt-Injection-Schutz. "
+                "Siehe CLAUDE.md, Abschnitt 'Voice Agent (agents/voice_agent.py)' "
+                "für die vollständige Erklärung dieser Lücke, bevor dieser Service "
+                "(erneut) live geschaltet wird.\n"
+                "Nach bewusster Prüfung/Entscheidung explizit freischalten: "
+                "Environment-Variable VOICE_AGENT_DLP_REVIEWED=true setzen."
+            )
+
         # IPv4 erzwingen: local_address="0.0.0.0" bindet den lokalen Socket an
         # eine IPv4-Adresse, sodass die Verbindung NICHT ueber IPv6 laeuft.
         # Das behebt den APIConnectionError auf Railway, wo der Container einen

@@ -654,6 +654,23 @@ nicht während:**
 > Live-Gesprächs keinerlei Schutz. Das ist eine strengere Lücke als der in
 > "Security Layer" oben dokumentierte Stufe-2-Restfall (dort existiert
 > wenigstens eine unvollkommene Heuristik; hier existiert keine).
+>
+> **Absicherung (2026-08-20): Start-Gate statt nur Dokumentation.** Eine
+> Notiz in CLAUDE.md hilft nichts, wenn sie vor einem Redeploy niemand
+> liest. `VoiceAgent.__init__()` prüft deshalb jetzt zuerst
+> `settings.voice_agent_dlp_reviewed` (Env-Var `VOICE_AGENT_DLP_REVIEWED`,
+> Default `false`) und verweigert den Start mit einem `RuntimeError`, der
+> genau auf diesen Abschnitt verweist, solange die Variable nicht explizit
+> `true` gesetzt ist. Da `main.py`s `lifespan()` `VoiceAgent()` ungeschützt
+> beim Boot aufruft (kein try/except drumherum, gleiches Muster wie der
+> bestehende `ANTHROPIC_API_KEY`-Production-Check), reißt dieser
+> `RuntimeError` den gesamten App-Start mit — eine (versehentliche oder
+> kontextlose) Reaktivierung des Voice-Service auf Railway geht damit NICHT
+> mehr stillschweigend wieder live, sondern bricht laut ab, bis diese Lücke
+> bewusst geprüft und die Variable gesetzt wurde. Regressionstest (Subprozess,
+> da `settings` ein gecachtes Singleton ist): `test_system.py` TEST 11 —
+> ohne Variable MUSS der Start fehlschlagen, mit `VOICE_AGENT_DLP_REVIEWED=true`
+> MUSS er normal funktionieren.
 
 **Vollständig implementiert, kein Gerüst.** Echte Fehlerbehandlung auf jeder
 Ebene: kaputte JSON-Bodies von Vapi werden abgefangen, Anthropic-Fehler

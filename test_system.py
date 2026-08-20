@@ -860,6 +860,84 @@ def test_prompt_injection_precision() -> None:
         traceback.print_exc()
 
 
+# ── Test 11: Voice-Agent-Sicherheits-Gate ──────────────────────────────────────
+
+def test_voice_agent_dlp_gate() -> None:
+    section("TEST 11 — Voice Agent: Start ohne VOICE_AGENT_DLP_REVIEWED muss fehlschlagen")
+    info(
+        "Regressionstest für die Sicherheits-Bremse in agents/voice_agent.py: "
+        "VoiceAgent hat während des laufenden Live-Telefongesprächs KEINE "
+        "DLP-Schicht (siehe CLAUDE.md, Abschnitt 'Voice Agent'). Eine reine "
+        "Dokumentations-Notiz reicht nicht, wenn niemand sie vor einem "
+        "Railway-Redeploy liest -- deshalb muss VoiceAgent() den Start hart "
+        "verweigern, solange VOICE_AGENT_DLP_REVIEWED nicht explizit gesetzt "
+        "ist, und normal starten, sobald es gesetzt ist. Läuft als separater "
+        "Subprozess (nicht importiert), weil core.config.settings ein "
+        "gecachtes Singleton ist -- ein In-Prozess-Test würde nur die schon "
+        "beim Programmstart eingelesene Umgebung sehen, nicht eine geänderte."
+    )
+    import os
+    import subprocess
+
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    probe = (
+        "from agents.voice_agent import VoiceAgent\n"
+        "VoiceAgent()\n"
+        "print('VOICE_AGENT_STARTED')\n"
+    )
+
+    base_env = {k: v for k, v in os.environ.items() if k != "VOICE_AGENT_DLP_REVIEWED"}
+
+    # 11a: ohne die Variable -- Start MUSS fehlschlagen.
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=repo_root,
+            env=base_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0 and "VOICE_AGENT_DLP_REVIEWED" in (result.stderr or ""):
+            ok(
+                "VoiceAgent() verweigert Start ohne VOICE_AGENT_DLP_REVIEWED",
+                f"exit={result.returncode}",
+            )
+        else:
+            fail(
+                "VoiceAgent() hätte ohne VOICE_AGENT_DLP_REVIEWED nicht starten dürfen",
+                f"exit={result.returncode}, stdout={result.stdout!r}, "
+                f"stderr={result.stderr[-300:]!r}",
+            )
+    except Exception:
+        fail("Voice-Agent-Gate (ohne Variable) — Exception", "")
+        traceback.print_exc()
+
+    # 11b: mit der Variable auf "true" -- Start MUSS normal funktionieren.
+    try:
+        env_with_flag = dict(base_env)
+        env_with_flag["VOICE_AGENT_DLP_REVIEWED"] = "true"
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=repo_root,
+            env=env_with_flag,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0 and "VOICE_AGENT_STARTED" in result.stdout:
+            ok("VoiceAgent() startet normal mit VOICE_AGENT_DLP_REVIEWED=true")
+        else:
+            fail(
+                "VoiceAgent() hätte mit VOICE_AGENT_DLP_REVIEWED=true starten müssen",
+                f"exit={result.returncode}, stdout={result.stdout!r}, "
+                f"stderr={result.stderr[-300:]!r}",
+            )
+    except Exception:
+        fail("Voice-Agent-Gate (mit Variable) — Exception", "")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -884,6 +962,7 @@ def main() -> int:
     test_dlp_hard_block_regression()
     test_dlp_contact_and_injection()
     test_prompt_injection_precision()
+    test_voice_agent_dlp_gate()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")
