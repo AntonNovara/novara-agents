@@ -309,27 +309,48 @@ Runde-5 korrigiert, indem beiden Sätzen ein Marker hinzugefügt wurde.
 > Projektleiter, der seine eigenen Team-Guidelines lesen soll"
 > unterscheiden.)
 >
-> **Warum das jetzt okay ist:** Kein Agent bekommt heute Input von
-> unbekannten Personen aus dem offenen Internet — alle 5 Agenten laufen
-> hinter dem internen FastAPI-Gateway mit `API_SECRET_KEY`. Das reale
-> Risiko dieser Lücke ist damit aktuell niedrig.
+> **Korrektur (2026-08-20): "Kein Agent ist heute öffentlich" war so nicht
+> mehr richtig — präzisiert.** Die 5 Factory-Text-Agenten (dieser Abschnitt
+> hier) laufen tatsächlich ausschließlich hinter dem internen
+> FastAPI-Gateway mit `API_SECRET_KEY`, kein offener Endpunkt. ABER: derselbe
+> Server (`main.py`, dasselbe Deployment) enthält auch den **Voice Agent**
+> (`agents/voice_agent.py`, siehe eigener Abschnitt weiter unten) — und der
+> WAR ein echter öffentlicher Kanal: Vapi als Telefonie-Frontend, deployed
+> auf Railway, mit sechs Commits zwischen 2026-05-30 und 2026-07-01, die
+> ausschließlich Railway-Produktionsprobleme dieses Pfads beheben. Jeder
+> unbekannte Anrufer aus dem echten Telefonnetz hatte in diesem Zeitraum
+> live Zugriff. Das ist keine theoretische künftige Exponierung, sondern
+> eine bereits existierende, aktuell nur abgeschaltete Fähigkeit — der
+> Railway-Service müsste lediglich reaktiviert werden, kein neuer Kanal
+> müsste gebaut werden. Schlimmer noch: der Voice-Pfad hat nach Prüfung
+> **überhaupt keine DLP-Schicht** — nicht einmal die hier dokumentierte,
+> unvollkommene Heuristik greift dort, weil `VoiceAgent` nicht über
+> `BaseAgent.process()` läuft (Details im Voice-Agent-Abschnitt). Der oben
+> beschriebene Stufe-2-Restfall ist für den Voice-Pfad also gar nicht die
+> relevante Sorge — dort fehlt jede Prüfung, nicht nur eine unvollkommene.
 >
-> **Bedingung für die nächste Runde:** Sobald IRGENDEINER dieser Agenten
-> öffentlich exponiert wird (Endnutzer aus dem Internet, ohne Novara als
-> Gatekeeper dazwischen) — so wie es `sdr_demo_referencia/`
-> (https://github.com/AntonNovara/sdr_demo_referencia, privates Repo)
-> laut README werden SOLL, aber Stand heute NICHT ist: geprüft am
-> 2026-08-19, keine Deployment-Spuren lokal, die zuvor dokumentierte
-> Railway-URL liefert Railways eigenes "Application not found" statt der
-> App — MUSS diese Lücke vor dem Go-Live neu bewertet werden, dann mit einer
-> LLM-basierten Klassifikation für genau diese Randfälle
-> (`core/llm.py`-Factory existiert bereits) statt einer siebten
-> Wortlisten-/Phrasenmatching-Runde. Nicht früher — eine weitere Runde
-> reiner Musteranpassung hat sich über 5 Runden als Whack-a-Mole
-> erwiesen (jede Lücken-Schließung öffnet an anderer Stelle eine neue),
-> eine LLM-Klassifikation lohnt den Zusatzaufwand (Latenz/Kosten pro
-> Call) erst, wenn der Angriffsflächen-Kontext das auch wirklich
-> rechtfertigt.
+> **Warum das aktuell trotzdem kein aktiver Vorfall ist:** Die Railway-URL
+> (`novara-agents-production.up.railway.app`) wurde am 2026-08-19 geprüft
+> und liefert Railways eigenes "Application not found" — der Service läuft
+> nicht. Die 5 Factory-Text-Agenten sind unverändert hinter dem API-Key.
+>
+> **Bedingung — gilt AB SOFORT, nicht erst "nächste Runde":** Sobald der
+> Voice-Agent-Service auf Railway reaktiviert wird (oder IRGENDEIN anderer
+> Agent öffentlich exponiert wird — z. B. `sdr_demo_referencia/`,
+> https://github.com/AntonNovara/sdr_demo_referencia, das laut eigenem
+> README als öffentliche Demo gedacht ist, Stand 2026-08-19 aber ebenfalls
+> nicht deployed), MUSS diese Entscheidung SOFORT neu bewertet werden, nicht
+> beim nächsten geplanten Review-Zyklus — mit einer LLM-basierten
+> Klassifikation für genau diese Randfälle (`core/llm.py`-Factory existiert
+> bereits) statt einer siebten Wortlisten-/Phrasenmatching-Runde. Für den
+> Voice-Agent-Pfad reicht dabei "die Stufe-2-Heuristik verbessern" ohnehin
+> nicht — dort muss überhaupt erst eine DLP-Prüfung eingebaut werden, bevor
+> über deren Präzision diskutiert wird. Nicht früher als bei Reaktivierung
+> eines dieser Kanäle — eine weitere Runde reiner Musteranpassung ohne
+> konkreten Anlass hat sich über 5 Runden als Whack-a-Mole erwiesen (jede
+> Lücken-Schließung öffnet an anderer Stelle eine neue), eine
+> LLM-Klassifikation lohnt den Zusatzaufwand (Latenz/Kosten pro Call) erst,
+> wenn der Angriffsflächen-Kontext das auch wirklich rechtfertigt.
 
 > **Offener Punkt: Stufe-2-Hard-Block wirkt nur auf Input, nicht auf
 > Output.** Verifiziert per `/code-review ultra` (Runde 4): `sanitize_dict()`
@@ -584,6 +605,80 @@ Zusätzlich 1 Industry-Block wenn Branche erkannt: `healthcare` | `financial` | 
 ```bash
 POST /api/v1/agents/onboarding/process
 ```
+
+---
+
+## Voice Agent (`agents/voice_agent.py`)
+
+Ein sechster, eigenständiger Agent — NICHT Teil der 5 Factory-Agenten oben und
+NICHT über `BaseAgent` implementiert. Nimmt echte Telefongespräche entgegen.
+
+**Plattform:** [Vapi](https://vapi.ai) als Custom-LLM-Backend, nicht Twilio.
+`VoiceAgent.stream()`/`.complete()` liefern OpenAI-kompatible
+Chat-Completion-Chunks (SSE) bzw. ein einzelnes JSON-Objekt — exakt das
+Format, das Vapis Custom-LLM-Integration pro Gesprächsturn erwartet. System-
+Prompt: Deutsch/Österreichisch, max. 2 Sätze pro Antwort, eine Frage
+gleichzeitig, kein Technik-Jargon ("KI", "LangGraph" etc. explizit
+verboten), Ziel ist Neukunden-Qualifizierung (Name → Firma →
+Mitarbeiterzahl → Problem) oder Terminbuchung.
+
+**Anbindung an die restliche Agenten-Architektur — nur NACH dem Gespräch,
+nicht während:**
+- `POST /api/v1/voice/chat/chat/completions` (Vapis Custom-LLM-URL) ruft pro
+  Gesprächsturn direkt `_VOICE_AGENT.stream()`/`.complete()` auf — live,
+  während das Gespräch läuft.
+- `POST /api/v1/voice/webhook` empfängt Vapis Server-Events. Bei
+  `end-of-call-report` wird das volle Transkript NACH Gesprächsende
+  asynchron (Hintergrund-Task) an den **SDR-Agenten** übergeben
+  (`sdr.process(...)`) — Lead-Scoring, Firmenname, Kontakt, Outreach-Entwurf
+  — und zusätzlich als Markdown-Protokoll auf die Festplatte geschrieben
+  (für manuelle Durchsicht in Claude Cowork). Während des Gesprächs selbst
+  gibt es keine Verbindung zu SDR, Support, Operations oder sonst einer
+  Factory-Komponente. `tool-calls`/`function-call`-Events (z. B.
+  `book_appointment`) werden direkt im Webhook-Handler ausgeführt, ohne
+  einen Factory-Agenten zu involvieren.
+
+> **Kritisch: Der Live-Gesprächspfad hat KEINE DLP-Schicht — nicht die
+> abgeschwächte, gar keine.** `VoiceAgent` erbt nicht von `BaseAgent` und
+> importiert `core.security` an keiner Stelle (verifiziert: kein Treffer für
+> `security`/`SecurityLayer`/`DLP`/`sanitize`/`redact` in
+> `agents/voice_agent.py`). `BaseAgent.process()` ist die EINZIGE Stelle, an
+> der `SecurityLayer.check_and_redact()` (Input) und `sanitize_dict()`
+> (Output) aufgerufen werden — und `voice_chat_completions()` in `main.py`
+> ruft `_VOICE_AGENT.stream()`/`.complete()` direkt auf, niemals
+> `BaseAgent.process()`. Alles, was der Anrufer sagt, geht unverändert in
+> den Anthropic-Request: keine PII-Redaktion, kein Credential-Hard-Block,
+> nicht einmal die einfachste Stufe-1-Prompt-Injection-Prüfung. Erst das
+> TRANSKRIPT NACH Gesprächsende durchläuft (via `sdr.process(...)`) die DLP
+> — für die Dauer des eigentlichen Telefonats besteht während des gesamten
+> Live-Gesprächs keinerlei Schutz. Das ist eine strengere Lücke als der in
+> "Security Layer" oben dokumentierte Stufe-2-Restfall (dort existiert
+> wenigstens eine unvollkommene Heuristik; hier existiert keine).
+
+**Vollständig implementiert, kein Gerüst.** Echte Fehlerbehandlung auf jeder
+Ebene: kaputte JSON-Bodies von Vapi werden abgefangen, Anthropic-Fehler
+lösen eine gesprächstaugliche Fallback-Antwort statt eines HTTP 500 aus,
+Vapis mitgeschicktes (mitunter veraltetes) Dashboard-Modell wird ignoriert
+und durch `settings.anthropic_model` ersetzt, sowohl `tool-calls` (neues
+Vapi-Format) als auch `function-call` (Legacy-Format) werden unterstützt.
+Dazu ein IPv4-DNS-Patch (`_anthropic_ipv4_only`) speziell für Railway, wo
+IPv6-Egress fehlschlägt.
+
+**Deployment-Historie — wurde bereits live betrieben.** `railway.toml`
+(Dockerfile-Build, Healthcheck `/health`) liegt im Repo-Root. Sechs Commits
+zwischen **2026-05-30 und 2026-07-01** beheben ausschließlich
+Railway-spezifische Netzwerkprobleme dieses Voice-Pfads (`fix: Anthropic-
+Voice-Client auf IPv4 zwingen (Railway-Egress)`, `fix: IPv4-DNS-Patch für
+Railway-Egress + Egress-Diagnose-Endpunkt`, u. a. mit eigens dafür gebautem
+`/health/egress`-Diagnose-Endpunkt) — dieser Fix-Typ entsteht nur beim
+Debuggen einer tatsächlich laufenden Produktionsinstanz, nicht bei nie
+ausgeführtem Code. `Novara-Zentrale/Bienvenido.md` (datiert exakt auf den
+1. Juli 2026, den Tag des letzten dieser Fixes) dokumentiert
+`novara-agents-production.up.railway.app` als die damals aktive Live-URL.
+Per 2026-08-19 verifiziert: dieselbe URL liefert heute Railways eigenes
+"Application not found" (nicht FastAPIs 404) auf jeder Route — der Service
+ist inzwischen offline oder entkoppelt, aber nicht als "nie deployed"
+misszuverstehen.
 
 ---
 
