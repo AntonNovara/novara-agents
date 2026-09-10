@@ -40,6 +40,16 @@ _PII_PATTERNS: dict[str, re.Pattern] = {
     # Ziffernfolge ohne jedes Trennzeichen wird von KEINER der beiden
     # Implementierungen als Steuernummer behandelt.
     "tax_id":     re.compile(r"\b\d{2,3}[\s/\-]\d{3}[\s/\-]\d{4,5}\b"),
+    # Anthropic API-Keys (Präfix "sk-ant-"). Ergänzt das bestehende
+    # Keyword+Delimiter-Hard-Block-Muster (_CREDENTIAL_PATTERN, z. B.
+    # "api_key: sk-ant-...") um den Fall, dass der Key OHNE erkennbares
+    # Schlüsselwort/Delimiter im Text auftaucht (z. B. einfach eingefügt in
+    # einen Satz) — dort greift der Hard-Block nicht, dieses Muster schon.
+    # Redact-statt-Hard-Block ist hier bewusst konsistent mit der
+    # unabhängigen Referenz-Implementierung la-maquina-de-confianza/
+    # utils/sanitizer.py (gleiches Regex-Muster, dortiger Typname
+    # "anthropic_key"), nicht mit dem strikteren Hard-Block-Pfad.
+    "anthropic_api_key": re.compile(r"sk-ant-[a-zA-Z0-9\-_]{20,}", re.IGNORECASE),
 }
 
 # Kontaktdaten, die Agenten für ihre eigentliche Aufgabe benötigen (CRM-Eintrag,
@@ -48,8 +58,9 @@ _PII_PATTERNS: dict[str, re.Pattern] = {
 # echte Gefahrendaten (IBAN, Steuernummer, IP, Credentials), die immer ersetzt
 # werden.
 #
-# check_and_redact() ermittelt Sensible-Daten-Treffer (iban/ip_address/tax_id)
-# ZUERST auf dem unveränderten Text und lässt sie bei Überlappung IMMER
+# check_and_redact() ermittelt Sensible-Daten-Treffer (iban/ip_address/tax_id/
+# anthropic_api_key — alles außer _CONTACT_TYPES) ZUERST auf dem unveränderten
+# Text und lässt sie bei Überlappung IMMER
 # gewinnen — ein Kontakt-Kandidat, der sich mit einer Steuernummer & Co.
 # überschneidet, wird verworfen statt geschützt. Das ist strukturell robuster
 # als einzelne Zeichen aus den Kontakt-Mustern auszuschließen (der vorherige
@@ -264,8 +275,11 @@ _CREDENTIAL_KEYWORDS: tuple[str, ...] = (
     "private_key", "access_token", "api_key",
 )
 _CREDENTIAL_DELIMITER = r"(?::\s*|=\s*|\s+ist\s+|\s+is\s+)"
+# Capturing group um die Keyword-Alternation (statt (?:...)) -- liefert den
+# Credential-TYP fürs Audit-Log, ohne dass match.group(0) (Keyword+Delimiter+
+# Klartextwert) selbst geloggt werden muss.
 _CREDENTIAL_PATTERN = re.compile(
-    r"\b(?:" + "|".join(_CREDENTIAL_KEYWORDS) + r")\b" + _CREDENTIAL_DELIMITER + r"\S+",
+    r"\b(" + "|".join(_CREDENTIAL_KEYWORDS) + r")\b" + _CREDENTIAL_DELIMITER + r"\S+",
     re.IGNORECASE,
 )
 # "Bearer <token>" (HTTP Authorization Header) — hier ist das Leerzeichen
@@ -298,13 +312,35 @@ class SecurityLayer:
         # Hard-stop: eine tatsächliche Credential-Zuweisung im Payload ist nie
         # akzeptabel. Erfordert Keyword + Delimiter + Wert (siehe
         # _CREDENTIAL_PATTERN oben), NICHT die bloße Erwähnung des Wortes.
-        match = _CREDENTIAL_PATTERN.search(text) or _BEARER_PATTERN.search(text)
+        #
+        # Weder das Audit-Log noch blocked_reason (landet über base_agent.py
+        # direkt im AgentResponse.error der API-Antwort!) dürfen den
+        # Klartext-Treffer enthalten -- sonst wäre genau die Stelle, die den
+        # Credential-Leak verhindern soll, selbst eine zweite Leak-Quelle.
+        # Gleiche Privacy-Logik wie bei der PII-Redaktion unten: nur Typ +
+        # Länge, nie der Wert selbst.
+        credential_match = _CREDENTIAL_PATTERN.search(text)
+        credential_type: Optional[str] = None
+        if credential_match:
+            match = credential_match
+            credential_type = credential_match.group(1).lower()
+        else:
+            match = _BEARER_PATTERN.search(text)
+            if match:
+                credential_type = "bearer_token"
         if match:
-            logger.warning("DLP hard-block triggered", extra={"match": match.group(0)})
+            matched_length = len(match.group(0))
+            logger.warning(
+                "DLP hard-block triggered",
+                extra={"credential_type": credential_type, "matched_length": matched_length},
+            )
             return DLPResult(
                 approved=False,
                 redacted_text=text,
-                blocked_reason=f"Blocked credential pattern detected: '{match.group(0)}'",
+                blocked_reason=(
+                    f"Blocked credential pattern detected: type={credential_type}, "
+                    f"length={matched_length}"
+                ),
             )
 
         # Hard-stop: Prompt-Injection-Versuch, Stufe 1 (eindeutige Marker).
