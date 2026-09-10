@@ -560,18 +560,16 @@ class SDRAgent(BaseAgent):
         self._workflow = SDRGraph(
             llm=build_llm(max_tokens=1024),
             db=LeadDatabase(),
-            # TODO: vor Einsatz auf echtes CRM umstellen. CRMIntegrationSDR
-            # ist eine In-Memory-Mock-Implementierung (tools/crm_integration.py)
-            # — Leads werden bei jedem Neustart verworfen. Ein direkter Swap
-            # auf crm_handler.py (Repo la-maquina-de-confianza) ist nicht ohne
-            # Weiteres möglich: dessen Google Sheets API nutzt einen
-            # interaktiven Desktop-OAuth-Login (InstalledAppFlow), der in
-            # einem automatisierten Agenten-Workflow nicht ausgelöst werden
-            # kann, und crm_handler.py liegt in einem separaten Repo ohne
-            # Paketierung für einen Cross-Repo-Import. LeadRecord ließe sich
-            # inhaltlich auf add_lead_to_crm() abbilden (firma=company_name,
-            # ansprechpartner=contact_name, email=contact_email, ...) — das
-            # müsste aber gezielt implementiert werden, nicht "by the way".
+            # CRMIntegrationSDR ist standardmäßig ein In-Memory-Mock (Leads
+            # gehen bei jedem Neustart verloren). Block C1 (10.09.2026) hat
+            # optional die echte Kopplung an crm_handler.py (Repo
+            # la-maquina-de-confianza) ergänzt — aktiv nur mit
+            # SDR_CRM_LIVE_SHEET=true (core/config.py, Default: aus). NUR für
+            # lokale Entwicklung geeignet: crm_handler.py nutzt einen an
+            # DIESEN Mac gebundenen OAuth-Token, ein Railway-Deploy hat
+            # keinen Zugriff darauf. Details: tools/crm_integration.py
+            # (_lead_record_to_sheet_row, upsert_lead) und
+            # tools/live_crm_bridge.py.
             crm=CRMIntegrationSDR(
                 endpoint=settings.crm_endpoint,
                 api_key=settings.crm_api_key.get_secret_value(),

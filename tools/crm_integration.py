@@ -1,12 +1,16 @@
 """
-CRM / ERP Integration Tool – Mock-Implementierung.
-In Produktion: Ersetze _post_to_erp() durch echten HTTP-Client (httpx).
-Das Interface bleibt identisch – keine Änderungen am aufrufenden Code nötig.
+CRM / ERP Integration Tool.
 
-TODO: vor Einsatz auf echtes CRM/ERP umstellen. Aktuell rein in-memory
-(_mock_store), Daten gehen bei jedem Prozess-Neustart verloren. Siehe
-operations_agent.py/sdr_agent.py für den genauen Stand & warum ein Swap auf
-crm_handler.py (Repo la-maquina-de-confianza) nicht 1:1 möglich ist.
+CRMIntegration (Operations-Agent, Rechnungen): weiterhin reiner In-Memory-
+Mock. TODO: vor Einsatz auf echtes ERP umstellen (_post_to_erp() durch
+httpx-Client ersetzen) — Interface bleibt identisch.
+
+CRMIntegrationSDR (SDR-Agent, Leads): Mock per Default, optional echte
+Kopplung an crm_handler.py (Repo la-maquina-de-confianza) über
+settings.sdr_crm_live_sheet (Block C1, 10.09.2026) — siehe
+_lead_record_to_sheet_row(), upsert_lead() und tools/live_crm_bridge.py.
+Nur für lokale Entwicklung: die Kopplung hängt an einem OAuth-Token, der an
+diesen Mac gebunden ist, nicht an einem Railway-Deploy verfügbar.
 """
 from __future__ import annotations
 
@@ -16,6 +20,8 @@ from datetime import datetime
 from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+
+from core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -118,13 +124,48 @@ class LeadCRMResult(BaseModel):
     crm_response: dict[str, Any] = Field(default_factory=dict)
 
 
+def _lead_record_to_sheet_row(record: LeadRecord) -> dict[str, str]:
+    """
+    Bildet LeadRecord auf die Spalten von crm_handler.add_lead_to_crm() ab
+    (firma, ansprechpartner, position, email, telefon, ...). Telefon wird
+    bewusst leer gelassen — das SDR-Agent-Datenmodell (LeadRecord,
+    ProspectContact) erfasst aktuell an keiner Stelle eine Telefonnummer;
+    das ist eine separate, spätere Erweiterung der Pipeline, keine Lücke in
+    dieser Kopplung. "Branche" hat in der Sheet-Struktur keine eigene
+    Spalte und landet deshalb zusammen mit Score/Pain-Points in Notizen.
+    """
+    notizen_parts = [f"Branche: {record.industry}"]
+    if record.company_size:
+        notizen_parts.append(f"Größe: {record.company_size}")
+    notizen_parts.append(f"Score: {record.lead_score} ({record.icp_tier})")
+    if record.pain_points:
+        notizen_parts.append(f"Pain Points: {', '.join(record.pain_points)}")
+    notizen_parts.append(f"Quelle: SDR-Agent ({record.contact_source})")
+
+    return {
+        "firma": record.company_name,
+        "ansprechpartner": record.contact_name,
+        "position": record.contact_title,
+        "email": record.contact_email or "",
+        "telefon": "",
+        "website": "",
+        "quelle": "SDR-Agent",
+        "notizen": " | ".join(notizen_parts),
+    }
+
+
 class CRMIntegrationSDR(CRMIntegration):
     """Extends CRMIntegration with SDR-specific lead management."""
 
     def upsert_lead(self, record: LeadRecord) -> LeadCRMResult:
         """
         Schreibt einen Lead-Datensatz ins CRM.
-        In Produktion: httpx.post(self.endpoint + "/leads", json=record.model_dump())
+
+        Standardmäßig In-Memory-Mock (_mock_store). Wenn
+        settings.sdr_crm_live_sheet=true ist (Block C1, nur lokale
+        Entwicklung — siehe tools/live_crm_bridge.py), wird zusätzlich echt
+        ins Produktions-Google-Sheet geschrieben; schlägt das fehl, wird das
+        bewusst als success=False gemeldet statt hinter dem Mock versteckt.
         """
         payload = record.model_dump()
         self._mock_store.append(payload)
@@ -133,6 +174,37 @@ class CRMIntegrationSDR(CRMIntegration):
             "CRM upsert_lead called",
             extra={"lead_id": record.lead_id, "company": record.company_name, "score": record.lead_score},
         )
+
+        if settings.sdr_crm_live_sheet:
+            from tools.live_crm_bridge import add_lead_to_live_crm
+
+            try:
+                written_row = add_lead_to_live_crm(_lead_record_to_sheet_row(record))
+            except Exception as exc:
+                logger.warning(
+                    "Live-CRM-Schreibversuch fehlgeschlagen",
+                    extra={"lead_id": record.lead_id, "error": str(exc)},
+                )
+                return LeadCRMResult(
+                    success=False,
+                    lead_id=record.lead_id,
+                    message=f"Live-CRM-Schreibversuch fehlgeschlagen: {exc}",
+                    crm_response={},
+                )
+
+            logger.info(
+                "Lead ins Live-CRM-Sheet geschrieben",
+                extra={"lead_id": record.lead_id, "sheet_row_id": written_row.get("ID")},
+            )
+            return LeadCRMResult(
+                success=True,
+                lead_id=record.lead_id,
+                message=(
+                    f"Lead '{record.contact_name}' @ '{record.company_name}' "
+                    f"erfolgreich im Live-Google-Sheet angelegt (Zeile {written_row.get('ID')})."
+                ),
+                crm_response={"sheet_row": written_row},
+            )
 
         crm_response = {
             "crm_id": f"CRM-{record.lead_id}",

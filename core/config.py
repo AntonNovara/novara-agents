@@ -66,6 +66,19 @@ class Settings(BaseSettings):
     # bewusst geprüft hat.
     voice_agent_dlp_reviewed: bool = Field(default=False, alias="VOICE_AGENT_DLP_REVIEWED")
 
+    # SDR → CRM-Sheet-Kopplung (Block C1): Live-Schreibzugriff auf das
+    # Produktions-Google-Sheet in la-maquina-de-confianza/crm_handler.py ist
+    # per Default AUS (fail-safe, analog zu voice_agent_dlp_reviewed) — ohne
+    # dieses Flag bleibt write_to_crm beim harmlosen In-Memory-Mock
+    # (tools/crm_integration.py). NUR für lokale Entwicklung gedacht:
+    # crm_handler.py liegt in einem Schwester-Repo mit eigenem, an DIESEN Mac
+    # gebundenem OAuth-Token — ein Railway-Deploy von novara-agents hat
+    # keinen Zugriff darauf (siehe tools/live_crm_bridge.py, CLAUDE.md).
+    sdr_crm_live_sheet: bool = Field(default=False, alias="SDR_CRM_LIVE_SHEET")
+    la_maquina_de_confianza_path: str = Field(
+        default="../la-maquina-de-confianza", alias="LA_MAQUINA_DE_CONFIANZA_PATH"
+    )
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
