@@ -18,6 +18,12 @@ _ROOT = Path(__file__).resolve().parent.parent
 # direkt als Dateiname/Pfad interpretiert (siehe load_wissen()).
 _KNOWN_CLIENTS: dict[str, str] = {
     "novara": "novara_wissen.txt",
+    # DKH (Deutsches Kulturhaus e.V., Passau) — Pilotkunde. Deckt beide
+    # Zielgruppen-Seiten der Website ab (deutsche Hauptseite für
+    # Institutionen/Kommunen + spanische /ausbildung-Landingpage fürs
+    # Lateinamerika-Programm), da beide von derselben Wissensdatei bedient
+    # werden. Liegt bewusst außerhalb dieses Repos, im Schwesterprojekt.
+    "dkh": "/Users/antonpfortevelazquez/kulturhaus-website/historia_kulturhaus.txt",
 }
 
 
