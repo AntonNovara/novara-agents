@@ -51,6 +51,8 @@ logger = logging.getLogger(__name__)
 
 _WISSEN = load_novara_wissen()
 
+_LANGUAGE_LABELS = {"de": "German", "en": "English", "es": "Spanish"}
+
 
 # ── Graph State ────────────────────────────────────────────────────────────────
 
@@ -62,7 +64,7 @@ class SupportState(TypedDict):
     intent: str          # billing | technical | onboarding | privacy | support_hours | complaint | general
     urgency: str         # low | medium | high
     sentiment: str       # positive | neutral | negative
-    language: str        # de | en
+    language: str        # de | en | es
     inquiry_summary: str
 
     # set by search_faq
@@ -100,7 +102,7 @@ Analysiere die eingehende Kundenanfrage und gib AUSSCHLIESSLICH valides JSON zur
   "intent": eines von ["billing","technical","onboarding","privacy","support_hours","complaint","general"],
   "urgency": eines von ["low","medium","high"],
   "sentiment": eines von ["positive","neutral","negative"],
-  "language": eines von ["de","en"],
+  "language": eines von ["de","en","es"],
   "summary": eine Zeile (max 20 Wörter) was der Kunde möchte
 }}
 
@@ -109,7 +111,10 @@ Regeln:
   - "billing" = Fragen zu Preisen (Starter €990, Growth €2.490, Retainer €590/Monat),
     Rechnungen (NA-2026-xxx), Zahlungsmodell (50/50)
   - urgency "high" = Kunde ist blockiert, System ausgefallen, Datenverlust
-  - language "de" wenn Anfrage primär auf Deutsch, sonst "en"
+  - language: "de" wenn die Anfrage primär auf Deutsch ist, "es" wenn primär auf
+    Spanisch, sonst "en". Richte dich nach der HAUPTSPRACHE des gesamten Texts,
+    nicht nach einzelnen eingestreuten Fremdwörtern (z. B. bleibt eine sonst
+    spanische Anfrage, die nur das deutsche Wort "Ausbildung" enthält, "es")
 
 Antworte NUR mit dem JSON-Objekt, keine Erklärung.
 """
@@ -220,7 +225,7 @@ class SupportGraph:
         logger.info("Node: compose_faq_response", extra={"session": state["session_id"]})
 
         top = state["faq_results"][0]
-        lang_label = "German" if state["language"] == "de" else "English"
+        lang_label = _LANGUAGE_LABELS.get(state["language"], "English")
 
         prompt = (
             f"Language to use: {lang_label}\n\n"
