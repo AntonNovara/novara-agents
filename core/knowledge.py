@@ -24,6 +24,11 @@ _KNOWN_CLIENTS: dict[str, str] = {
     # Lateinamerika-Programm), da beide von derselben Wissensdatei bedient
     # werden. Liegt bewusst außerhalb dieses Repos, im Schwesterprojekt.
     "dkh": "/Users/antonpfortevelazquez/kulturhaus-website/historia_kulturhaus.txt",
+    # Institut für Berufsstrategie — eigenständiges Einzelunternehmen, teilt
+    # sich aber Kontakt-Domain/Infrastruktur mit DKH. Eigene Wissensdatei,
+    # weil Zielgruppen und Angebote inhaltlich anders sind als beim
+    # allgemeinen DKH-Wissen.
+    "berufsstrategie": "/Users/antonpfortevelazquez/kulturhaus-website/institut_berufsstrategie_wissen.txt",
 }
 
 

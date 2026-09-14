@@ -31,8 +31,10 @@ from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
-from core.knowledge import load_novara_wissen
+from core.config import settings
+from core.knowledge import load_wissen
 from core.llm import build_llm
+from tools.email_sender import send_email
 from tools.faq_database import FAQDatabase, FAQSearchResult
 from tools.ticket_system import TicketPriority, TicketRecord, TicketSystem
 
@@ -49,9 +51,31 @@ def _parse_llm_json(text: str) -> dict:
 
 logger = logging.getLogger(__name__)
 
-_WISSEN = load_novara_wissen()
+_WISSEN = load_wissen(settings.support_knowledge_client)
 
 _LANGUAGE_LABELS = {"de": "German", "en": "English", "es": "Spanish"}
+
+# Kurze Identitäts-/Positionierungssätze pro Mandant für die Prompt-Einleitung.
+# Die eigentlichen Fakten (Preise, Angebote, Regeln) kommen aus _WISSEN oben —
+# hier steht bewusst nur der "wer bin ich"-Satz, der sich pro Kunde
+# unterscheidet. Unbekannter Mandant fällt auf einen generischen Satz zurück,
+# statt fälschlich Novara-Text zu zeigen.
+_CLIENT_INTROS = {
+    "novara": (
+        "Novara Automation ist ein österreichisches Unternehmen (Wien), das "
+        "Handwerksbetrieben (Schwerpunkt Elektrikerbetriebe) hilft, manuelle "
+        "Prozesse zu automatisieren."
+    ),
+    "berufsstrategie": (
+        "Das Institut für Berufsstrategie (Passau) verbindet berufsbezogene "
+        "Sprachförderung mit beruflicher Orientierung — für Privatpersonen, "
+        "Unternehmen und Bildungsträger."
+    ),
+}
+_CLIENT_INTRO = _CLIENT_INTROS.get(
+    settings.support_knowledge_client,
+    "Das Unternehmen hilft seinen Kunden, wie in der Wissensdatenbank unten beschrieben.",
+)
 
 
 # ── Graph State ────────────────────────────────────────────────────────────────
@@ -89,11 +113,10 @@ class SupportState(TypedDict):
 # ── LLM Prompts ────────────────────────────────────────────────────────────────
 
 _SYSTEM_ANALYZE = f"""\
-Du bist ein Support-Klassifikator bei Novara Automation.
-Novara Automation ist ein österreichisches Unternehmen (Wien) das Handwerksbetrieben
-(Schwerpunkt Elektrikerbetriebe) hilft, manuelle Prozesse zu automatisieren.
+Du bist ein Support-Klassifikator.
+{_CLIENT_INTRO}
 
-=== NOVARA WISSENSDATENBANK ===
+=== WISSENSDATENBANK ===
 {_WISSEN}
 === ENDE WISSENSDATENBANK ===
 
@@ -108,8 +131,8 @@ Analysiere die eingehende Kundenanfrage und gib AUSSCHLIESSLICH valides JSON zur
 
 Regeln:
   - "complaint" = Kunde äußert Unzufriedenheit oder Ärger
-  - "billing" = Fragen zu Preisen (Starter €990, Growth €2.490, Retainer €590/Monat),
-    Rechnungen (NA-2026-xxx), Zahlungsmodell (50/50)
+  - "billing" = Fragen zu Preisen, Rechnungen oder Zahlungsmodalitäten (Details dazu
+    stehen, falls vorhanden, in der Wissensdatenbank oben)
   - urgency "high" = Kunde ist blockiert, System ausgefallen, Datenverlust
   - language: "de" wenn die Anfrage primär auf Deutsch ist, "es" wenn primär auf
     Spanisch, sonst "en". Richte dich nach der HAUPTSPRACHE des gesamten Texts,
@@ -120,20 +143,20 @@ Antworte NUR mit dem JSON-Objekt, keine Erklärung.
 """
 
 _SYSTEM_COMPOSE = f"""\
-Du bist ein freundlicher Support-Agent bei Novara Automation.
-Novara hilft Handwerksbetrieben (Elektriker, Installateure, etc.) in Wien/Österreich,
-Prozesse wie verpasste Anrufe, Angebotserstellung und Terminbestätigung zu automatisieren.
+Du bist ein freundlicher Support-Agent.
+{_CLIENT_INTRO}
 
-=== NOVARA WISSENSDATENBANK (für präzise Antworten zu Paketen, Preisen, Prozessen) ===
+=== WISSENSDATENBANK (für präzise Antworten zu Angeboten, Preisen, Prozessen) ===
 {_WISSEN}
 === ENDE WISSENSDATENBANK ===
 
 Ein relevanter FAQ-Eintrag wurde gefunden. Schreibe eine hilfreiche, präzise Antwort die:
   - Die spezifische Frage des Kunden direkt beantwortet
   - Den FAQ-Eintrag als primäre Informationsquelle nutzt
-  - Bei Preisfragen die echten Novara-Pakete (Starter/Growth/Retainer) nennt
+  - Bei Preis-/Förderfragen nur Angaben aus der Wissensdatenbank nennt und keine
+    Zusagen (z. B. Förderzusagen) erfindet, die dort nicht stehen
   - In der unten angegebenen Sprache geschrieben ist ({{language}})
-  - Professionell aber zugänglich ist — österreichisches Deutsch, "Sie"-Form
+  - Professionell aber zugänglich ist — "Sie"-Form
   - Maximal 2–5 Sätze; die Kundenfrage nicht wiederholen
 
 Antworte NUR mit dem Antworttext, kein JSON, keine Präambel.
@@ -265,6 +288,24 @@ class SupportGraph:
         )
 
         result = self._tickets.create_ticket(record)
+
+        if settings.support_escalation_email_live and settings.support_escalation_email_to:
+            try:
+                send_email(
+                    to=settings.support_escalation_email_to,
+                    subject=f"[Support-Eskalation] {state['inquiry_summary']}",
+                    body=(
+                        f"Neue Anfrage konnte nicht automatisch beantwortet werden "
+                        f"und wurde eskaliert (Ticket {result.ticket_id}, "
+                        f"Priorität {priority.value.upper()}).\n\n"
+                        f"Zusammenfassung: {state['inquiry_summary']}\n"
+                        f"Sprache: {state['language']}\n\n"
+                        f"Ursprüngliche Anfrage:\n{state['input_text']}"
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("Eskalations-E-Mail konnte nicht gesendet werden: %s", exc)
+
         return {**state, "ticket_result": result.model_dump(), "action": "ticket_created"}
 
     # ── Node: finalize ───────────────────────────────────────────────────────

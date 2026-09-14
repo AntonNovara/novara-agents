@@ -79,6 +79,20 @@ class Settings(BaseSettings):
         default="../la-maquina-de-confianza", alias="LA_MAQUINA_DE_CONFIANZA_PATH"
     )
 
+    # Support Agent: welchen Wissens-Mandanten laden (siehe core/knowledge.py,
+    # load_wissen). Default "novara" = bisheriges Verhalten unverändert.
+    support_knowledge_client: str = Field(default="novara", alias="SUPPORT_KNOWLEDGE_CLIENT")
+
+    # Support Agent: echte Eskalations-E-Mail bei create_ticket. Analog zu
+    # sdr_crm_live_sheet fail-safe AUS per Default — ohne dieses Flag bleibt
+    # es beim reinen In-Memory-Mock (tools/ticket_system.py), es wird nie
+    # eine echte E-Mail verschickt. Nutzt dieselbe Gmail-OAuth-Brücke zum
+    # Schwester-Repo la-maquina-de-confianza wie sdr_crm_live_sheet
+    # (tools/email_sender.py), sendet also immer als das dort hinterlegte
+    # Konto (aktuell anton@novaraautomation.com), nie "als" der Kunde.
+    support_escalation_email_live: bool = Field(default=False, alias="SUPPORT_ESCALATION_EMAIL_LIVE")
+    support_escalation_email_to: str = Field(default="", alias="SUPPORT_ESCALATION_EMAIL_TO")
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
