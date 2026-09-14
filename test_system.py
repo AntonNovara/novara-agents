@@ -149,20 +149,45 @@ def test_knowledge_base() -> None:
     else:
         ok("Inhalts-Marker vorhanden", ", ".join(markers))
 
-    # Jeder Agent hat modulweit _WISSEN mit demselben Inhalt
+    # Jeder Agent hat modulweit _WISSEN mit demselben Inhalt, das er beim
+    # Import tatsächlich lädt. Fünf der sechs Agenten laden fest Novaras
+    # eigenes Wissen (load_novara_wissen()); support_agent ist mandanten-
+    # fähig (core/knowledge.py, load_wissen()) und lädt stattdessen
+    # settings.support_knowledge_client — auf manchen Rechnern z. B.
+    # "berufsstrategie" statt "novara" (siehe CLAUDE.md/Session-Historie:
+    # Institut für Berufsstrategie ist ein echter Pilotkunde). Ein
+    # pauschaler "€990 in wissen"-Check (Novaras eigener Preis) schlägt
+    # dadurch für support_agent fälschlich fehl, sobald ein anderer
+    # Mandant konfiguriert ist — das ist kein Bug, sondern die Mandanten-
+    # Fähigkeit funktioniert wie vorgesehen. Der Test vergleicht deshalb
+    # pro Agent gegen die Quelle, die für ihn TATSÄCHLICH zuständig ist,
+    # statt einen Novara-spezifischen Inhalt bei allen vorauszusetzen.
+    from core.config import settings
+    from core.knowledge import load_wissen
+
     agent_modules = [
         "agents.operations_agent", "agents.sdr_agent", "agents.support_agent",
         "agents.sales_copilot_agent", "agents.onboarding_agent", "agents.voice_agent",
     ]
     import importlib
     for modname in agent_modules:
+        short_name = modname.split(".")[-1]
+        expected_client = settings.support_knowledge_client if short_name == "support_agent" else "novara"
         try:
             mod = importlib.import_module(modname)
             w = getattr(mod, "_WISSEN", None)
-            if w and len(w) > 500 and "€990" in w:
-                ok(f"{modname.split('.')[-1]} lädt Wissensbasis in Kontext", f"{len(w)} Zeichen")
+            expected = load_wissen(expected_client)
+            if w and len(w) > 500 and w == expected:
+                ok(
+                    f"{short_name} lädt Wissensbasis in Kontext",
+                    f"{len(w)} Zeichen (Mandant: {expected_client})",
+                )
             else:
-                fail(f"{modname.split('.')[-1]} Wissensbasis", "leer oder unvollständig")
+                fail(
+                    f"{short_name} Wissensbasis",
+                    f"leer, unvollständig oder weicht vom erwarteten Mandanten "
+                    f"'{expected_client}' ab (len={len(w) if w else 0})",
+                )
         except Exception as exc:
             fail(f"Import {modname}", str(exc))
 
@@ -938,6 +963,269 @@ def test_voice_agent_dlp_gate() -> None:
         traceback.print_exc()
 
 
+# ── Test 12: Output-DLP-Hard-Block-Enforcement ──────────────────────────────
+
+def test_output_dlp_enforcement() -> None:
+    section("TEST 12 — Security-Layer: Hard-Block greift jetzt auch auf der Ausgabeseite")
+    info(
+        "Regressionstest für den in CLAUDE.md dokumentierten 'Offener Punkt: "
+        "Stufe-2-Hard-Block wirkt nur auf Input, nicht auf Output': "
+        "sanitize_dict() prüfte bisher nur .redacted_text und ignorierte "
+        ".approved/.blocked_reason -- ein Hard-Block-Treffer im vom Agenten "
+        "erzeugten Output wurde dadurch unverändert durchgereicht. "
+        "sanitize_dict() wirft jetzt OutputBlockedError, und "
+        "BaseAgent.process() fängt sie ab und meldet success=False, statt "
+        "sie unbehandelt propagieren zu lassen."
+    )
+    try:
+        from core.security import SecurityLayer, OutputBlockedError
+    except Exception as exc:
+        fail("Import SecurityLayer/OutputBlockedError", str(exc))
+        return
+
+    # 12a: sanitize_dict() blockt einen Credential-Leak im Output.
+    try:
+        SecurityLayer.sanitize_dict({"reply": "api_key: sk-ant-abcdefghijklmnopqrstuvwx"})
+        fail("sanitize_dict() hat den Credential-Leak im Output NICHT geblockt")
+    except OutputBlockedError as exc:
+        ok("sanitize_dict() wirft OutputBlockedError bei Credential-Leak im Output", str(exc.blocked_reason))
+    except Exception:
+        fail("sanitize_dict() — unerwartete Exception statt OutputBlockedError", "")
+        traceback.print_exc()
+
+    # 12b: normaler Output (PII-Redaktion, Kontakt-Erhalt) funktioniert weiterhin unverändert.
+    try:
+        result = SecurityLayer.sanitize_dict(
+            {"message": "Kontakt: max@example.at, IBAN AT611904300234573201"}
+        )
+        if "[REDACTED:IBAN]" in result["message"] and "max@example.at" in result["message"]:
+            ok("sanitize_dict() redigiert normale PII weiterhin korrekt (kein False-Positive-Block)")
+        else:
+            fail("sanitize_dict() Normalfall unerwartetes Ergebnis", str(result))
+    except Exception:
+        fail("sanitize_dict() Normalfall — Exception", "")
+        traceback.print_exc()
+
+    # 12c: End-to-End über BaseAgent.process() -- kein LLM nötig, _run() liefert
+    # direkt einen Output, der den Hard-Block auslöst.
+    try:
+        from agents.base_agent import AgentRequest, BaseAgent
+
+        class _FakeBlockedOutputAgent(BaseAgent):
+            agent_type = "fake_blocked_output"
+
+            def _run(self, request: AgentRequest) -> dict:
+                return {"reply": "api_key: sk-ant-abcdefghijklmnopqrstuvwx"}
+
+        resp = _FakeBlockedOutputAgent().process(AgentRequest(text="hallo"))
+        if not resp.success and resp.error and "Output blocked by DLP" in resp.error:
+            ok("BaseAgent.process() fängt OutputBlockedError ab und meldet success=False", resp.error)
+        else:
+            fail(
+                "BaseAgent.process() hätte den Output blocken müssen",
+                f"success={resp.success}, error={resp.error}",
+            )
+    except Exception:
+        fail(
+            "BaseAgent.process() Output-Block — unbehandelte Exception "
+            "(genau der Bug, den dieser Test abdecken soll)",
+            "",
+        )
+        traceback.print_exc()
+
+
+# ── Test 13: EU AI Act Art. 50 — Pflicht-Offenlegung ────────────────────────
+
+def test_ai_disclosure() -> None:
+    section("TEST 13 — EU AI Act Art. 50: Pflicht-Offenlegung in SDR- und Voice-Agent")
+    info(
+        "AI_DISCLOSURE_DE muss (a) in den jeweiligen System-Prompt injiziert "
+        "sein UND (b) im SDR-Fall deterministisch an die generierte Nachricht "
+        "angehängt bzw. im Voice-Fall dem ersten Gesprächsturn vorangestellt "
+        "werden -- die Prompt-Instruktion allein ist keine Garantie."
+    )
+
+    try:
+        from agents.sdr_agent import (
+            AI_DISCLOSURE_DE as SDR_DISCLOSURE,
+            _CLIENT_NAME as SDR_CLIENT_NAME,
+            _SYSTEM_OUTREACH,
+        )
+    except Exception as exc:
+        fail("Import SDR-Offenlegung", str(exc))
+        return
+
+    sdr_formatted = SDR_DISCLOSURE.format(client_name=SDR_CLIENT_NAME)
+    if "KI-System" in sdr_formatted and SDR_CLIENT_NAME in sdr_formatted:
+        ok("AI_DISCLOSURE_DE (SDR) formatiert korrekt", sdr_formatted)
+    else:
+        fail("AI_DISCLOSURE_DE (SDR) fehlerhaft formatiert", sdr_formatted)
+
+    if sdr_formatted in _SYSTEM_OUTREACH:
+        ok("Offenlegungssatz ist wörtlich im SDR-System-Prompt (_SYSTEM_OUTREACH) enthalten")
+    else:
+        fail("Offenlegungssatz fehlt im SDR-System-Prompt")
+
+    try:
+        from agents.voice_agent import (
+            AI_DISCLOSURE_DE as VOICE_DISCLOSURE,
+            _CLIENT_NAME as VOICE_CLIENT_NAME,
+            _SYSTEM_PROMPT,
+            _is_first_turn,
+            _with_disclosure_prefix,
+        )
+    except Exception as exc:
+        fail("Import Voice-Offenlegung", str(exc))
+        return
+
+    voice_formatted = VOICE_DISCLOSURE.format(client_name=VOICE_CLIENT_NAME)
+    if voice_formatted in _SYSTEM_PROMPT:
+        ok("Offenlegungssatz ist wörtlich im Voice-System-Prompt enthalten")
+    else:
+        fail("Offenlegungssatz fehlt im Voice-System-Prompt")
+
+    if _is_first_turn([]):
+        ok("_is_first_turn(): leere Historie zählt als erster Turn")
+    else:
+        fail("_is_first_turn(): leere Historie hätte True ergeben müssen")
+
+    history_with_assistant = [
+        {"role": "user", "content": "Hallo"},
+        {"role": "assistant", "content": "Servus, hier ist Novara!"},
+    ]
+    if not _is_first_turn(history_with_assistant):
+        ok("_is_first_turn(): Folge-Turn korrekt erkannt (Assistant-Antwort vorhanden)")
+    else:
+        fail("_is_first_turn(): hätte bei vorhandener Assistant-Antwort False ergeben müssen")
+
+    prefixed = _with_disclosure_prefix("Herzlich willkommen bei Novara!")
+    if prefixed.startswith(voice_formatted):
+        ok("_with_disclosure_prefix() stellt die Offenlegung deterministisch voran", prefixed[:90])
+    else:
+        fail("_with_disclosure_prefix() hat die Offenlegung nicht vorangestellt", prefixed[:120])
+
+
+# ── Test 14: Consent-Ledger + SDR-Consent-Routing ───────────────────────────
+
+def test_consent_ledger() -> None:
+    section("TEST 14 — Consent-Ledger: Opt-in/Opt-out pro Kontakt+Kanal, SDR-Routing")
+    info(
+        "core/consent.py muss Opt-outs kanalspezifisch UND auditierbar "
+        "(Timestamp, Grund, History) registrieren, Identifier normalisieren "
+        "(Groß-/Kleinschreibung, Whitespace) und der SDR-Graph muss vor "
+        "compose_outreach() tatsächlich blocken, wenn ein Opt-out vorliegt."
+    )
+    try:
+        from core.consent import ConsentLedger
+        import core.consent as consent_module
+    except Exception as exc:
+        fail("Import core.consent", str(exc))
+        return
+
+    ledger = ConsentLedger()
+
+    if ledger.is_allowed("max@example.at", "email"):
+        ok("Unbekannter Kontakt ist standardmäßig erlaubt (kein Opt-out hinterlegt)")
+    else:
+        fail("Unbekannter Kontakt hätte erlaubt sein müssen")
+
+    ledger.record_opt_out("max@example.at", "email", reason="Antwort auf Kalt-Mail: 'bitte nicht mehr'")
+    if not ledger.is_allowed("max@example.at", "email"):
+        ok("Opt-out blockt is_allowed() für denselben Kanal")
+    else:
+        fail("Opt-out hätte blocken müssen")
+
+    if ledger.is_allowed("max@example.at", "linkedin"):
+        ok("Opt-out ist kanalspezifisch — LinkedIn bleibt für denselben Kontakt erlaubt")
+    else:
+        fail("Opt-out hätte NICHT kanalübergreifend gelten dürfen")
+
+    ledger.record_opt_in("max@example.at", "email", reason="Kunde hat auf Nachfrage erneut zugestimmt")
+    if ledger.is_allowed("max@example.at", "email"):
+        ok("Ein späteres Opt-in hebt einen vorherigen Opt-out wieder auf")
+    else:
+        fail("Opt-in hätte den vorherigen Block aufheben müssen")
+
+    ledger.record_opt_out("  Max@Example.AT  ", "linkedin", reason="Test: Normalisierung")
+    if not ledger.is_allowed("max@example.at", "linkedin"):
+        ok("Identifier werden normalisiert (Groß-/Kleinschreibung, Whitespace) — trifft denselben Eintrag")
+    else:
+        fail("Normalisierung griff nicht — abweichende Schreibweise fand den Opt-out nicht")
+
+    entries = ledger.history("max@example.at")
+    if len(entries) == 3:
+        ok("history() liefert den vollständigen Audit-Trail für den Kontakt", f"{len(entries)} Einträge")
+    else:
+        fail("history() unerwartete Anzahl Einträge", f"{len(entries)} statt 3 erwartet")
+
+    if ledger.is_allowed(None, "email") and ledger.is_allowed("", "voice"):
+        ok("Fehlender Identifier blockt den Outreach-Flow nicht (Fail-Safe)")
+    else:
+        fail("Fehlender Identifier hätte NICHT blocken dürfen")
+
+    # 14h: SDRGraph.check_consent()/_route_after_consent() gegen den echten
+    # Prozess-Singleton (core.consent._ledger) -- kein LLM nötig, beide
+    # Knoten sind reiner State-in/State-out-Code.
+    try:
+        from agents.sdr_agent import SDRGraph
+        from tools.crm_integration import CRMIntegrationSDR
+        from tools.lead_database import LeadDatabase
+    except Exception as exc:
+        fail("Import für SDR-Consent-Routing-Test", str(exc))
+        return
+
+    graph = SDRGraph(llm=None, db=LeadDatabase(), crm=CRMIntegrationSDR())
+    base_state = {
+        "input_text": "", "session_id": "test-consent-routing",
+        "company_name": "Testbetrieb GmbH", "industry": "Elektrikerbetrieb",
+        "company_size": 5, "pain_points": [], "icp_score": 90,
+        "icp_rationale": "", "outreach_channel": "email", "language": "de",
+        "contacts": [{
+            "contact_id": "c-1", "first_name": "Max", "last_name": "Mustermann",
+            "title": "Inhaber", "seniority": "c_level", "company": "Testbetrieb GmbH",
+            "company_size": 5, "industry": "Elektrikerbetrieb",
+            "email": "consent-test@example.at", "linkedin_url": "linkedin.com/in/max-mustermann",
+            "pain_points": [], "tech_stack": [],
+        }],
+        "contact_source": "generated", "lead_score": 95, "score_rationale": "",
+        "qualified": True, "consent_allowed": True, "consent_identifier": "",
+        "consent_reason": "", "outreach_text": "", "outreach_subject": "",
+        "crm_result": {}, "final_result": {}, "error": None,
+    }
+
+    try:
+        state_after = graph.check_consent(dict(base_state))
+        route = graph._route_after_consent(state_after)
+        if state_after["consent_allowed"] and route == "compose_outreach":
+            ok("check_consent() erlaubt unbekannten Kontakt, Routing → compose_outreach")
+        else:
+            fail(
+                "check_consent() hätte erlauben müssen",
+                f"allowed={state_after['consent_allowed']}, route={route}",
+            )
+
+        consent_module.record_opt_out("consent-test@example.at", "email", reason="Testfall TEST 14h")
+        state_after2 = graph.check_consent(dict(base_state))
+        route2 = graph._route_after_consent(state_after2)
+        if not state_after2["consent_allowed"] and route2 == "finalize_opted_out":
+            ok("check_consent() blockt nach Opt-out, Routing → finalize_opted_out", state_after2["consent_reason"])
+        else:
+            fail(
+                "check_consent() hätte nach Opt-out blocken müssen",
+                f"allowed={state_after2['consent_allowed']}, route={route2}",
+            )
+
+        final = graph.finalize_opted_out(state_after2)
+        fr = final["final_result"]
+        if fr.get("consent_blocked") is True and "outreach" not in fr:
+            ok("finalize_opted_out() erzeugt keinen Outreach-Text und markiert consent_blocked=True")
+        else:
+            fail("finalize_opted_out() Ergebnis unerwartet", str(fr))
+    except Exception:
+        fail("SDR-Consent-Routing — Exception", "")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -963,6 +1251,9 @@ def main() -> int:
     test_dlp_contact_and_injection()
     test_prompt_injection_precision()
     test_voice_agent_dlp_gate()
+    test_output_dlp_enforcement()
+    test_ai_disclosure()
+    test_consent_ledger()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

@@ -42,9 +42,40 @@ log = structlog.get_logger("novara.voice")
 
 _WISSEN = load_novara_wissen()
 
+# EU AI Act Art. 50 – Transparenzpflicht (in Kraft seit 2. August 2026): wer
+# mit einem KI-System interagiert, muss das erkennen können, sofern es nicht
+# offensichtlich ist — gilt für ein Telefonat genauso wie für eine
+# geschriebene Nachricht. Gleiche Konstante/Formulierung wie in
+# agents/sdr_agent.py, hier bewusst dupliziert statt importiert: voice_agent.py
+# bleibt absichtlich unabhängig von agents/sdr_agent.py, die einzige
+# bestehende Kopplung läuft über main.py (Webhook nach Gesprächsende ruft
+# sdr.process() auf), nie direkt zwischen den beiden Agenten-Modulen.
+#
+# Konsens/Opt-out (core/consent.py, Kanal "voice"): dieser Agent nimmt nur
+# EINGEHENDE Anrufe entgegen — er initiiert kein Outbound-Telefonat, das vor
+# dem Wählen gegen ein Opt-out geprüft werden müsste (ein Anrufer, der selbst
+# anruft, hat den Kontakt hergestellt). Die tatsächliche Outreach-Aktion, die
+# aus einem Anruf entstehen kann — die Follow-up-E-Mail/LinkedIn-Nachricht,
+# die main.py nach Gesprächsende über sdr.process() erzeugen lässt — läuft
+# bereits durch SDRGraph.check_consent() (agents/sdr_agent.py). Der Kanal
+# "voice" im Ledger ist vorbereitet für den Tag, an dem Novara selbst
+# ausgehend anruft (siehe Roadmap) — dann ist HIER der richtige Ort für eine
+# is_allowed()-Prüfung vor dem Wählen.
+AI_DISCLOSURE_DE = (
+    "Hinweis: Diese Nachricht/dieser Anruf wird von einem "
+    "KI-System im Auftrag von {client_name} erstellt."
+)
+_CLIENT_NAME = "Novara Automation"
+
 _SYSTEM_PROMPT = f"""\
 Du bist Novara, der freundliche digitale Assistent von Novara Automation Wien.
 Du nimmst eingehende Anrufe entgegen und sprichst Österreichisch/Deutsch.
+
+PFLICHT-OFFENLEGUNG (EU AI Act Art. 50, in Kraft seit 2. August 2026):
+Zu Beginn JEDES Gesprächs musst du sinngemäß offenlegen, dass du ein
+KI-System bist, bevor du mit der eigentlichen Qualifizierung beginnst —
+zum Beispiel: "{AI_DISCLOSURE_DE.format(client_name=_CLIENT_NAME)}"
+(natürlich in gesprochener, kurzer Form, nicht als vorgelesener Rechtstext).
 
 === NOVARA WISSENSDATENBANK ===
 {_WISSEN}
@@ -57,7 +88,8 @@ GESPRÄCHSREGELN (STRIKT EINHALTEN):
 4. Bestandskunde mit Problem? Beantworte aus der Wissensdatenbank oder biete Rückruf an.
 5. Terminwunsch? Sage: "Ich schicke Ihnen gleich den Buchungslink per SMS."
 6. Preise ERST nennen wenn Qualifizierung abgeschlossen (Firma + Mitarbeiterzahl bekannt).
-7. KEIN Technik-Jargon: kein "KI", kein "Automatisierungssoftware", kein "LangGraph".
+7. KEIN Technik-Jargon: kein "KI", kein "Automatisierungssoftware", kein "LangGraph"
+   (Ausnahme: die Pflicht-Offenlegung oben zu Gesprächsbeginn).
 8. Ton: freundlich, direkt, kompetent — wie ein Mensch am Telefon.
 9. Abschluss: "Vielen Dank für Ihren Anruf. Ich leite alles weiter und Sie hören bald von uns."
 
@@ -67,6 +99,23 @@ INTENT-ERKENNUNG:
 - Termin buchen → Buchungslink per SMS ankündigen
 - Unklar → Frage: "Sind Sie bereits Kunde bei uns oder rufen Sie zum ersten Mal an?"
 """
+
+
+def _is_first_turn(anthropic_messages: list[dict]) -> bool:
+    """True, wenn im bisherigen Gesprächsverlauf noch keine Assistant-Antwort vorkam."""
+    return not any(m["role"] == "assistant" for m in anthropic_messages)
+
+
+def _with_disclosure_prefix(content: str) -> str:
+    """
+    Stellt die Pflicht-Offenlegung (Art. 50) dem ersten Satz des Gesprächs
+    deterministisch voran — nicht nur per Prompt-Instruktion. Gleiche
+    Philosophie wie der Credential-Hard-Block in core/security.py: eine
+    System-Prompt-Regel ist eine Empfehlung ans LLM, kein Garant. Wird nur
+    beim ERSTEN Turn eines Gesprächs aufgerufen (siehe _is_first_turn).
+    """
+    disclosure = AI_DISCLOSURE_DE.format(client_name=_CLIENT_NAME)
+    return f"{disclosure} {content}" if content else disclosure
 
 
 class VoiceAgent:
@@ -156,6 +205,7 @@ class VoiceAgent:
             for m in messages
             if m.get("role") in ("user", "assistant") and m.get("content")
         ]
+        first_turn = _is_first_turn(anthropic_messages)
 
         try:
             response = self._client.messages.create(
@@ -173,6 +223,9 @@ class VoiceAgent:
                 error=str(exc),
             )
             content = "Entschuldigung, da ist kurz etwas schiefgelaufen. Können Sie das bitte wiederholen?"
+
+        if first_turn:
+            content = _with_disclosure_prefix(content)
 
         return {
             "id": completion_id,
@@ -203,9 +256,16 @@ class VoiceAgent:
             for m in messages
             if m.get("role") in ("user", "assistant") and m.get("content")
         ]
+        first_turn = _is_first_turn(anthropic_messages)
 
         # Erstes Chunk: role
         yield _sse_chunk(completion_id, created, model, {"role": "assistant"}, None)
+
+        # Pflicht-Offenlegung deterministisch VOR dem ersten LLM-Token dieses
+        # Anrufs ausgeben — siehe _with_disclosure_prefix()-Docstring.
+        if first_turn:
+            disclosure = AI_DISCLOSURE_DE.format(client_name=_CLIENT_NAME)
+            yield _sse_chunk(completion_id, created, model, {"content": f"{disclosure} "}, None)
 
         try:
             with self._client.messages.stream(

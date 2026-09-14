@@ -296,6 +296,24 @@ class DLPResult:
     blocked_reason: Optional[str] = None
 
 
+class OutputBlockedError(Exception):
+    """
+    Wird von sanitize_dict() ausgelöst, wenn ein vom Agenten erzeugter
+    Ausgabewert selbst den Hard-Block auslöst (Credential-Leak oder
+    Prompt-Injection-Muster im LLM-Output). Vormals wurde `approved` auf der
+    Ausgabeseite nie geprüft -- der Hard-Block griff faktisch nur beim
+    Input-DLP-Aufruf in agents/base_agent.py, siehe CLAUDE.md, "Offener
+    Punkt: Stufe-2-Hard-Block wirkt nur auf Input, nicht auf Output".
+    BaseAgent.process() fängt diese Exception ab und wandelt sie in eine
+    reguläre AgentResponse(success=False, ...) um -- genau wie beim
+    Input-Block, nur eine Ebene später.
+    """
+
+    def __init__(self, blocked_reason: str) -> None:
+        self.blocked_reason = blocked_reason
+        super().__init__(blocked_reason)
+
+
 class SecurityLayer:
     """
     Stateless security utility used by BaseAgent before any outbound call.
@@ -479,20 +497,41 @@ class SecurityLayer:
 
     @classmethod
     def sanitize_dict(cls, data: dict[str, Any]) -> dict[str, Any]:
-        """Recursively redact PII from all string values in a dict."""
+        """
+        Recursively redact PII from all string values in a dict.
+
+        Raises OutputBlockedError if any string value trips the hard-block
+        (credential leak or prompt-injection pattern) -- unlike a mere PII
+        finding, `approved=False` on the OUTPUT side means the agent (or the
+        LLM behind it) produced something that must never reach the caller,
+        so this is a hard failure, not a silent redaction. Vorher wurde nur
+        `.redacted_text` gelesen und `.approved`/`.blocked_reason` nie
+        geprüft -- der Hard-Block griff dadurch effektiv nur beim
+        Input-DLP-Aufruf. Der Aufrufer (agents/base_agent.py) MUSS diese
+        Exception abfangen.
+        """
         result: dict[str, Any] = {}
         for key, value in data.items():
             if isinstance(value, str):
                 dlp = cls.check_and_redact(value)
+                if not dlp.approved:
+                    raise OutputBlockedError(dlp.blocked_reason or "output blocked by DLP")
                 result[key] = dlp.redacted_text
             elif isinstance(value, dict):
                 result[key] = cls.sanitize_dict(value)
             elif isinstance(value, list):
-                result[key] = [
-                    cls.sanitize_dict(item) if isinstance(item, dict)
-                    else (cls.check_and_redact(item).redacted_text if isinstance(item, str) else item)
-                    for item in value
-                ]
+                new_list: list[Any] = []
+                for item in value:
+                    if isinstance(item, dict):
+                        new_list.append(cls.sanitize_dict(item))
+                    elif isinstance(item, str):
+                        dlp = cls.check_and_redact(item)
+                        if not dlp.approved:
+                            raise OutputBlockedError(dlp.blocked_reason or "output blocked by DLP")
+                        new_list.append(dlp.redacted_text)
+                    else:
+                        new_list.append(item)
+                result[key] = new_list
             else:
                 result[key] = value
         return result

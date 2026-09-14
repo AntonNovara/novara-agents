@@ -12,11 +12,21 @@ Workflow (LangGraph StateGraph):
   _route_after_score
         ├── score ≥ 40 (qualifiziert)
         │         ↓
-        │   compose_outreach  ← LLM: hochpersonalisierter E-Mail- oder
-        │         ↓                   LinkedIn-Text
-        │   write_to_crm     ← CRMIntegrationSDR.upsert_lead()
+        │   check_consent      ← core.consent: Opt-out-Prüfung für den gewählten Kanal
         │         ↓
-        │     finalize
+        │   _route_after_consent
+        │         ├── erlaubt
+        │         │       ↓
+        │         │  compose_outreach  ← LLM: hochpersonalisierter E-Mail- oder
+        │         │       ↓                   LinkedIn-Text + Pflicht-Offenlegung
+        │         │       ↓                   (EU AI Act Art. 50, siehe AI_DISCLOSURE_DE)
+        │         │  write_to_crm     ← CRMIntegrationSDR.upsert_lead()
+        │         │       ↓
+        │         │     finalize
+        │         │
+        │         └── Opt-out hinterlegt
+        │                   ↓
+        │             finalize_opted_out   (kein Outreach-Text, kein CRM-Eintrag)
         │
         └── score < 40 (disqualifiziert)
                   ↓
@@ -35,6 +45,7 @@ from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
+from core import consent
 from core.config import settings
 from core.knowledge import load_novara_wissen
 from core.llm import build_llm
@@ -51,6 +62,24 @@ _SENIORITY_BONUS: dict[str, int] = {
     "ic": 0,
 }
 _ICP_TIER_THRESHOLDS = {"high": 70, "medium": 40}
+
+# EU AI Act Art. 50 – Transparenzpflicht (in Kraft seit 2. August 2026): wer
+# mit einem KI-System interagiert, muss das erkennen können, sofern es nicht
+# offensichtlich ist. Der vom LLM erzeugte Outreach-Text selbst ist NICHT
+# vertrauenswürdig genug, um diese Pflicht allein zu erfüllen (siehe
+# core/security.py — dieselbe Philosophie wie beim Credential-Hard-Block:
+# eine Prompt-Anweisung ist eine Empfehlung an das LLM, deterministischer
+# Code ist die Garantie). Die Konstante wird daher sowohl in den
+# System-Prompt injiziert (_SYSTEM_OUTREACH) als auch deterministisch in
+# compose_outreach() angehängt, falls das LLM sie ausgelassen haben sollte.
+# Gleiche Konstante/Formulierung in agents/voice_agent.py — dort bewusst
+# dupliziert statt importiert, weil voice_agent.py absichtlich unabhängig
+# von agents/sdr_agent.py bleibt (siehe CLAUDE.md, Abschnitt "Voice Agent").
+AI_DISCLOSURE_DE = (
+    "Hinweis: Diese Nachricht/dieser Anruf wird von einem "
+    "KI-System im Auftrag von {client_name} erstellt."
+)
+_CLIENT_NAME = "Novara Automation"
 
 # Wissensdatenbank einmalig laden
 _WISSEN = load_novara_wissen()
@@ -91,6 +120,11 @@ class SDRState(TypedDict):
     lead_score: int
     score_rationale: str
     qualified: bool
+
+    # set by check_consent
+    consent_allowed: bool
+    consent_identifier: str
+    consent_reason: str
 
     # set by compose_outreach
     outreach_text: str
@@ -170,6 +204,11 @@ Gib AUSSCHLIESSLICH valides JSON zurück:
 _SYSTEM_OUTREACH = f"""\
 Du bist ein erfahrener SDR bei Novara Automation und schreibst eine Kalt-Outreach-Nachricht.
 
+PFLICHT-OFFENLEGUNG (EU AI Act Art. 50, in Kraft seit 2. August 2026):
+Die Nachricht MUSS als allerletzten Satz genau diesen Offenlegungssatz enthalten,
+unverändert und unabhängig von der gewählten Sprache:
+"{AI_DISCLOSURE_DE.format(client_name=_CLIENT_NAME)}"
+
 === NOVARA WISSENSDATENBANK (dein Kontext für Ton, Pakete, Einwände, Vorlagen) ===
 {_WISSEN}
 === ENDE WISSENSDATENBANK ===
@@ -182,9 +221,12 @@ WICHTIGE SPRACHREGELN (strikt einhalten):
 4. Schließe mit EINER einzigen, unverbindlichen Frage — kein "Haben Sie Zeit für einen Anruf?"
 5. LinkedIn: max 6 Zeilen. E-Mail: max 5 Sätze Body + Betreff.
 6. Ton: neugierig, nicht drängend — wie ein Kollege der eine echte Beobachtung teilt
-7. KEIN Technik-Jargon: kein "KI", kein "Make.com", kein "Automatisierungssoftware"
+7. KEIN Technik-Jargon in der eigentlichen Nachricht: kein "KI", kein "Make.com", kein
+   "Automatisierungssoftware" (die Pflicht-Offenlegung oben ist davon ausgenommen —
+   die MUSS wörtlich "KI-System" enthalten)
 8. Österreichisches Deutsch. Unterschrift: "LG, Anton" oder "Freundliche Grüße, Anton"
 9. Nie verteidigen — immer mit einer Frage weiterdrehen
+10. Letzter Satz der Nachricht = die Pflicht-Offenlegung oben, wörtlich übernommen
 
 Verwende die Kalt-E-Mail-Vorlage und den Anruf-Ablauf aus der Wissensdatenbank als Vorlage.
 
@@ -333,6 +375,33 @@ class SDRGraph:
             "qualified": qualified,
         }
 
+    # ── Node: check_consent ──────────────────────────────────────────────────
+
+    def check_consent(self, state: SDRState) -> SDRState:
+        logger.info("Node: check_consent", extra={"session": state["session_id"]})
+
+        top = state["contacts"][0] if state["contacts"] else {}
+        channel = state["outreach_channel"]
+        identifier = top.get("email") if channel == "email" else top.get("linkedin_url")
+
+        allowed = consent.is_allowed(identifier, channel)
+        reason = (
+            "kein Opt-out hinterlegt" if allowed
+            else f"Kontakt hat für Kanal '{channel}' widersprochen (Opt-out)"
+        )
+        if not allowed:
+            logger.warning(
+                "Outreach durch Opt-out blockiert",
+                extra={"session": state["session_id"], "channel": channel, "identifier": identifier},
+            )
+
+        return {
+            **state,
+            "consent_allowed": allowed,
+            "consent_identifier": identifier or "",
+            "consent_reason": reason,
+        }
+
     # ── Node: compose_outreach ───────────────────────────────────────────────
 
     def compose_outreach(self, state: SDRState) -> SDRState:
@@ -367,6 +436,14 @@ class SDRGraph:
             lines = raw.split("\n", 2)
             subject = lines[0].split(":", 1)[1].strip()
             body = lines[2].strip() if len(lines) > 2 else raw
+
+        # Deterministische Garantie für die AI-Act-Art.-50-Offenlegung: die
+        # Prompt-Instruktion oben ist eine Empfehlung ans LLM, kein Beweis.
+        # Nur anhängen, wenn sie nicht schon (wörtlich, vom LLM befolgt) da
+        # ist, damit sie nicht doppelt erscheint.
+        disclosure = AI_DISCLOSURE_DE.format(client_name=_CLIENT_NAME)
+        if disclosure not in body:
+            body = f"{body}\n\n{disclosure}"
 
         return {**state, "outreach_text": body, "outreach_subject": subject}
 
@@ -438,6 +515,32 @@ class SDRGraph:
         }
         return {**state, "final_result": final, "error": None}
 
+    def finalize_opted_out(self, state: SDRState) -> SDRState:
+        logger.info("Node: finalize_opted_out", extra={"session": state["session_id"]})
+
+        final: dict[str, Any] = {
+            "qualified": True,
+            "consent_blocked": True,
+            "company": {
+                "name": state["company_name"],
+                "industry": state["industry"],
+                "size": state["company_size"],
+            },
+            "lead_score": state["lead_score"],
+            "score_rationale": state["score_rationale"],
+            "consent": {
+                "channel": state["outreach_channel"],
+                "identifier": state["consent_identifier"],
+                "reason": state["consent_reason"],
+            },
+            "message": (
+                f"Lead '{state['company_name']}' ist qualifiziert (Score {state['lead_score']}), "
+                f"aber für Kanal '{state['outreach_channel']}' liegt ein Opt-out vor. "
+                "Kein Outreach-Text erstellt, kein CRM-Eintrag."
+            ),
+        }
+        return {**state, "final_result": final, "error": None}
+
     def finalize_disqualified(self, state: SDRState) -> SDRState:
         logger.info("Node: finalize_disqualified", extra={"score": state.get("lead_score")})
 
@@ -469,7 +572,19 @@ class SDRGraph:
     def _route_after_score(
         state: SDRState,
     ) -> Literal["compose_outreach", "finalize_disqualified"]:
+        # Rückgabewert "compose_outreach" führt im Graph zu "check_consent",
+        # nicht direkt zu "compose_outreach" (siehe _build_graph) — die
+        # Consent-Prüfung sitzt zwischen Qualifikation und Nachrichten-
+        # erstellung. Name unverändert gelassen, um den bestehenden Test
+        # (test_sdr_routing) und die bestehende Literal-Signatur nicht
+        # anzufassen.
         return "compose_outreach" if state["qualified"] else "finalize_disqualified"
+
+    @staticmethod
+    def _route_after_consent(
+        state: SDRState,
+    ) -> Literal["compose_outreach", "finalize_opted_out"]:
+        return "compose_outreach" if state["consent_allowed"] else "finalize_opted_out"
 
     # ── Graph Builder ─────────────────────────────────────────────────────────
 
@@ -479,10 +594,12 @@ class SDRGraph:
         graph.add_node("analyze_input", self.analyze_input)
         graph.add_node("search_leads", self.search_leads)
         graph.add_node("score_lead", self.score_lead)
+        graph.add_node("check_consent", self.check_consent)
         graph.add_node("compose_outreach", self.compose_outreach)
         graph.add_node("write_to_crm", self.write_to_crm)
         graph.add_node("finalize", self.finalize)
         graph.add_node("finalize_disqualified", self.finalize_disqualified)
+        graph.add_node("finalize_opted_out", self.finalize_opted_out)
 
         graph.set_entry_point("analyze_input")
         graph.add_edge("analyze_input", "search_leads")
@@ -491,14 +608,24 @@ class SDRGraph:
             "score_lead",
             self._route_after_score,
             {
-                "compose_outreach": "compose_outreach",
+                # qualifiziert → erst Consent prüfen, nicht direkt Outreach schreiben
+                "compose_outreach": "check_consent",
                 "finalize_disqualified": "finalize_disqualified",
+            },
+        )
+        graph.add_conditional_edges(
+            "check_consent",
+            self._route_after_consent,
+            {
+                "compose_outreach": "compose_outreach",
+                "finalize_opted_out": "finalize_opted_out",
             },
         )
         graph.add_edge("compose_outreach", "write_to_crm")
         graph.add_edge("write_to_crm", "finalize")
         graph.add_edge("finalize", END)
         graph.add_edge("finalize_disqualified", END)
+        graph.add_edge("finalize_opted_out", END)
 
         return graph.compile()
 
@@ -519,6 +646,9 @@ class SDRGraph:
             "lead_score": 0,
             "score_rationale": "",
             "qualified": False,
+            "consent_allowed": True,
+            "consent_identifier": "",
+            "consent_reason": "",
             "outreach_text": "",
             "outreach_subject": "",
             "crm_result": {},

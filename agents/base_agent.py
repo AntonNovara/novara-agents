@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from core.security import SecurityLayer, DLPResult
+from core.security import SecurityLayer, DLPResult, OutputBlockedError
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,24 @@ class BaseAgent(ABC):
             )
 
         # --- Output DLP ---
-        sanitized_result = SecurityLayer.sanitize_dict(raw_result)
+        # sanitize_dict() raises OutputBlockedError instead of silently
+        # passing through a hard-block hit -- must be caught here, otherwise
+        # it propagates uncaught out of process() (see core/security.py).
+        try:
+            sanitized_result = SecurityLayer.sanitize_dict(raw_result)
+        except OutputBlockedError as exc:
+            self._logger.warning(
+                "Agent output blocked by DLP",
+                extra={"session_id": request.session_id, "agent": self.agent_type},
+            )
+            return AgentResponse(
+                success=False,
+                session_id=request.session_id,
+                agent_type=self.agent_type,
+                error=f"Output blocked by DLP: {exc.blocked_reason}",
+                dlp_findings=input_dlp.findings,
+                processing_time_ms=_elapsed_ms(start),
+            )
 
         elapsed = _elapsed_ms(start)
         self._logger.info(

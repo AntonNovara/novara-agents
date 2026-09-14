@@ -352,21 +352,19 @@ Runde-5 korrigiert, indem beiden Sätzen ein Marker hinzugefügt wurde.
 > LLM-Klassifikation lohnt den Zusatzaufwand (Latenz/Kosten pro Call) erst,
 > wenn der Angriffsflächen-Kontext das auch wirklich rechtfertigt.
 
-> **Offener Punkt: Stufe-2-Hard-Block wirkt nur auf Input, nicht auf
-> Output.** Verifiziert per `/code-review ultra` (Runde 4): `sanitize_dict()`
-> (genutzt für die Output-DLP in `agents/base_agent.py`) ruft zwar
-> `check_and_redact()` auf, liest aber nur `.redacted_text` und prüft
-> `.approved`/`.blocked_reason` nie. Enthielte eine vom LLM generierte
-> Antwort zufällig ein Rollenumdefinitions-Muster mit KI-Identitäts- oder
-> Einschränkungs+Verneinungs-Cue, würde `check_and_redact()` zwar
-> `approved=False` zurückgeben, `sanitize_dict()` gibt den unveränderten
-> Text trotzdem weiter — der Hard-Block greift effektiv nur beim
-> Input-DLP-Aufruf, nicht beim Output. Vorbestehendes Verhalten, nicht neu
-> durch diese Runde eingeführt; die Doku-Zeile "Läuft automatisch um jede
-> `BaseAgent.process()`-Ausführung (Input UND Output)" oben stimmt daher nur
-> für die Redaktion, nicht für Hard-Block-Enforcement. Bewusst nicht in
-> dieser Runde gefixt — braucht eigene Runde mit Fokus auf
-> `sanitize_dict()`/`base_agent.py`, nicht "nebenbei mitgefixt".
+> **Behoben (Sprint 1 Compliance, 14.09.2026): Stufe-2-Hard-Block wirkte nur
+> auf Input, nicht auf Output.** Ursprünglich verifiziert per `/code-review
+> ultra` (Runde 4): `sanitize_dict()` rief zwar `check_and_redact()` auf, las
+> aber nur `.redacted_text` und prüfte `.approved`/`.blocked_reason` nie —
+> der Hard-Block griff effektiv nur beim Input-DLP-Aufruf. `sanitize_dict()`
+> wirft jetzt `OutputBlockedError` (siehe `OutputBlockedError`-Klasse
+> direkt über `DLPResult`), sobald irgendein String-Wert im Output
+> `approved=False` liefert — rekursiv über verschachtelte Dicts/Listen.
+> `agents/base_agent.py` fängt sie in `process()` ab und meldet
+> `AgentResponse(success=False, error="Output blocked by DLP: ...")`, statt
+> sie unbehandelt propagieren zu lassen. Regressionstest: `test_system.py`
+> TEST 12 (Hard-Block-Treffer im Output, Normalfall ohne False-Positive,
+> volle `BaseAgent.process()`-Kette mit einem Fake-Agenten ohne LLM-Aufruf).
 
 ---
 
@@ -404,6 +402,56 @@ Aktiv, wenn:
 > — laut eigenem README als öffentliche Demo gedacht, Stand 2026-08-19 aber
 > noch nicht deployed), muss dort Demo-Modus zum Fail-Safe-Default werden
 > (an, sofern nicht explizit für Prod freigeschaltet) — das ist noch offen.
+
+---
+
+## Compliance: EU AI Act Art. 50 & Consent-Ledger (Sprint 1, 14.09.2026)
+
+Zwei zusätzliche, deterministische Schutzschichten, unabhängig von der
+DLP-Schicht oben — beide folgen derselben Grundregel: eine Prompt-Instruktion
+an das LLM ist eine Empfehlung, kein Garant, also muss die eigentliche
+Durchsetzung im Code passieren, nicht nur im System-Prompt.
+
+**AI_DISCLOSURE_DE** — Pflicht-Offenlegung nach EU AI Act Art. 50
+(Transparenzpflicht, in Kraft seit 2. August 2026: wer mit einem KI-System
+interagiert, muss das erkennen können). Als Konstante bewusst **dupliziert**
+in `agents/sdr_agent.py` und `agents/voice_agent.py` statt aus einem
+gemeinsamen Modul importiert — `voice_agent.py` bleibt absichtlich
+unabhängig von `agents/sdr_agent.py` (die einzige bestehende Kopplung läuft
+über `main.py`, siehe Abschnitt "Voice Agent" unten).
+
+| Agent | Wo injiziert | Wo durchgesetzt |
+|---|---|---|
+| SDR (`compose_outreach`) | Instruktion + Wortlaut in `_SYSTEM_OUTREACH` | Deterministisch an `outreach_text` angehängt, falls vom LLM ausgelassen |
+| Voice (`complete()`/`stream()`) | Instruktion + Wortlaut in `_SYSTEM_PROMPT` | `_with_disclosure_prefix()` stellt sie dem ersten Gesprächsturn voran (`_is_first_turn()` erkennt anhand der Historie, ob es der erste Turn ist) — läuft VOR dem ersten LLM-Token, nicht danach |
+
+**`core/consent.py`** — auditierbares Opt-in/Opt-out-Register pro
+Kontakt-Identifier (E-Mail, Telefonnummer oder LinkedIn-URL, normalisiert)
+und Kanal (`email` | `voice` | `linkedin`). Prozessweiter In-Memory-Singleton
+(`_ledger`), analog zu den Mock-Stores in `tools/crm_integration.py` —
+Einträge gehen bei Neustart verloren, TODO vor Produktivbetrieb: persistenter
+Store (Postgres/Redis), identische Interface-Methoden (`is_allowed`,
+`record_opt_out`, `record_opt_in`, `history`).
+
+- SDR-Agent: neuer Node `check_consent` zwischen `score_lead` und
+  `compose_outreach` (siehe SDR-Agent-Workflow unten) — ein Opt-out für den
+  gewählten Kanal routet nach `finalize_opted_out` statt `compose_outreach`,
+  kein Outreach-Text wird generiert, kein CRM-Eintrag geschrieben.
+- Voice-Agent: **kein** Consent-Check vor der Gesprächsannahme — `VoiceAgent`
+  nimmt ausschließlich eingehende Anrufe entgegen, initiiert kein Outbound-
+  Telefonat, das vor dem Wählen geprüft werden müsste. Die tatsächliche
+  Outreach-Aktion, die aus einem Anruf entstehen kann (die Follow-up-E-Mail,
+  die `main.py` nach Gesprächsende über `sdr.process()` erzeugen lässt),
+  läuft bereits durch `SDRGraph.check_consent()`. Der Kanal `voice` im
+  Ledger ist vorbereitet für den Tag, an dem Novara selbst ausgehend anruft
+  (Roadmap) — dann ist `agents/voice_agent.py`, vor dem Wählen, der richtige
+  Ort für eine `is_allowed()`-Prüfung. Bewusst nicht vorgezogen — das wäre
+  ungetesteter, unerreichbarer Code ohne reale Aufrufstelle.
+
+Regressionstests: `test_system.py` TEST 13 (Offenlegung injiziert +
+deterministisch durchgesetzt) und TEST 14 (Ledger-Normalisierung,
+Kanal-Spezifität, Audit-Trail, volle `check_consent`/`_route_after_consent`-
+Kette im SDR-Graph ohne LLM-Aufruf).
 
 ---
 
@@ -497,7 +545,9 @@ Qualifiziert eingehende Firmen-Leads, ermittelt Ansprechpartner und erstellt per
 **Workflow:**
 ```
 analyze_input → search_leads → score_lead → [score ≥ 40?]
-                                               ├── ja  → compose_outreach → write_to_crm → finalize
+                                               ├── ja  → check_consent → [Opt-out?]
+                                               │                          ├── nein → compose_outreach → write_to_crm → finalize
+                                               │                          └── ja   → finalize_opted_out
                                                └── nein → finalize_disqualified
 ```
 
@@ -508,9 +558,11 @@ analyze_input → search_leads → score_lead → [score ≥ 40?]
 | `analyze_input` | LLM | Extrahiert Firma, Branche, Größe, Pain Points, ICP-Score (0-100) |
 | `search_leads` | `LeadDatabase` | Fuzzy-Match auf Firmenname; Industry-Match → Persona-Generierung |
 | `score_lead` | deterministisch | `lead_score = min(100, icp_score + seniority_bonus)` |
-| `compose_outreach` | LLM | Hochpersonalisierter E-Mail- oder LinkedIn-Text mit SUBJECT-Parsing |
+| `check_consent` | `core.consent` (Sprint 1, 14.09.2026) | Fragt `is_allowed(identifier, channel)` für E-Mail/LinkedIn-Identifier des Top-Kontakts ab; blockt bei Opt-out |
+| `compose_outreach` | LLM | Hochpersonalisierter E-Mail- oder LinkedIn-Text mit SUBJECT-Parsing; hängt `AI_DISCLOSURE_DE` (Art. 50) deterministisch an |
 | `write_to_crm` | `CRMIntegrationSDR` | Mock → in Prod: HubSpot / Salesforce / Pipedrive |
 | `finalize_disqualified` | — | Kein CRM-Eintrag, kein Outreach |
+| `finalize_opted_out` | — | Score reicht, aber Opt-out für den Kanal vorhanden: kein Outreach-Text, kein CRM-Eintrag |
 
 **Lead-Scoring:**
 
@@ -710,8 +762,9 @@ novara-agents/
 │
 ├── core/
 │   ├── config.py                   # pydantic-settings, Singleton via lru_cache
+│   ├── consent.py                  # Opt-in/Opt-out-Ledger pro Kontakt+Kanal (Sprint 1)
 │   ├── llm.py                      # Zentrale LLM-Factory + Demo-Modus-Fake-Client
-│   └── security.py                 # DLP/PII-Redaktion, Hard-Block-Keywords
+│   └── security.py                 # DLP/PII-Redaktion, Hard-Block-Keywords, OutputBlockedError
 │
 ├── agents/
 │   ├── base_agent.py               # BaseAgent, AgentRequest, AgentResponse
@@ -770,4 +823,5 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | Ticket-System = Mock | Zendesk / Freshdesk / Jira Service Management API |
 | LLM-Caching = keins | Anthropic Prompt Caching für wiederholte System-Prompts aktivieren |
 | Kein Rate-Limiting | FastAPI `slowapi` Middleware ergänzen |
+| Consent-Ledger (`core/consent.py`) = In-Memory | Persistenter Store (Postgres/Redis), identische Interface-Methoden |
 | Kein Auth außer API-Key | OAuth2 / JWT für Multi-Tenant-Szenarien |
