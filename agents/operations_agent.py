@@ -22,16 +22,17 @@ import logging
 import re
 from typing import Any, Literal, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.output_parsers import JsonOutputParser
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, ValidationError, field_validator
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
+from core import customer_state
 from core.config import settings
 from core.knowledge import load_novara_wissen
-from core.llm import build_llm
+from core.llm import build_llm, cached_system_message
 from tools.crm_integration import CRMIntegration, ERPRecord
 from tools.document_parser import DocumentParser, ParsedDocument
 
@@ -182,7 +183,7 @@ class OperationsGraph:
         # LLM fallback for ambiguous documents
         try:
             response = self._llm.invoke([
-                SystemMessage(content=_SYSTEM_CLASSIFY),
+                cached_system_message(_SYSTEM_CLASSIFY),
                 HumanMessage(content=state["input_text"]),
             ])
             parsed = _parse_llm_json(response.content)
@@ -212,7 +213,7 @@ class OperationsGraph:
             logger.debug("extract_fields: LLM enrichment for %s", missing_fields)
             try:
                 response = self._llm.invoke([
-                    SystemMessage(content=_SYSTEM_EXTRACT),
+                    cached_system_message(_SYSTEM_EXTRACT),
                     HumanMessage(content=state["input_text"]),
                 ])
                 raw_llm_data = _parse_llm_json(response.content)
@@ -278,6 +279,28 @@ class OperationsGraph:
         )
 
         crm_result = self._crm.upsert_invoice(record)
+
+        # Operations erfasst nur den Firmennamen aus der Rechnung, keine
+        # E-Mail -- eine bereits über einen anderen Agenten für dieselbe
+        # Firma bekannte E-Mail wird übernommen (siehe sales_copilot_agent.py
+        # für dasselbe Muster), damit diese Stufe unter demselben customer_id
+        # landet statt einen zweiten, firmennamen-basierten Eintrag anzulegen.
+        company_name = record.company_name
+        if company_name and company_name != "Unknown":
+            existing = customer_state.get(company_name=company_name)
+            customer_state.update_stage(
+                "operations",
+                {
+                    "invoice_amount": record.amount,
+                    "invoice_currency": record.currency,
+                    "invoice_date": record.invoice_date,
+                    "invoice_number": record.invoice_number,
+                },
+                email=existing.primary_email if existing else None,
+                company_name=company_name,
+                agent_session_id=state["session_id"],
+            )
+
         return {**state, "crm_result": crm_result.model_dump()}
 
     # ── Node: finalize ───────────────────────────────────────────────────────

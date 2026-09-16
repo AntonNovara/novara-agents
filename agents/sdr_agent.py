@@ -42,15 +42,15 @@ import re
 import uuid
 from typing import Any, Literal, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
-from core import consent
+from core import consent, customer_state
 from core.config import settings
 from core.knowledge import load_novara_wissen
-from core.llm import build_llm
+from core.llm import build_llm, cached_system_message
 from tools import sequence_scheduler
 from tools.crm_integration import CRMIntegrationSDR, LeadRecord
 from tools.lead_database import LeadDatabase, LeadSearchResult, ProspectContact
@@ -271,7 +271,7 @@ class SDRGraph:
 
         try:
             response = self._llm.invoke([
-                SystemMessage(content=_SYSTEM_ANALYZE),
+                cached_system_message(_SYSTEM_ANALYZE),
                 HumanMessage(content=state["input_text"]),
             ])
             data = _parse_llm_json(response.content)
@@ -319,7 +319,7 @@ class SDRGraph:
                 f"Pain points: {', '.join(state['pain_points'])}"
             )
             response = self._llm.invoke([
-                SystemMessage(content=_SYSTEM_GENERATE_PERSONA),
+                cached_system_message(_SYSTEM_GENERATE_PERSONA),
                 HumanMessage(content=prompt),
             ])
             persona = _parse_llm_json(response.content)
@@ -428,7 +428,7 @@ class SDRGraph:
 
         try:
             response = self._llm.invoke([
-                SystemMessage(content=_SYSTEM_OUTREACH.format(language=lang_label)),
+                cached_system_message(_SYSTEM_OUTREACH.format(language=lang_label)),
                 HumanMessage(content=context),
             ])
             raw = response.content.strip()
@@ -482,6 +482,22 @@ class SDRGraph:
         )
 
         result = self._crm.upsert_lead(record)
+
+        customer_state.update_stage(
+            "sdr",
+            {
+                "lead_score": score,
+                "icp_tier": tier,
+                "industry": state["industry"],
+                "pain_points": state["pain_points"],
+                "outreach_channel": state["outreach_channel"],
+                "contact_name": record.contact_name,
+            },
+            email=top.get("email") or None,
+            company_name=state["company_name"],
+            agent_session_id=state["session_id"],
+        )
+
         return {**state, "crm_result": result.model_dump()}
 
     # ── Node: schedule_sequence ──────────────────────────────────────────────

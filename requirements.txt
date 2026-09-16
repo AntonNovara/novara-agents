@@ -31,3 +31,6 @@ anthropic>=0.40.0
 google-auth>=2.27.0
 google-auth-oauthlib>=1.2.0
 google-api-python-client>=2.120.0
+
+# MCP Server (tools/mcp_server.py) – exponiert Novara-Tools für Kunden-CRMs
+mcp>=1.6.0,<2.0.0

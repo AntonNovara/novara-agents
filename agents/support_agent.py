@@ -26,14 +26,16 @@ import logging
 import re
 from typing import Any, Literal, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
+from core import customer_state
 from core.config import settings
 from core.knowledge import load_wissen
-from core.llm import build_llm
+from core.llm import build_llm, cached_system_message
+from core.security import SecurityLayer
 from tools.email_sender import send_email
 from tools.faq_database import FAQDatabase, FAQSearchResult
 from tools.ticket_system import TicketPriority, TicketRecord, TicketSystem
@@ -189,7 +191,7 @@ class SupportGraph:
 
         try:
             response = self._llm.invoke([
-                SystemMessage(content=_SYSTEM_ANALYZE),
+                cached_system_message(_SYSTEM_ANALYZE),
                 HumanMessage(content=state["input_text"]),
             ])
             data: dict = _parse_llm_json(response.content)
@@ -258,7 +260,7 @@ class SupportGraph:
 
         try:
             response = self._llm.invoke([
-                SystemMessage(content=_SYSTEM_COMPOSE.format(language=lang_label)),
+                cached_system_message(_SYSTEM_COMPOSE.format(language=lang_label)),
                 HumanMessage(content=prompt),
             ])
             answer = response.content.strip()
@@ -348,6 +350,26 @@ class SupportGraph:
                 },
                 "ticket": state["ticket_result"],
             }
+
+        # Support erfasst -- anders als SDR/Onboarding -- kein strukturiertes
+        # Kontaktfeld; die Anfrage selbst enthält aber oft eine E-Mail
+        # (Kontaktdaten werden von der DLP-Schicht nie redigiert, siehe
+        # core/security.py). Ohne erkennbare E-Mail bleibt dieser Aufruf ein
+        # No-op (core/customer_state.py) statt einen unzuverlässigen
+        # Firmennamen-Identifier zu erfinden.
+        email = SecurityLayer.extract_email(state["input_text"])
+        if email:
+            customer_state.update_stage(
+                "support",
+                {
+                    "intent": state["intent"],
+                    "urgency": state["urgency"],
+                    "sentiment": state["sentiment"],
+                    "action": state["action"],
+                },
+                email=email,
+                agent_session_id=state["session_id"],
+            )
 
         return {**state, "final_result": final, "error": None}
 

@@ -1533,6 +1533,268 @@ def test_voice_agent_dlp_sanitization() -> None:
         fail("Assistant-Nachricht wurde unerwartet verändert oder hat geblockt", f"{sanitized}, {blocked_reason}")
 
 
+# ── Test 18: Customer State (Sprint 3, 16.09.2026) ──────────────────────────
+
+def test_customer_state() -> None:
+    section("TEST 18 — Customer State: geteilter Kundenzustand über alle 5 Agenten")
+    info(
+        "core/customer_state.py muss Kunden über E-Mail (bevorzugt) oder "
+        "Firmenname (Fallback) identifizieren, Stage-Snapshots additiv "
+        "zusammenführen (nie einen bekannten Wert überschreiben), einen "
+        "vollständigen Audit-Trail führen und ohne jeden Identifier zum "
+        "No-op werden statt einen Fehler zu werfen."
+    )
+    try:
+        from core.customer_state import CustomerStateStore
+    except Exception as exc:
+        fail("Import core.customer_state", str(exc))
+        return
+
+    store = CustomerStateStore()
+
+    # 18a: kein Identifier -> No-op, kein Fehler.
+    result = store.update_stage("sdr", {"lead_score": 90}, agent_session_id="s0")
+    if result is None:
+        ok("update_stage() ohne E-Mail/Firmenname ist ein sauberer No-op (gibt None zurück)")
+    else:
+        fail("update_stage() ohne Identifier hätte None zurückgeben müssen", str(result))
+
+    # 18b: E-Mail-basierte Identifikation, erster Snapshot.
+    state = store.update_stage(
+        "sdr",
+        {"lead_score": 85, "icp_tier": "high"},
+        email="  Max@Testbetrieb.AT  ",
+        company_name="Testbetrieb GmbH",
+        agent_session_id="sdr-session-1",
+    )
+    if state is not None and state.customer_id == "max@testbetrieb.at" and state.journey == ["sdr"]:
+        ok("Erster Stage-Snapshot legt Kunden an, Identifier normalisiert (Groß-/Kleinschreibung, Whitespace)")
+    else:
+        fail("Erster Stage-Snapshot unerwartet", str(state))
+
+    # 18c: zweite Stufe für denselben Kunden -- Journey wächst, Stammdaten bleiben erhalten.
+    state2 = store.update_stage(
+        "onboarding",
+        {"plan": "pro"},
+        email="max@testbetrieb.at",
+        agent_session_id="onboarding-session-1",
+    )
+    if state2 is not None and state2.journey == ["sdr", "onboarding"] and state2.company_name == "Testbetrieb GmbH":
+        ok("Zweite Stufe merged in denselben Kunden-Snapshot, Journey in Ausführungsreihenfolge")
+    else:
+        fail("Zweite Stufe wurde nicht korrekt gemerged", str(state2))
+
+    # 18d: dieselbe Firma, aber nur per Firmenname referenziert (kein E-Mail-Parameter)
+    # -- MUSS denselben customer_id treffen, weil get()/update_stage() mit
+    # company_name allein nur dann einen ANDEREN Kunden anlegen, wenn noch
+    # keine E-Mail für diese Firma bekannt ist. Hier simulieren wir stattdessen
+    # den in den Agenten verwendeten Merge-Vorbehalt: ein Aufrufer OHNE eigene
+    # E-Mail schlägt zuerst per company_name nach, ob schon eine bekannt ist.
+    existing = store.get(company_name="Testbetrieb GmbH")
+    if existing is not None and existing.primary_email == "max@testbetrieb.at":
+        ok("get(company_name=...) findet den E-Mail-identifizierten Kunden wieder (Merge-Vorbehalt der Agenten)")
+    else:
+        fail("get(company_name=...) fand den erwarteten Kunden nicht", str(existing))
+
+    # 18e: ein bereits bekannter Wert wird NIE mit leer/None überschrieben.
+    store.update_stage("support", {"intent": "billing"}, email="max@testbetrieb.at", company_name="", agent_session_id="s2")
+    state3 = store.get(email="max@testbetrieb.at")
+    if state3 is not None and state3.company_name == "Testbetrieb GmbH":
+        ok("Ein leerer company_name in einem späteren Aufruf überschreibt den bekannten Namen nicht")
+    else:
+        fail("company_name wurde fälschlich überschrieben/gelöscht", str(state3))
+
+    # 18f: reiner Firmenname-Identifier (kein E-Mail bekannt) -- eigener Kunde.
+    store.update_stage("operations", {"invoice_amount": 990.0}, company_name="AndereFirma KG", agent_session_id="ops-1")
+    other = store.get(company_name="AndereFirma KG")
+    if other is not None and other.customer_id == "anderefirma kg" and other.primary_email is None:
+        ok("Firmenname-Fallback legt einen eigenständigen Kunden ohne E-Mail an")
+    else:
+        fail("Firmenname-Fallback unerwartet", str(other))
+
+    # 18g: Audit-Trail global und gefiltert.
+    all_events = store.history()
+    filtered = store.history("max@testbetrieb.at")
+    if len(all_events) == 4 and len(filtered) == 3:
+        ok("history() liefert den vollständigen Audit-Trail, global und pro Kunde gefiltert", f"{len(all_events)} gesamt, {len(filtered)} gefiltert")
+    else:
+        fail("history()-Zähler unerwartet", f"{len(all_events)} gesamt, {len(filtered)} gefiltert")
+
+    if len(store.all_customers()) == 2:
+        ok("all_customers() zählt beide angelegten Kunden (E-Mail- und Firmenname-identifiziert)")
+    else:
+        fail("all_customers() unerwartete Anzahl", str(len(store.all_customers())))
+
+
+# ── Test 19: Prompt Caching (Sprint 3, 16.09.2026) ──────────────────────────
+
+def test_prompt_caching() -> None:
+    section("TEST 19 — core/llm.py: Anthropic Prompt Caching auf System-Prompts")
+    info(
+        "cached_system_message() muss den System-Prompt-Text als "
+        "Content-Block mit cache_control=ephemeral verpacken (Anthropic "
+        "Prompt-Caching-Format) -- UND _DemoChatModel muss diesen Block "
+        "weiterhin korrekt lesen können (JSON- vs. Freitext-Erkennung), "
+        "sonst würde jeder der 5 Agenten im Demo-Modus stillschweigend "
+        "kaputtgehen."
+    )
+    try:
+        from core.llm import cached_system_message, _DemoChatModel, _extract_text
+        from langchain_core.messages import HumanMessage, SystemMessage
+    except Exception as exc:
+        fail("Import core.llm-Interna", str(exc))
+        return
+
+    # 19a: Content-Block-Struktur.
+    msg = cached_system_message("Du bist ein Test-Prompt. Antworte NUR mit JSON: {...}")
+    if (
+        isinstance(msg, SystemMessage)
+        and isinstance(msg.content, list)
+        and msg.content[0].get("cache_control") == {"type": "ephemeral"}
+        and msg.content[0].get("text", "").startswith("Du bist ein Test-Prompt")
+    ):
+        ok("cached_system_message() erzeugt einen Content-Block mit cache_control=ephemeral")
+    else:
+        fail("cached_system_message()-Struktur unerwartet", str(msg.content))
+
+    # 19b: _extract_text liest sowohl das alte String-Format als auch die neue Blockliste.
+    if _extract_text("plain text") == "plain text" and _extract_text(msg.content) == msg.content[0]["text"]:
+        ok("_extract_text() liest String- UND Content-Block-Format identisch")
+    else:
+        fail("_extract_text() unerwartetes Ergebnis")
+
+    # 19c: _DemoChatModel erkennt JSON-Erwartung weiterhin korrekt über den gecachten Block.
+    demo = _DemoChatModel()
+    json_response = demo.invoke([
+        cached_system_message("Antworte AUSSCHLIESSLICH mit validem JSON: {...}"),
+        HumanMessage(content="Testeingabe"),
+    ])
+    text_response = demo.invoke([
+        cached_system_message("Antworte in Freitext, kein JSON. SUBJECT: ..."),
+        HumanMessage(content="Testeingabe"),
+    ])
+    try:
+        json.loads(json_response.content)
+        json_ok = True
+    except Exception:
+        json_ok = False
+    if json_ok and text_response.content.upper().startswith("SUBJECT:"):
+        ok("_DemoChatModel unterscheidet JSON- vs. Freitext-Prompts weiterhin korrekt über gecachte Blöcke")
+    else:
+        fail(
+            "_DemoChatModel-Routing über gecachte Blöcke fehlgeschlagen",
+            f"json_ok={json_ok}, text={text_response.content[:60]!r}",
+        )
+
+    # 19d: alle 5 Agenten-Module nutzen cached_system_message() statt eines
+    # nackten SystemMessage(content=str) -- Regressionsschutz gegen ein
+    # versehentliches "SystemMessage(" in einem künftigen Node, das am
+    # Caching vorbeigeht.
+    import ast
+    agent_files = [
+        "agents/sdr_agent.py", "agents/onboarding_agent.py", "agents/operations_agent.py",
+        "agents/sales_copilot_agent.py", "agents/support_agent.py",
+    ]
+    offenders = []
+    for path in agent_files:
+        try:
+            tree = ast.parse(open(path, encoding="utf-8").read(), filename=path)
+        except Exception as exc:
+            offenders.append(f"{path} (Parse-Fehler: {exc})")
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "SystemMessage":
+                offenders.append(path)
+    if not offenders:
+        ok("Alle 5 Agenten bauen ihre System-Prompts ausschließlich über cached_system_message()")
+    else:
+        fail("Mindestens ein Agent umgeht cached_system_message()", str(offenders))
+
+
+# ── Test 20: MCP Server (Sprint 3, 16.09.2026) ──────────────────────────────
+
+def test_mcp_server() -> None:
+    section("TEST 20 — tools/mcp_server.py: MCP-Tools für Kunden-CRMs")
+    info(
+        "search_leads/upsert_lead/upsert_deal müssen als MCP-Tools "
+        "registriert sein und korrekt an LeadDatabase/CRMIntegrationSDR/"
+        "DealTracker delegieren. upsert_lead wird NUR aufgerufen, wenn "
+        "settings.sdr_crm_live_sheet aus ist -- sonst würde dieser Test "
+        "einen echten Eintrag ins produktive Google Sheet schreiben (siehe "
+        "tools/crm_integration.py, tools/live_crm_bridge.py)."
+    )
+    try:
+        import asyncio
+        from tools import mcp_server
+        from core.config import settings
+    except ModuleNotFoundError as exc:
+        warn("tools.mcp_server nicht testbar -- Abhängigkeit fehlt (pip install -r requirements.txt?)", str(exc))
+        return
+    except Exception as exc:
+        fail("Import tools.mcp_server", str(exc))
+        return
+
+    async def _run() -> None:
+        tools = await mcp_server.mcp.list_tools()
+        names = {t.name for t in tools}
+        if {"search_leads", "upsert_lead", "upsert_deal"} <= names:
+            ok("Alle 3 Tools sind beim MCP-Server registriert", str(sorted(names)))
+        else:
+            fail("Erwartete Tools fehlen in der MCP-Registrierung", str(sorted(names)))
+
+        # 20b: search_leads -- reiner Lesezugriff, kein Nebeneffekt.
+        _, search_result = await mcp_server.mcp.call_tool("search_leads", {"company_name": "FastBox"})
+        hits = search_result.get("result", [])
+        if hits and hits[0]["contact"]["company"] == "FastBox Logistics GmbH":
+            ok("search_leads liefert den erwarteten Fuzzy-Match aus LeadDatabase")
+        else:
+            fail("search_leads unerwartetes Ergebnis", str(hits))
+
+        # 20c: upsert_deal -- DealTracker ist immer ein reiner In-Memory-Mock,
+        # kein Live-Backend-Risiko (anders als CRMIntegrationSDR).
+        _, deal_result = await mcp_server.mcp.call_tool("upsert_deal", {
+            "company_name": "MCP-Test GmbH", "contact_name": "Test Kontakt", "contact_title": "CEO",
+            "deal_stage": "demo", "deal_health_score": 70, "close_probability": 60,
+            "meeting_summary": "Testlauf TEST 20", "followup_subject": "Test", "followup_body": "Test",
+        })
+        if deal_result.get("success") and deal_result.get("deal_id", "").startswith("DEAL-"):
+            ok("upsert_deal legt einen Deal über DealTracker an", deal_result.get("deal_id"))
+        else:
+            fail("upsert_deal unerwartetes Ergebnis", str(deal_result))
+
+        # 20d: ungültige deal_stage wird abgelehnt statt einen Deal mit
+        # kaputtem Stage-Wert anzulegen.
+        try:
+            await mcp_server.mcp.call_tool("upsert_deal", {
+                "company_name": "x", "contact_name": "x", "contact_title": "x",
+                "deal_stage": "not-a-real-stage", "deal_health_score": 1, "close_probability": 1,
+                "meeting_summary": "x", "followup_subject": "x", "followup_body": "x",
+            })
+            fail("upsert_deal mit ungültiger deal_stage hätte fehlschlagen müssen")
+        except Exception:
+            ok("upsert_deal lehnt eine unbekannte deal_stage korrekt ab")
+
+        # 20e: upsert_lead NUR gegen den Mock -- niemals gegen das Live-Sheet.
+        if settings.sdr_crm_live_sheet:
+            warn("upsert_lead-Aufruf übersprungen -- SDR_CRM_LIVE_SHEET=true lokal aktiv (würde live schreiben)")
+        else:
+            _, lead_result = await mcp_server.mcp.call_tool("upsert_lead", {
+                "company_name": "MCP-Test GmbH", "contact_name": "Test Kontakt", "contact_title": "CEO",
+                "industry": "Retail", "lead_score": 80, "icp_tier": "high",
+                "outreach_channel": "email", "outreach_text": "Testlauf TEST 20",
+            })
+            if lead_result.get("success") and lead_result.get("lead_id", "").startswith("LEAD-"):
+                ok("upsert_lead legt einen Lead über CRMIntegrationSDR (Mock) an", lead_result.get("lead_id"))
+            else:
+                fail("upsert_lead unerwartetes Ergebnis", str(lead_result))
+
+    try:
+        asyncio.run(_run())
+    except Exception:
+        fail("MCP-Server-Test — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -1564,6 +1826,9 @@ def main() -> int:
     test_sequence_scheduler()
     test_reply_classifier_and_webhook()
     test_voice_agent_dlp_sanitization()
+    test_customer_state()
+    test_prompt_caching()
+    test_mcp_server()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

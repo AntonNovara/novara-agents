@@ -11,6 +11,20 @@ WICHTIG: Das ist aktuell nur eine Entwicklungs-/Kosten-Bequemlichkeit für den
 internen Gebrauch (siehe core/config.py). Sobald ein Agent öffentlich als Demo
 exponiert wird, muss Demo-Modus dort zum Sicherheits-Default werden statt nur
 zur Bequemlichkeit — das ist ein separater, noch offener Schritt.
+
+Prompt Caching (Sprint 3, 16.09.2026): Alle 5 Text-Agenten betten das volle
+Novara-/Mandanten-Wissen (novara_wissen.txt, mehrere tausend Tokens, siehe
+core/knowledge.py) in JEDEN System-Prompt ein — Analyse, Persona-Generierung,
+Outreach-Text, FAQ-Antwort, etc. laufen alle über denselben, größtenteils
+statischen Block. cached_system_message() unten markiert diesen Block mit
+Anthropic Prompt Caching (cache_control: ephemeral), sodass wiederholte Calls
+mit demselben System-Prompt-Text innerhalb des Cache-Fensters (Default 5 Min.,
+serverseitig verwaltet) nur noch die Cache-Read-Rate statt des vollen
+Input-Preises zahlen — bis zu ~90 % Ersparnis bei den Token-Kosten, siehe
+CLAUDE.md-Roadmap "Prompt Caching". Anthropic ignoriert cache_control
+stillschweigend (kein Fehler, keine Zusatzkosten), wenn ein Block die
+Mindestlänge fürs Caching unterschreitet — daher ist es sicher, es überall
+gleich anzuwenden statt pro Prompt einzeln abzuwägen.
 """
 from __future__ import annotations
 
@@ -19,7 +33,7 @@ import logging
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage
 
 from core.config import settings
 
@@ -68,6 +82,23 @@ _DEMO_TEXT = (
 )
 
 
+def _extract_text(content: Any) -> str:
+    """
+    Liest den reinen Text aus einem Message-Content — entweder ein einfacher
+    String (Alt-Format) oder eine Liste von Anthropic-Content-Blöcken
+    (`[{"type": "text", "text": "...", "cache_control": {...}}]`), wie sie
+    cached_system_message() unten erzeugt. _DemoChatModel muss beide Formen
+    lesen können, ohne dass die aufrufenden Agenten davon wissen müssen.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(
+            block.get("text", "") for block in content if isinstance(block, dict)
+        )
+    return str(content)
+
+
 def _expects_json(system_text: str) -> bool:
     """
     Erkennt am System-Prompt, ob JSON erwartet wird. Alle Agenten formulieren
@@ -90,7 +121,8 @@ class _DemoChatModel:
 
     def invoke(self, messages: list[BaseMessage]) -> AIMessage:
         system_text = next(
-            (m.content for m in messages if getattr(m, "type", None) == "system"), ""
+            (_extract_text(m.content) for m in messages if getattr(m, "type", None) == "system"),
+            "",
         )
         if _expects_json(system_text):
             content = json.dumps(_DEMO_JSON_FIELDS, ensure_ascii=False)
@@ -112,4 +144,20 @@ def build_llm(max_tokens: int = 1024) -> Any:
         api_key=settings.anthropic_api_key.get_secret_value(),
         temperature=0,
         max_tokens=max_tokens,
+    )
+
+
+def cached_system_message(text: str) -> SystemMessage:
+    """
+    Baut eine SystemMessage mit aktiviertem Anthropic Prompt Caching auf dem
+    Text-Block (`cache_control: {"type": "ephemeral"}`). Alle Agenten-Nodes
+    sollen ihre System-Prompts über diese Funktion statt über ein direktes
+    `SystemMessage(content=text)` erzeugen — siehe Modul-Docstring oben.
+
+    Wirkt sowohl mit dem echten ChatAnthropic-Client (der Content-Block-Listen
+    inkl. cache_control 1:1 an die Anthropic-API weiterreicht) als auch mit
+    _DemoChatModel (liest den Text über _extract_text() aus der Blockliste).
+    """
+    return SystemMessage(
+        content=[{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
     )

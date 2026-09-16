@@ -496,6 +496,19 @@ class SecurityLayer:
         return DLPResult(approved=True, redacted_text=redacted, findings=findings)
 
     @classmethod
+    def extract_email(cls, text: str) -> Optional[str]:
+        """
+        Bestes-Aufwand-Extraktion der ersten E-Mail-Adresse aus Freitext —
+        für Agenten wie support_agent.py, die (anders als SDR/Onboarding)
+        keine strukturierte Kontaktfeld-Extraktion haben, aber trotzdem einen
+        Identifier für core.customer_state brauchen. Nutzt denselben Pattern
+        wie die DLP-Erkennung oben (E-Mail wird nie redigiert, nur erkannt),
+        reiner Lesezugriff ohne jede Änderung am Text.
+        """
+        match = _PII_PATTERNS["email"].search(text)
+        return match.group(0) if match else None
+
+    @classmethod
     def sanitize_dict(cls, data: dict[str, Any]) -> dict[str, Any]:
         """
         Recursively redact PII from all string values in a dict.

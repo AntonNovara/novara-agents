@@ -19,14 +19,15 @@ import logging
 import re
 from typing import Any, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
+from core import customer_state
 from core.config import settings
 from core.knowledge import load_novara_wissen
-from core.llm import build_llm
+from core.llm import build_llm, cached_system_message
 from tools.deal_tracker import DealRecord, DealStage, DealTracker
 
 logger = logging.getLogger(__name__)
@@ -196,7 +197,7 @@ class SalesCopilotGraph:
         }
         try:
             response = self._llm.invoke([
-                SystemMessage(content=_SYSTEM_PARSE),
+                cached_system_message(_SYSTEM_PARSE),
                 HumanMessage(content=state["input_text"]),
             ])
             data = _parse_llm_json(response.content)
@@ -228,7 +229,7 @@ class SalesCopilotGraph:
         }
         try:
             response = self._llm.invoke([
-                SystemMessage(content=_SYSTEM_DETECT),
+                cached_system_message(_SYSTEM_DETECT),
                 HumanMessage(content=state["input_text"]),
             ])
             data = _parse_llm_json(response.content)
@@ -282,7 +283,7 @@ class SalesCopilotGraph:
         try:
             lang = "German" if state["language"] == "de" else "English"
             response = self._llm.invoke([
-                SystemMessage(content=_SYSTEM_FOLLOWUP.format(language=lang)),
+                cached_system_message(_SYSTEM_FOLLOWUP.format(language=lang)),
                 HumanMessage(content=context),
             ])
             raw = response.content.strip()
@@ -321,6 +322,27 @@ class SalesCopilotGraph:
             followup_body=state["followup_body"],
         )
         result = self._tracker.upsert_deal(record)
+
+        # Sales Copilot erfasst aktuell keine Kontakt-E-Mail (nur Name/Titel,
+        # siehe SalesCopilotState) -- eine evtl. vom SDR-Agent für dieselbe
+        # Firma bereits hinterlegte E-Mail wird übernommen, damit beide Stufen
+        # unter demselben customer_id landen statt einen zweiten,
+        # firmennamen-basierten Eintrag anzulegen (core/customer_state.py).
+        existing = customer_state.get(company_name=state["company_name"])
+        customer_state.update_stage(
+            "sales_copilot",
+            {
+                "deal_stage": stage.value,
+                "deal_health_score": state["deal_health_score"],
+                "close_probability": state["close_probability"],
+                "objections": state["objections"],
+                "next_steps": state["next_steps"],
+            },
+            email=existing.primary_email if existing else None,
+            company_name=state["company_name"],
+            agent_session_id=state["session_id"],
+        )
+
         return {**state, "deal_result": result.model_dump()}
 
     # ── Node: finalize ───────────────────────────────────────────────────────

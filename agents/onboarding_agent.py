@@ -21,13 +21,14 @@ import logging
 import re
 from typing import Any, Optional
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langgraph.graph import END, StateGraph
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
+from core import customer_state
 from core.knowledge import load_novara_wissen
-from core.llm import build_llm
+from core.llm import build_llm, cached_system_message
 from tools.notification_system import NotificationSystem
 from tools.onboarding_tracker import OnboardingRecord, OnboardingTracker, build_checklist
 
@@ -169,7 +170,7 @@ class OnboardingGraph:
         }
         try:
             response = self._llm.invoke([
-                SystemMessage(content=_SYSTEM_PARSE),
+                cached_system_message(_SYSTEM_PARSE),
                 HumanMessage(content=state["input_text"]),
             ])
             data = _parse_llm_json(response.content)
@@ -230,7 +231,7 @@ class OnboardingGraph:
 
         try:
             response = self._llm.invoke([
-                SystemMessage(content=_SYSTEM_WELCOME.format(language=lang)),
+                cached_system_message(_SYSTEM_WELCOME.format(language=lang)),
                 HumanMessage(content=context),
             ])
             raw = response.content.strip()
@@ -278,6 +279,22 @@ class OnboardingGraph:
             checklist=checklist_items,
         )
         result = self._tracker.create_onboarding(record)
+
+        customer_state.update_stage(
+            "onboarding",
+            {
+                "plan": state["plan"],
+                "industry": state["industry"],
+                "team_size": state["team_size"],
+                "primary_use_case": state["primary_use_case"],
+                "checklist_total": len(state["checklist"]),
+                "contact_name": state["contact_name"],
+            },
+            email=state["contact_email"] or None,
+            company_name=state["company_name"],
+            agent_session_id=state["session_id"],
+        )
+
         return {**state, "onboarding_result": result.model_dump()}
 
     # ── Node: finalize ───────────────────────────────────────────────────────

@@ -513,6 +513,137 @@ echten Anthropic-Egress-Check macht).
 
 ---
 
+## Sprint 3: Architektur & Skalierbarkeit (16.09.2026)
+
+Drei Infrastruktur-Bausteine, alle aus der bisherigen Roadmap/"Bekannte
+Einschränkungen"-Tabelle unten: Prompt Caching, ein geteilter
+Kundenzustand über die 5-Agenten-Journey, und ein MCP-Server für
+Kunden-CRM-Integrationen.
+
+### Anthropic Prompt Caching (`core/llm.py`)
+
+Alle 5 Text-Agenten betten das volle Wissens-Dokument (`novara_wissen.txt`
+über `core/knowledge.py`, mehrere tausend Tokens) in JEDEN System-Prompt
+ein — Analyse, Persona-Generierung, Outreach-Text, FAQ-Antwort etc. laufen
+alle über denselben, größtenteils statischen Block. `core.llm.
+cached_system_message(text)` ersetzt das bisherige `SystemMessage(content=
+text)` an allen 12 Aufrufstellen (2–3 pro Agent) durch einen
+Anthropic-Content-Block mit `cache_control: {"type": "ephemeral"}`. Wirkt
+nur bei echten `ChatAnthropic`-Calls; Anthropic ignoriert `cache_control`
+stillschweigend (kein Fehler, keine Zusatzkosten), wenn ein Block die
+Mindestlänge fürs Caching unterschreitet.
+
+`_DemoChatModel` (Demo-Modus) musste dafür angepasst werden: System-Prompts
+kommen jetzt als Content-Block-Liste statt als reiner String an.
+`core.llm._extract_text()` liest beide Formen — sonst hätte die
+JSON-vs.-Freitext-Erkennung (`_expects_json()`) im Demo-Modus stillschweigend
+aufgehört zu funktionieren, und ALLE 5 Agenten wären im Demo-Modus (Default
+ohne echten API-Key) kaputt gegangen, nicht nur ein einzelner Node.
+Regressionstest: `test_system.py` TEST 19 (Content-Block-Struktur,
+`_extract_text()` für beide Formen, `_DemoChatModel`-JSON-Erkennung über
+gecachte Blöcke, AST-Scan aller 5 Agenten-Dateien gegen ein versehentliches
+`SystemMessage(` an einem künftigen Node vorbei am Caching).
+
+### Customer State (`core/customer_state.py`)
+
+Geteilter Kundenzustand über die gesamte Journey (SDR → Sales Copilot →
+Onboarding → Support → Operations) — vorher schrieb jeder Agent nur in sein
+eigenes Tool (`LeadRecord`, `DealRecord`, ...), ein später aufgerufener
+Agent hatte keine Sicht auf das, was ein vorheriger Agent über denselben
+Kunden bereits herausgefunden hat. Jeder der 5 Agenten-Graphen ruft jetzt
+am Ende seines Schreib-Nodes (`write_to_crm`, `update_deal`,
+`log_to_tracker`, `finalize`) `customer_state.update_stage(...)` auf.
+
+**Identifier-Auflösung:** E-Mail bevorzugt, Firmenname als Fallback. Ein
+`_company_index` (normalisierter Firmenname → `customer_id`) sorgt dafür,
+dass eine Stufe OHNE eigenes E-Mail-Feld (Sales Copilot, Operations — siehe
+deren `SalesCopilotState`/`OperationsState`, keine `contact_email`) nicht
+automatisch einen zweiten, getrennten Kunden-Eintrag für dieselbe Firma
+anlegt: beide Agenten schlagen vor ihrem eigenen `update_stage()`-Aufruf per
+`customer_state.get(company_name=...)` nach, ob für diese Firma schon eine
+E-Mail bekannt ist, und reichen sie explizit durch. Der Support-Agent hat
+gar kein strukturiertes Kontaktfeld — `core.security.SecurityLayer.
+extract_email()` (neu, wrappt das bestehende `_PII_PATTERNS["email"]`)
+liest best-effort eine E-Mail aus dem freien Anfrage-Text; ohne Treffer
+bleibt der Aufruf ein bewusster No-op statt einen unzuverlässigen
+Identifier zu erfinden. Operations verwirft zusätzlich den
+Extraktions-Default `"Unknown"` als Identifier (verhindert, dass alle
+nicht erkannten Rechnungsabsender unter einem einzigen falschen
+"unknown"-Kunden zusammenlaufen).
+
+Aktuell In-Memory (Prozess-Singleton `_store`, gleiches Muster wie
+`core/consent.py`) — Einträge gehen bei Neustart verloren, UND gelten nur
+innerhalb EINES Prozesses (der MCP-Server unten hat z. B. seinen eigenen
+Prozess, teilt sich also nichts mit `main.py`'s Agenten-Prozess). TODO vor
+Produktivbetrieb: persistenter Store (Postgres/Redis), identisches
+Interface — siehe "Bekannte Einschränkungen" unten für die Konsequenz
+daraus (keine echte CRM-Primärschlüssel-Kopplung, E-Mail/Firmenname können
+kollidieren oder auseinanderlaufen).
+
+Regressionstest: `test_system.py` TEST 18 (No-op ohne Identifier,
+E-Mail-Identifikation + additives Merging, Firmenname-Index-Fallback für
+Stufen ohne eigenes E-Mail-Feld, "bekannter Wert wird nie mit leer
+überschrieben", eigenständiger Firmenname-only-Kunde, globaler + gefilterter
+Audit-Trail).
+
+### MCP Server für Kunden-CRMs (`tools/mcp_server.py`)
+
+Exponiert `LeadDatabase.search()`, `CRMIntegrationSDR.upsert_lead()` und
+`DealTracker.upsert_deal()` über das native Model Context Protocol (MCP,
+`mcp>=1.6.0,<2.0.0`, FastMCP High-Level-API) als 3 Tools (`search_leads`,
+`upsert_lead`, `upsert_deal`) — für externe Kunden-CRMs (HubSpot,
+Salesforce, Pipedrive), die einzelne Werkzeuge direkt ansprechen wollen,
+statt über die REST-API in `main.py` "mit einem Agenten zu sprechen"
+(anderes Zielpublikum: `main.py` ist für Novaras eigene 5 LangGraph-Agenten
+gebaut, X-API-Key-Auth + AgentRequest/AgentResponse-Schema).
+
+Reine Delegation, keine eigene Geschäftslogik — beide Ziel-Tools bleiben
+dieselben In-Memory-Mocks wie in den Agenten-Graphen (siehe deren eigene
+Docstrings in `tools/crm_integration.py`/`tools/deal_tracker.py`). Läuft
+als **eigener Prozess** mit eigenem In-Memory-Store, geteilt NUR zwischen
+MCP-Tool-Aufrufen innerhalb dieses Prozesses — nicht mit `main.py`'s
+Agenten-Prozess oder dessen `customer_state`.
+
+Startet über stdio (Default, für lokale/Desktop-MCP-Clients) oder `--http`
+(streamable-http, Port 8001 Default, für entfernte Kunden-CRMs):
+```bash
+python3 -m tools.mcp_server            # stdio
+python3 -m tools.mcp_server --http     # HTTP auf Port 8001
+```
+
+> **Bekannte Lücke, analog zum Voice-Agent-Muster oben: HTTP-Transport hat
+> KEINE eigene Auth.** Anders als `main.py`'s `X-API-Key`-Header ist das
+> kein MCP-Primitive, das FastMCP von sich aus mitbringt. MUSS vor dem
+> ersten entfernten Kunden-CRM-Zugriff hinter denselben Schutz wie
+> `main.py` gestellt werden (Reverse-Proxy mit eigenem Auth, oder FastMCPs
+> `auth_server_provider` für OAuth). Für lokale/stdio-Nutzung (Claude
+> Desktop) ist das kein Thema — der Prozess läuft dann im Vertrauensbereich
+> des aufrufenden Clients selbst. Anders als beim Voice-Agent gibt es hier
+> noch KEIN Start-Gate, weil `tools/mcp_server.py` (noch) kein eigener
+> Teil von `main.py`s Lifespan ist, sondern ein separat gestarteter
+> Prozess — ein versehentlicher `--http`-Start ist daher ein bewusster
+> Operator-Schritt, kein stillschweigender Nebeneffekt eines
+> `main.py`-Deployments.
+>
+> **Technische Randnotiz:** Anders als der Rest des Repos nutzt diese Datei
+> bewusst KEIN `from __future__ import annotations` — FastMCPs
+> `Tool.from_function()` löst Parameter-Annotationen zur
+> Registrierungszeit per `issubclass()` auf; mit postponed evaluation
+> (PEP 563) sind Annotationen dann Strings statt echter Typen, was beim
+> Import mit einem `TypeError` crasht (verifiziert gegen `mcp==1.12.4`).
+
+Regressionstest: `test_system.py` TEST 20 (Tool-Registrierung,
+`search_leads` gegen die echte `LeadDatabase`, `upsert_deal` inkl.
+Ablehnung einer unbekannten `deal_stage` — `DealTracker` ist immer reiner
+Mock, kein Live-Risiko). `upsert_lead` wird im Test NUR aufgerufen, wenn
+`settings.sdr_crm_live_sheet` aus ist, sonst `warn()` statt echtem Aufruf —
+`CRMIntegrationSDR.upsert_lead()` schreibt bei aktivem Flag ins produktive
+Google Sheet (siehe `tools/crm_integration.py`, `tools/live_crm_bridge.py`),
+und dieser MCP-Server-Test soll niemals versehentlich einen echten
+Test-Lead dort anlegen.
+
+---
+
 ## Implementierte Agenten
 
 ### 1. Operations Agent (`agents/operations_agent.py`)
@@ -843,7 +974,8 @@ novara-agents/
 ├── core/
 │   ├── config.py                   # pydantic-settings, Singleton via lru_cache
 │   ├── consent.py                  # Opt-in/Opt-out-Ledger pro Kontakt+Kanal (Sprint 1)
-│   ├── llm.py                      # Zentrale LLM-Factory + Demo-Modus-Fake-Client
+│   ├── customer_state.py           # Geteilter Kundenzustand über alle 5 Agenten (Sprint 3)
+│   ├── llm.py                      # Zentrale LLM-Factory + Demo-Modus-Fake-Client + Prompt Caching (Sprint 3)
 │   └── security.py                 # DLP/PII-Redaktion, Hard-Block-Keywords, OutputBlockedError
 │
 ├── agents/
@@ -860,6 +992,7 @@ novara-agents/
     ├── document_parser.py          # Regex-Extraktion, pdfplumber-Integration
     ├── faq_database.py             # FAQDatabase, 8 Einträge, Prefix-Stemming-Suche
     ├── lead_database.py            # LeadDatabase, 15 Mock-Kontakte, Fuzzy-Suche
+    ├── mcp_server.py                # MCP-Server: Novara-Tools für Kunden-CRMs (Sprint 3)
     ├── notification_system.py      # NotificationSystem, SentEmail – Mock E-Mail-Versand
     ├── onboarding_tracker.py       # OnboardingTracker, build_checklist(), ChecklistItem
     ├── reply_classifier.py         # ReplyClassifier — interested/objection/opt_out (Sprint 2)
@@ -891,7 +1024,8 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | **Churn-Detection** | Analysiert Nutzungsdaten und eskaliert an CSM wenn Aktivierungsgrad unter Schwellwert fällt |
 | **Multi-Tenant Auth** | OAuth2 / JWT statt einfachem API-Key für SaaS-Mandantenfähigkeit |
 | **Embedding-FAQ** | Vektor-Suche (Weaviate / pgvector) statt Keyword-Stemming für bessere FAQ-Treffer |
-| **Prompt Caching** | Anthropic Prompt Caching für System-Prompts aktivieren (Kostensenkung ~90 % bei wiederholten Calls) |
+| **Persistenter Store für Consent/Sequence/Customer State** | Postgres/Redis statt der drei In-Memory-Singletons (`core/consent.py`, `tools/sequence_scheduler.py`, `core/customer_state.py`) |
+| **MCP-Server-Auth** | Auth für den `--http`-Transport von `tools/mcp_server.py` (siehe Abschnitt oben) |
 
 ---
 
@@ -903,9 +1037,10 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | FAQ-Suche = Keyword-Stemming | Embedding-Suche gegen Weaviate / Qdrant / pgvector |
 | Lead-Datenbank = 15 Hard-coded-Kontakte | LinkedIn Sales Navigator API / CRM-Query |
 | Ticket-System = Mock | Zendesk / Freshdesk / Jira Service Management API |
-| LLM-Caching = keins | Anthropic Prompt Caching für wiederholte System-Prompts aktivieren |
 | Kein Rate-Limiting | FastAPI `slowapi` Middleware ergänzen |
 | Consent-Ledger (`core/consent.py`) = In-Memory | Persistenter Store (Postgres/Redis), identische Interface-Methoden |
 | Sequence Scheduler (`tools/sequence_scheduler.py`) = In-Memory, kein Worker | Persistenter Store + Cron/Celery-Beat-Worker, der `next_due_step()` periodisch abfragt |
 | Kein Telefonnummer-Feld in `ProspectContact`/`LeadRecord` | "voice"-Kadenzschritt bleibt dadurch immer `skipped` — Datenmodell um Telefonnummer erweitern |
-| Kein Auth außer API-Key | OAuth2 / JWT für Multi-Tenant-Szenarien |
+| Kein Auth außer API-Key (`main.py`) bzw. gar keine (`tools/mcp_server.py --http`) | OAuth2 / JWT für Multi-Tenant-Szenarien; MCP-HTTP-Transport hinter Reverse-Proxy-Auth oder FastMCPs `auth_server_provider` |
+| Customer State (`core/customer_state.py`) = In-Memory, kein echter CRM-Primärschlüssel | Persistenter Store; Identifier-Auflösung über E-Mail/Firmenname ist eine Mock-Vereinfachung — kann bei wirklich unterschiedlichen, aber zur selben Firma gehörenden E-Mails (verschiedene Ansprechpartner je Stufe) getrennte Einträge erzeugen, siehe Sprint-3-Abschnitt oben |
+| MCP-Server (`tools/mcp_server.py`) läuft als eigener Prozess mit eigenem In-Memory-Store | Teilt sich nichts mit `main.py`'s Agenten-Prozess (weder Mock-CRM-Daten noch `customer_state`) — vor Produktivbetrieb gemeinsamen persistenten Store einführen |
