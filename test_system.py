@@ -1795,6 +1795,134 @@ def test_mcp_server() -> None:
         traceback.print_exc()
 
 
+# ── Test 21: Landing-Page-Chat-Widget / Inbound-SDR ─────────────────────────
+
+def test_inbound_chat(live: bool) -> None:
+    section("TEST 21 — SDR-Agent Inbound-Modus: Landing-Page-Chat-Widget")
+    info(
+        "InboundChatGraph muss (a) die Session-Store-Obergrenze respektieren "
+        "(älteste Session verworfen statt unbegrenztem Wachstum), (b) die "
+        "EU-AI-Act-Art.-50-Offenlegung nur beim ersten Turn einer Session "
+        "anhängen, (c) should_book_demo/booking_url deterministisch an der "
+        "ICP-Schwelle koppeln und customer_state NUR bei Qualifikation + "
+        "bekanntem Identifier befüllen -- alles ohne LLM-Aufruf testbar, da "
+        "diese Logik in reinem Python-Code sitzt, nicht im Prompt."
+    )
+    try:
+        from agents.sdr_agent import (
+            InboundChatGraph, InboundChatSession, QUALIFICATION_THRESHOLD,
+            _get_inbound_session, _save_inbound_session, _inbound_sessions,
+        )
+        import agents.sdr_agent as sdr_module
+        from core import customer_state
+    except Exception as exc:
+        fail("Import für Inbound-Chat-Test", str(exc))
+        return
+
+    # 21a: Session-Store — Obergrenze verdrängt die älteste Session.
+    original_max = sdr_module._MAX_INBOUND_SESSIONS
+    sdr_module._MAX_INBOUND_SESSIONS = 2
+    try:
+        for sid in ("cap-test-1", "cap-test-2", "cap-test-3"):
+            _save_inbound_session(InboundChatSession(session_id=sid))
+        remaining = {s for s in _inbound_sessions if s.startswith("cap-test-")}
+        if remaining == {"cap-test-2", "cap-test-3"}:
+            ok("Session-Store verdrängt bei Überschreiten der Obergrenze die älteste Session", str(remaining))
+        else:
+            fail("Session-Store-Verdrängung unerwartet", str(remaining))
+    finally:
+        sdr_module._MAX_INBOUND_SESSIONS = original_max
+        for sid in ("cap-test-1", "cap-test-2", "cap-test-3"):
+            _inbound_sessions.pop(sid, None)
+
+    # llm=None ist hier sicher: apply_disclosure() und finalize() rufen
+    # self._llm nie auf (nur respond_and_qualify() tut das, siehe unten 21d).
+    graph = InboundChatGraph(llm=None)
+
+    # 21b: AI-Act-Offenlegung nur beim ersten Turn.
+    first_state = {
+        "session_id": "disclosure-test", "message": "Was kostet Growth?", "visitor_info": {},
+        "history": [], "is_first_turn": True, "turn_count": 0, "created_at": "",
+        "reply_text": "Growth kostet 2.490€ einmalig.", "icp_score": 0, "icp_rationale": "",
+        "company_name": "", "industry": "", "pain_points": [], "language": "de", "final_result": {},
+    }
+    after_first = graph.apply_disclosure(dict(first_state))
+    second_state = {**first_state, "is_first_turn": False, "reply_text": "Noch was: der Prozess dauert ca. 2 Wochen."}
+    after_second = graph.apply_disclosure(dict(second_state))
+    if "KI-System" in after_first["reply_text"] and "KI-System" not in after_second["reply_text"]:
+        ok("AI-Act-Offenlegung wird nur beim ersten Turn angehängt, nicht bei jeder Antwort")
+    else:
+        fail("AI-Act-Offenlegungs-Logik unerwartet", f"first={after_first['reply_text']!r}, second={after_second['reply_text']!r}")
+
+    # 21c: finalize() — qualifiziert vs. nicht, customer_state nur bei Treffer.
+    base_state = {
+        "session_id": "finalize-test-qualified", "message": "Wir sind ein Elektrikerbetrieb, 5 MA.",
+        "visitor_info": {"email": "inbound-test@example.at"}, "history": [], "is_first_turn": False,
+        "turn_count": 0, "created_at": "", "reply_text": "Klingt nach einem guten Fit für uns!",
+        "icp_score": QUALIFICATION_THRESHOLD + 10, "icp_rationale": "Elektrikerbetrieb Wien, 5 MA",
+        "company_name": "Elektro Test GmbH", "industry": "Elektrikerbetrieb", "pain_points": ["verpasste Anrufe"],
+        "language": "de", "final_result": {},
+    }
+    qualified_result = graph.finalize(dict(base_state))["final_result"]
+    if (
+        qualified_result["qualified"] is True
+        and qualified_result["should_book_demo"] is True
+        and qualified_result["booking_url"]
+    ):
+        ok("finalize() setzt should_book_demo=true + booking_url ab der ICP-Schwelle", qualified_result["booking_url"])
+    else:
+        fail("finalize() (qualifiziert) unerwartetes Ergebnis", str(qualified_result))
+
+    state_after = customer_state.get(email="inbound-test@example.at")
+    if state_after is not None and "sdr" in state_after.stages and state_after.stages["sdr"].data.get("source") == "landing_chat":
+        ok("finalize() schreibt einen customer_state-Snapshot für qualifizierte, identifizierte Besucher")
+    else:
+        fail("customer_state-Snapshot fehlt oder unerwartet", str(state_after))
+
+    unqualified_state = {
+        **base_state,
+        "session_id": "finalize-test-unqualified",
+        "icp_score": QUALIFICATION_THRESHOLD - 10,
+        "visitor_info": {"email": "inbound-unqualified@example.at"},
+    }
+    unqualified_result = graph.finalize(dict(unqualified_state))["final_result"]
+    if unqualified_result["qualified"] is False and unqualified_result["should_book_demo"] is False and unqualified_result["booking_url"] is None:
+        ok("finalize() setzt should_book_demo=false + kein booking_url unterhalb der ICP-Schwelle")
+    else:
+        fail("finalize() (nicht qualifiziert) unerwartetes Ergebnis", str(unqualified_result))
+
+    if customer_state.get(email="inbound-unqualified@example.at") is None:
+        ok("finalize() schreibt KEINEN customer_state-Snapshot für nicht qualifizierte Besucher")
+    else:
+        fail("customer_state wurde fälschlich für einen nicht qualifizierten Besucher befüllt")
+
+    # 21d: voller Durchlauf über SDRAgent.process_inbound_chat() inkl. LLM +
+    # main.py-Endpoint-Logik (DLP) -- nur mit echtem Key, gleiches Muster wie
+    # test_sdr_routing() oben.
+    if not live:
+        warn("Inbound-Chat-Live-Test übersprungen", "kein gültiger ANTHROPIC_API_KEY lokal")
+        return
+
+    try:
+        from agents.sdr_agent import SDRAgent
+        from core.security import SecurityLayer
+
+        agent = SDRAgent()
+        msg = "Wir sind ein kleiner Elektrikerbetrieb in Wien mit 4 Mitarbeitern und verpassen ständig Anrufe."
+        dlp = SecurityLayer.check_and_redact(msg)
+        result = agent.process_inbound_chat(
+            session_id="live-inbound-test", message=dlp.redacted_text, visitor_info={"email": "live-inbound@example.at"},
+        )
+        info(f"icp_score={result.get('icp', {}).get('score')}, should_book_demo={result.get('should_book_demo')}")
+        if result.get("reply") and "icp" in result:
+            ok("process_inbound_chat() liefert eine Antwort + ICP-Einschätzung (LLM)", result["reply"][:200])
+        else:
+            fail("process_inbound_chat() unerwartetes Ergebnis (live)", str(result))
+    except Exception:
+        fail("Inbound-Chat-Live-Test — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -1829,6 +1957,7 @@ def main() -> int:
     test_customer_state()
     test_prompt_caching()
     test_mcp_server()
+    test_inbound_chat(live)
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

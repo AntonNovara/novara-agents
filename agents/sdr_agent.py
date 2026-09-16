@@ -33,6 +33,19 @@ Workflow (LangGraph StateGraph):
         └── score < 40 (disqualifiziert)
                   ↓
             finalize_disqualified
+
+Zweiter, unabhängiger Workflow im selben Modul: InboundChatGraph
+(Landing-Page-Chat-Widget, siehe main.py POST /api/v1/chat/landing).
+Anders als der Outbound-Flow oben (ein Lead-Text rein, eine Outreach-
+Nachricht raus, EIN Aufruf) ist das hier ein mehrstufiges Gespräch
+(session_id-basiertes In-Memory-Verlauf, mehrere Turns), das Fragen aus
+novara_wissen.txt beantwortet und den ICP-Fit über den GESAMTEN
+Gesprächsverlauf einschätzt, nicht nur pro Nachricht. Teilt sich mit dem
+Outbound-Flow: die Wissensdatenbank (_WISSEN), die ICP-Scoring-Skala
+(identische Schwellwerte/Rubrik), AI_DISCLOSURE_DE und QUALIFICATION_THRESHOLD.
+Teilt sich NICHT: LeadDatabase, CRMIntegrationSDR, Consent-Ledger,
+Sequence Scheduler — ein Chat-Besucher ist kein Outbound-Lead, es gibt
+keinen Kaltakquise-Kanal und daher keinen Opt-out zu prüfen.
 """
 from __future__ import annotations
 
@@ -40,10 +53,12 @@ import json
 import logging
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END, StateGraph
+from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
@@ -745,6 +760,306 @@ class SDRGraph:
         }
 
 
+# ── Inbound Chat: Session Store ─────────────────────────────────────────────
+# In-Memory-Prozess-Singleton, gleiches Muster wie core/consent.py._ledger --
+# geht bei Neustart verloren. ANDERS als die anderen In-Memory-Stores in
+# diesem Repo ist der Aufrufer hier ein ANONYMER, UNAUTHENTIFIZIERTER
+# Website-Besucher (main.py's /api/v1/chat/landing hat bewusst KEINEN
+# API-Key-Schutz, siehe dortiger Endpoint-Docstring) -- session_id kommt vom
+# Client (Widget), ein böswilliger Akteur könnte beliebig viele erfinden.
+# _MAX_INBOUND_SESSIONS + die Verdrängung der ältesten Session in
+# _save_inbound_session() sind ein einfaches Not-Ventil dagegen, kein echtes
+# Rate-Limiting (siehe CLAUDE.md, "Bekannte Einschränkungen").
+
+_MAX_INBOUND_SESSIONS = 5_000
+_MAX_INBOUND_HISTORY_TURNS = 12  # letzte 12 Nachrichten (6 Runden) je Session
+
+
+class InboundChatSession(BaseModel):
+    """Persistierter Zustand EINER Landing-Page-Chat-Session zwischen Turns."""
+
+    session_id: str
+    history: list[dict[str, str]] = Field(default_factory=list)  # [{"role": "user"|"assistant", "content": ...}]
+    icp_score: int = 0
+    icp_rationale: str = ""
+    company_name: str = ""
+    industry: str = ""
+    pain_points: list[str] = Field(default_factory=list)
+    turn_count: int = 0
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+_inbound_sessions: dict[str, InboundChatSession] = {}
+
+
+def _get_inbound_session(session_id: str) -> InboundChatSession:
+    return _inbound_sessions.get(session_id) or InboundChatSession(session_id=session_id)
+
+
+def _save_inbound_session(session: InboundChatSession) -> None:
+    session.updated_at = datetime.now(timezone.utc).isoformat()
+    if session.session_id not in _inbound_sessions and len(_inbound_sessions) >= _MAX_INBOUND_SESSIONS:
+        oldest_id = min(_inbound_sessions, key=lambda sid: _inbound_sessions[sid].updated_at)
+        del _inbound_sessions[oldest_id]
+    _inbound_sessions[session.session_id] = session
+
+
+# ── Inbound Chat: Prompt ─────────────────────────────────────────────────────
+
+_SYSTEM_INBOUND_CHAT = f"""\
+Du bist der Chat-Assistent auf der Novara-Automation-Landing-Page. Ein
+Website-Besucher chattet direkt mit dir (Inbound, keine Kaltakquise).
+
+=== NOVARA WISSENSDATENBANK (deine EINZIGE Quelle für Fakten) ===
+{_WISSEN}
+=== ENDE WISSENSDATENBANK ===
+
+DEINE AUFGABE (zwei Dinge gleichzeitig, in JEDER Antwort):
+1. Beantworte die Frage des Besuchers hilfreich, konkret und im Ton eines
+   Kollegen — NUR mit Fakten aus der Wissensdatenbank oben (Pakete, Preise,
+   Prozess, Zielgruppe). Erfinde NIEMALS ein Feature, einen Preis oder eine
+   Zusage, die nicht in der Wissensdatenbank steht — sag im Zweifel lieber,
+   dass du das gern im persönlichen Gespräch klärst, statt zu raten.
+2. Schätze im Hintergrund den ICP-Fit des Besuchers anhand des GESAMTEN
+   bisherigen Gesprächsverlaufs ein (nicht nur der letzten Nachricht) —
+   Firma, Branche, Größe, Schmerzpunkte, alles was bisher gesagt wurde.
+
+ICP-Scoring gemäß Wissensdatenbank (identische Skala wie im Outbound-SDR):
+  SEHR HOCH (85-100): Elektrikerbetrieb Wien, 1-10 MA, Inhaber auf Baustelle,
+    Büro läuft nebenher, kein CRM, verpasste Anrufe, manuelle Angebote
+  HOCH (70-84): Anderer Handwerksbetrieb Wien/DACH (Installateur, Maler, Tischler, ...),
+    ähnliches Profil wie oben
+  MITTEL (45-69): KMU Wien/DACH, manuelle Prozesse, Optimierungspotenzial erkennbar
+  NIEDRIG (0-44): Bereits professionell digitalisiert, >50 MA, kein Interesse
+    an Effizienz, Tech-Start-up (DIY), Non-Profit — ODER schlicht noch zu
+    wenig Information bekannt, um sinnvoll einzuschätzen
+
+WICHTIG: Wenn der Besucher noch keine Firmendaten preisgegeben hat, ist ein
+niedriger Score korrekt (nicht raten!) — 0 ist der richtige Default bei
+einer reinen Informationsanfrage ohne jeden Firmenbezug. Dräng NICHT aktiv
+auf Firmendaten ("Wie heißt Ihre Firma?" als erste Reaktion) — beantworte
+zuerst die eigentliche Frage; wenn es sich im Gesprächsfluss natürlich
+ergibt, darfst du eine kurze, beiläufige Rückfrage stellen, aber das ist
+kein Pflichtschritt in jeder Antwort.
+
+Gib AUSSCHLIESSLICH valides JSON zurück (kein Text davor/danach):
+{{
+  "reply": string (deine Chat-Antwort an den Besucher, in der Sprache des Besuchers,
+                   2-5 Sätze, kein Technik-Jargon wie "LangGraph" oder "Agent"),
+  "company_name": string (bereits bekannter oder neu genannter Firmenname, sonst ""),
+  "industry": string (z.B. "Elektrikerbetrieb", "Installateur", "Malerbetrieb", ..., sonst ""),
+  "company_size": integer oder null,
+  "pain_points": [Liste von Strings, max 4, sonst leere Liste],
+  "icp_score": integer 0-100 (Gesamteinschätzung über das GANZE Gespräch, nicht nur diese Nachricht),
+  "icp_rationale": string (1 Satz Begründung auf Deutsch),
+  "language": "de" | "en"  (Sprache DIESER Besucher-Nachricht)
+}}
+"""
+
+
+# ── Inbound Chat: Graph State ────────────────────────────────────────────────
+
+class InboundChatState(TypedDict):
+    session_id: str
+    message: str                    # DLP-bereinigte Besucher-Nachricht (main.py prüft VOR diesem Aufruf)
+    visitor_info: dict[str, Any]    # optionale Formulardaten: name/email/company/phone
+
+    # aus der Session geladen, VOR diesem Turn
+    history: list[dict[str, str]]
+    is_first_turn: bool
+    turn_count: int
+    created_at: str
+
+    # von respond_and_qualify gesetzt/aktualisiert
+    reply_text: str
+    icp_score: int
+    icp_rationale: str
+    company_name: str
+    industry: str
+    pain_points: list[str]
+    language: str
+
+    final_result: dict[str, Any]
+
+
+# ── Inbound Chat: Graph ───────────────────────────────────────────────────────
+
+class InboundChatGraph:
+    """LangGraph-Workflow für das Landing-Page-Chat-Widget (Inbound-SDR)."""
+
+    def __init__(self, llm: Any) -> None:
+        self._llm = llm
+        self._graph = self._build_graph()
+
+    # ── Node: respond_and_qualify ────────────────────────────────────────────
+
+    def respond_and_qualify(self, state: InboundChatState) -> InboundChatState:
+        logger.info("Node: respond_and_qualify", extra={"session": state["session_id"]})
+
+        messages: list = [cached_system_message(_SYSTEM_INBOUND_CHAT)]
+        for turn in state["history"]:
+            msg_cls = HumanMessage if turn.get("role") == "user" else AIMessage
+            messages.append(msg_cls(content=turn.get("content", "")))
+
+        visitor_note = ""
+        known = {k: v for k, v in (state.get("visitor_info") or {}).items() if v}
+        if known:
+            visitor_note = f"[Bekannte Besucherdaten aus einem Formularfeld: {json.dumps(known, ensure_ascii=False)}]\n"
+        messages.append(HumanMessage(content=f"{visitor_note}{state['message']}"))
+
+        fallback_reply = (
+            "Entschuldigung, da ist gerade technisch etwas schiefgelaufen — "
+            "magst du deine Frage nochmal stellen?"
+        )
+        try:
+            response = self._llm.invoke(messages)
+            data = _parse_llm_json(response.content)
+            new_score = int(data.get("icp_score", state["icp_score"]))
+            return {
+                **state,
+                "reply_text": data.get("reply") or fallback_reply,
+                "company_name": data.get("company_name") or state["company_name"],
+                "industry": data.get("industry") or state["industry"],
+                "pain_points": data.get("pain_points") or state["pain_points"],
+                # Monotonic: ein einmal erkannter ICP-Fit soll nicht durch
+                # LLM-Rauschen in einer späteren Antwort wieder sinken --
+                # sonst könnte should_book_demo mitten im Gespräch flackern.
+                "icp_score": max(state["icp_score"], new_score),
+                "icp_rationale": data.get("icp_rationale") or state["icp_rationale"],
+                "language": data.get("language") or state["language"],
+            }
+        except Exception as exc:
+            logger.warning("respond_and_qualify LLM failed: %s", exc)
+            return {**state, "reply_text": fallback_reply}
+
+    # ── Node: apply_disclosure ───────────────────────────────────────────────
+
+    def apply_disclosure(self, state: InboundChatState) -> InboundChatState:
+        logger.info("Node: apply_disclosure", extra={"session": state["session_id"]})
+
+        # EU AI Act Art. 50: einmal pro Session beim ersten Turn, nicht bei
+        # jeder einzelnen Chat-Antwort -- Letzteres wäre weder von Art. 50
+        # gefordert noch zumutbare Chat-UX. Deterministisch angehängt statt
+        # nur per Prompt-Instruktion, gleiche Philosophie wie compose_outreach()
+        # im Outbound-Flow oben (core/security.py: eine Prompt-Anweisung ist
+        # eine Empfehlung, kein Beweis).
+        reply = state["reply_text"]
+        if state["is_first_turn"]:
+            disclosure = AI_DISCLOSURE_DE.format(client_name=_CLIENT_NAME)
+            if disclosure not in reply:
+                reply = f"{reply}\n\n{disclosure}"
+        return {**state, "reply_text": reply}
+
+    # ── Node: finalize ───────────────────────────────────────────────────────
+
+    def finalize(self, state: InboundChatState) -> InboundChatState:
+        logger.info("Node: finalize", extra={"session": state["session_id"]})
+
+        qualified = state["icp_score"] >= QUALIFICATION_THRESHOLD
+        tier = "low"
+        for label, threshold in _ICP_TIER_THRESHOLDS.items():
+            if state["icp_score"] >= threshold:
+                tier = label
+                break
+
+        history = state["history"] + [
+            {"role": "user", "content": state["message"]},
+            {"role": "assistant", "content": state["reply_text"]},
+        ]
+        history = history[-_MAX_INBOUND_HISTORY_TURNS:]
+
+        _save_inbound_session(InboundChatSession(
+            session_id=state["session_id"],
+            history=history,
+            icp_score=state["icp_score"],
+            icp_rationale=state["icp_rationale"],
+            company_name=state["company_name"],
+            industry=state["industry"],
+            pain_points=state["pain_points"],
+            turn_count=state["turn_count"] + 1,
+            created_at=state["created_at"],
+        ))
+
+        # customer_state nur schreiben, wenn qualifiziert UND wenigstens ein
+        # Identifier bekannt ist -- gleiches Muster wie write_to_crm() im
+        # Outbound-Flow (kein CRM-/State-Eintrag für unqualifizierte Leads).
+        # ANDERS als der Outbound-Flow: KEIN CRMIntegrationSDR.upsert_lead()
+        # hier -- ein anonymer Chat-Besucher ist noch kein Lead-Datensatz,
+        # nur eine Zeile im geteilten Kundenzustand.
+        visitor_email = (state.get("visitor_info") or {}).get("email") or ""
+        if qualified and (state["company_name"] or visitor_email):
+            customer_state.update_stage(
+                "sdr",
+                {
+                    "source": "landing_chat",
+                    "icp_score": state["icp_score"],
+                    "icp_tier": tier,
+                    "industry": state["industry"],
+                    "pain_points": state["pain_points"],
+                },
+                email=visitor_email or None,
+                company_name=state["company_name"] or None,
+                agent_session_id=state["session_id"],
+            )
+
+        final: dict[str, Any] = {
+            "reply": state["reply_text"],
+            "qualified": qualified,
+            "should_book_demo": qualified,
+            "booking_url": settings.demo_booking_url if qualified else None,
+            "icp": {
+                "score": state["icp_score"],
+                "tier": tier,
+                "rationale": state["icp_rationale"],
+            },
+            "company": {
+                "name": state["company_name"],
+                "industry": state["industry"],
+                "pain_points": state["pain_points"],
+            },
+            "language": state["language"],
+        }
+        return {**state, "final_result": final}
+
+    # ── Graph Builder ─────────────────────────────────────────────────────────
+
+    def _build_graph(self):
+        graph = StateGraph(InboundChatState)
+        graph.add_node("respond_and_qualify", self.respond_and_qualify)
+        graph.add_node("apply_disclosure", self.apply_disclosure)
+        graph.add_node("finalize", self.finalize)
+
+        graph.set_entry_point("respond_and_qualify")
+        graph.add_edge("respond_and_qualify", "apply_disclosure")
+        graph.add_edge("apply_disclosure", "finalize")
+        graph.add_edge("finalize", END)
+
+        return graph.compile()
+
+    def run(self, session_id: str, message: str, visitor_info: dict[str, Any]) -> dict[str, Any]:
+        session = _get_inbound_session(session_id)
+        initial: InboundChatState = {
+            "session_id": session_id,
+            "message": message,
+            "visitor_info": visitor_info,
+            "history": session.history,
+            "is_first_turn": len(session.history) == 0,
+            "turn_count": session.turn_count,
+            "created_at": session.created_at,
+            "reply_text": "",
+            "icp_score": session.icp_score,
+            "icp_rationale": session.icp_rationale,
+            "company_name": session.company_name,
+            "industry": session.industry,
+            "pain_points": session.pain_points,
+            "language": "de",
+            "final_result": {},
+        }
+        final_state = self._graph.invoke(initial)
+        return final_state["final_result"]
+
+
 # ── SDRAgent ───────────────────────────────────────────────────────────────────
 
 class SDRAgent(BaseAgent):
@@ -772,9 +1087,34 @@ class SDRAgent(BaseAgent):
                 api_key=settings.crm_api_key.get_secret_value(),
             ),
         )
+        # Eigener LLM-Client, kleineres max_tokens als der Outbound-Workflow
+        # (1024) -- eine Chat-Antwort ist per Prompt-Vorgabe auf 2-5 Sätze
+        # begrenzt, braucht also weniger Headroom als eine volle Outreach-
+        # Nachricht. Getrennt vom Outbound-_llm, damit ein zukünftiges
+        # Tuning des einen Workflows (z. B. Retries, anderes Modell) den
+        # jeweils anderen nicht versehentlich mitbeeinflusst.
+        self._inbound = InboundChatGraph(llm=build_llm(max_tokens=768))
 
     def _run(self, request: AgentRequest) -> dict[str, Any]:
         return self._workflow.run(
             input_text=request.text,
             session_id=request.session_id,
         )
+
+    def process_inbound_chat(
+        self, session_id: str, message: str, visitor_info: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        """
+        Inbound-Modus für das Landing-Page-Chat-Widget (main.py:
+        POST /api/v1/chat/landing). Umgeht bewusst BaseAgent.process()/
+        AgentRequest: anders als die anderen 5 Agenten (ein zustandsloser
+        Text-Request rein, ein Dict raus) ist das hier mehrstufiges Chat-
+        State über mehrere Turns hinweg (session_id-basierter In-Memory-
+        Verlauf, siehe InboundChatSession), und die Antwortform (reply,
+        should_book_demo, booking_url) passt nicht ins generische
+        AgentResponse.result-Schema. Die Input-DLP-Prüfung auf `message`
+        läuft bereits VOR diesem Aufruf in main.py -- exakt dasselbe Muster
+        wie beim strukturell ähnlichen /api/v1/webhooks/inbound-reply
+        (dort ebenfalls kein AgentRequest, aus demselben Grund).
+        """
+        return self._inbound.run(session_id=session_id, message=message, visitor_info=visitor_info or {})

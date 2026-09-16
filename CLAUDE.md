@@ -644,6 +644,109 @@ Test-Lead dort anlegen.
 
 ---
 
+## Landing-Page-Chat-Widget: Inbound-SDR (16.09.2026)
+
+Zweiter, unabhängiger Workflow im SDR-Agenten (`agents/sdr_agent.py`,
+`InboundChatGraph`) neben dem Outbound-Flow oben — Gegenstück zum
+klassischen SDR-Prozess: statt einen Lead-Text zu qualifizieren und EINE
+Outreach-Nachricht zu erzeugen, führt der Agent hier ein mehrstufiges
+Gespräch mit einem anonymen Website-Besucher, beantwortet dessen Fragen aus
+`novara_wissen.txt` und schätzt den ICP-Fit über den GESAMTEN
+Gesprächsverlauf ein (nicht nur pro Nachricht).
+
+**Endpoint:** `POST /api/v1/chat/landing` (`main.py`) — ÖFFENTLICH, KEIN
+`X-API-Key` (anders als `/api/v1/agents/*`). Ein eingebettetes Chat-Widget
+läuft im Browser jedes anonymen Besuchers, ein Secret könnte dort nie
+verborgen bleiben — gleiches Muster wie die ebenfalls unauthentifizierten
+Voice-Endpunkte. Umgeht bewusst `BaseAgent.process()`/`AgentRequest`: die
+Antwortform (`reply`, `should_book_demo`, `booking_url`) passt nicht ins
+generische `AgentResponse.result`-Schema, und der Zustand ist mehrstufig
+(`session_id`-basiert) statt ein einzelner zustandsloser Text-Request. Die
+Sicherheitsgrenze ist hier nicht der API-Key, sondern: Input-DLP auf jede
+Nachricht (`SecurityLayer.check_and_redact()`, exakt der Schritt, den
+`BaseAgent.process()` für die anderen 5 Agenten automatisch übernimmt),
+Output-DLP auf die generierte Antwort (`SecurityLayer.sanitize_dict()` +
+`OutputBlockedError`-Handling, ebenfalls manuell nachgebildet), ein striktes
+`LandingVisitorInfo`-Schema statt eines freien `dict` für `visitor_info`
+(begrenzt Payload-Größe/Prompt-Injection-Fläche), und eine Obergrenze im
+Session-Store (siehe unten).
+
+```json
+// Request
+{"session_id": "<vom Widget generiert, über die ganze Konversation stabil>",
+ "message": "Was kostet das Starter-Paket?",
+ "visitor_info": {"name": "", "email": "", "company": "", "phone": ""}}
+
+// Response
+{"success": true, "session_id": "...", "reply": "...",
+ "should_book_demo": true, "booking_url": "https://calendly.com/...",
+ "icp_score": 82, "dlp_findings": [], "error": null}
+```
+
+**`InboundChatGraph`** (3 Nodes, linear):
+1. `respond_and_qualify` — EIN LLM-Call liefert gleichzeitig die Chat-Antwort
+   UND die ICP-Einschätzung als JSON (`reply`, `company_name`, `industry`,
+   `pain_points`, `icp_score`, `icp_rationale`, `language`) — spart einen
+   zweiten Call gegenüber getrennter Antwort-/Extraktions-Logik. Nutzt
+   dieselbe ICP-Scoring-Rubrik wie `analyze_input` im Outbound-Flow
+   (identische Schwellwerte, damit "qualifiziert" über beide Kanäle dasselbe
+   bedeutet). `icp_score` wird `max(bisheriger Score, neuer Score)` verrechnet
+   — ein einmal erkannter ICP-Fit soll nicht durch LLM-Rauschen in einer
+   späteren Antwort wieder sinken (sonst würde `should_book_demo` mitten im
+   Gespräch flackern).
+2. `apply_disclosure` — EU AI Act Art. 50, deterministisch angehängt (gleiche
+   Philosophie wie `compose_outreach()` im Outbound-Flow), aber NUR beim
+   ersten Turn einer Session, nicht bei jeder einzelnen Chat-Antwort — das
+   wäre weder von Art. 50 gefordert noch zumutbare Chat-UX.
+3. `finalize` — `qualified`/`should_book_demo` = `icp_score >=
+   QUALIFICATION_THRESHOLD` (identische Schwelle wie Outbound), `booking_url`
+   = `settings.demo_booking_url` NUR wenn qualifiziert, sonst `null`. Schreibt
+   `customer_state.update_stage("sdr", ...)` NUR wenn qualifiziert UND
+   mindestens ein Identifier (E-Mail aus `visitor_info` oder erkannter
+   Firmenname) bekannt ist — bewusst KEIN `CRMIntegrationSDR.upsert_lead()`
+   hier: ein anonymer Chat-Besucher ist noch kein Lead-Datensatz, nur eine
+   Zeile im geteilten Kundenzustand.
+
+**Session-Speicher** (`InboundChatSession`, `_inbound_sessions` in
+`agents/sdr_agent.py`) — In-Memory-Prozess-Singleton, gleiches Muster wie
+`core/consent.py`. ANDERS als die übrigen In-Memory-Stores in diesem Repo
+ist der Aufrufer hier ein ANONYMER, UNAUTHENTIFIZIERTER Website-Besucher —
+`session_id` kommt vom Client, ein böswilliger Akteur könnte beliebig viele
+erfinden. `_MAX_INBOUND_SESSIONS` (5.000) + Verdrängung der ältesten Session
+bei Überschreiten sind ein einfaches Not-Ventil dagegen, KEIN echtes
+Rate-Limiting (siehe "Bekannte Einschränkungen" unten). Verlauf pro Session
+zusätzlich auf `_MAX_INBOUND_HISTORY_TURNS` (12) begrenzt.
+
+**`static/chat_widget.js`** — Vanilla-JS-Widget, keine Abhängigkeiten, per
+EINER `<script>`-Zeile einbettbar:
+```html
+<script src="https://<novara-agents-deployment>/static/chat_widget.js"></script>
+```
+Leitet seine API-Basis-URL standardmäßig vom eigenen Script-`src`-Origin ab
+(`document.currentScript`) — funktioniert automatisch, solange es von
+`main.py`s eigenem `/static`-Mount geladen wird (`app.mount("/static",
+StaticFiles(...))`). Konfiguration ausschließlich über `data-*`-Attribute
+(Titel, Begrüßung, Akzentfarbe, optionale bekannte Besucherdaten) — kein
+zweiter Script-Block nötig, anders als beim bestehenden ROI-Rechner-Widget
+(`website/js/novara-roi-widget.js`, braucht einen expliziten
+`NovaraROIWidget.mount(...)`-Aufruf). `session_id` + sichtbarer Verlauf
+werden im `localStorage` des Besuchers persistiert (try/catch-abgesichert —
+privater Modus/blockierter Speicher lässt das Widget trotzdem
+funktionieren, nur ohne Persistenz über Seitenaufrufe hinweg). Bewusst KEIN
+Shadow DOM (Einfachheit vor Isolations-Härte) — alle IDs/Klassen sind mit
+`novara-chat-` präfixiert.
+
+Regressionstest: `test_system.py` TEST 21 (Session-Store-Verdrängung bei
+Überschreiten der Obergrenze, AI-Act-Offenlegung nur beim ersten Turn,
+`finalize()`-Schwellenlogik inkl. `customer_state`-Wiring — alles ohne
+LLM-Aufruf direkt auf den Graph-Nodes getestet, da diese Logik in reinem
+Python-Code sitzt, nicht im Prompt; ein voller Durchlauf über
+`SDRAgent.process_inbound_chat()` inkl. echtem LLM-Call läuft zusätzlich,
+aber nur mit gültigem `ANTHROPIC_API_KEY`, gleiches Live-Gating wie
+`test_sdr_routing()`).
+
+---
+
 ## Implementierte Agenten
 
 ### 1. Operations Agent (`agents/operations_agent.py`)
@@ -971,6 +1074,9 @@ novara-agents/
 ├── .env.example                    # Template – nie .env committen
 ├── CLAUDE.md                       # diese Datei
 │
+├── static/
+│   └── chat_widget.js              # Landing-Page-Chat-Widget, ausgeliefert über app.mount("/static", ...)
+│
 ├── core/
 │   ├── config.py                   # pydantic-settings, Singleton via lru_cache
 │   ├── consent.py                  # Opt-in/Opt-out-Ledger pro Kontakt+Kanal (Sprint 1)
@@ -1044,3 +1150,5 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | Kein Auth außer API-Key (`main.py`) bzw. gar keine (`tools/mcp_server.py --http`) | OAuth2 / JWT für Multi-Tenant-Szenarien; MCP-HTTP-Transport hinter Reverse-Proxy-Auth oder FastMCPs `auth_server_provider` |
 | Customer State (`core/customer_state.py`) = In-Memory, kein echter CRM-Primärschlüssel | Persistenter Store; Identifier-Auflösung über E-Mail/Firmenname ist eine Mock-Vereinfachung — kann bei wirklich unterschiedlichen, aber zur selben Firma gehörenden E-Mails (verschiedene Ansprechpartner je Stufe) getrennte Einträge erzeugen, siehe Sprint-3-Abschnitt oben |
 | MCP-Server (`tools/mcp_server.py`) läuft als eigener Prozess mit eigenem In-Memory-Store | Teilt sich nichts mit `main.py`'s Agenten-Prozess (weder Mock-CRM-Daten noch `customer_state`) — vor Produktivbetrieb gemeinsamen persistenten Store einführen |
+| `POST /api/v1/chat/landing` ist öffentlich/unauthentifiziert, `InboundChatSession`-Store (`agents/sdr_agent.py`) = In-Memory mit nur einer groben `_MAX_INBOUND_SESSIONS`-Obergrenze statt echtem Rate-Limiting | FastAPI `slowapi` Middleware speziell für diesen Endpoint + persistenter Session-Store (Redis) vor echtem Produktiv-Traffic |
+| `static/chat_widget.js` nutzt kein Shadow DOM — CSS-Kollisionen mit sehr aggressiven globalen Host-Seiten-Styles theoretisch möglich | Bei Bedarf auf Shadow-DOM-Kapselung umstellen |

@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     crm_endpoint: str = Field(default="https://crm.mock/api/v1", alias="CRM_ENDPOINT")
     crm_api_key: SecretStr = Field(default="mock-key", alias="CRM_API_KEY")
 
+    # Landing-Page-Chat-Widget (Inbound-SDR, siehe agents/sdr_agent.py
+    # InboundChatGraph): Termin-Link, der einem als ICP qualifizierten
+    # Besucher zusammen mit should_book_demo=true zurückgegeben wird.
+    # Default = derselbe reale Link wie in novara_wissen.txt
+    # ("TERMINBUCHUNG: calendly.com/anton-novaraautomation/30min").
+    demo_booking_url: str = Field(
+        default="https://calendly.com/anton-novaraautomation/30min", alias="DEMO_BOOKING_URL"
+    )
+
     # Google Calendar (book_appointment tool)
     google_client_id: SecretStr = Field(default="", alias="GOOGLE_CLIENT_ID")
     google_client_secret: SecretStr = Field(default="", alias="GOOGLE_CLIENT_SECRET")

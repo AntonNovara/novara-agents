@@ -20,6 +20,7 @@ import structlog
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Security, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -33,7 +34,7 @@ from agents.support_agent import SupportAgent
 from agents.voice_agent import VoiceAgent
 from core import consent
 from core.config import settings
-from core.security import SecurityLayer
+from core.security import OutputBlockedError, SecurityLayer
 from tools import sequence_scheduler
 from tools.calendar_integration import GoogleCalendarTool
 from tools.document_parser import DocumentParser
@@ -145,6 +146,14 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# static/chat_widget.js wird von hier ausgeliefert, damit eine Landing Page
+# ihn mit EINER Zeile einbinden kann, ohne die Datei selbst zu hosten:
+#   <script src="https://<dieses-deployment>/static/chat_widget.js"></script>
+# Das Widget leitet seine API-Basis-URL standardmäßig vom eigenen Script-
+# Origin ab (siehe static/chat_widget.js) -- funktioniert dadurch automatisch,
+# solange es von genau diesem Deployment geladen wird.
+app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
 # ── Authentication ────────────────────────────────────────────────────────────
 
@@ -465,6 +474,124 @@ async def inbound_reply_webhook(
         sequence_id=sequence_id,
         sequence_status=sequence_status,
         consent_recorded=consent_recorded,
+    )
+
+
+# ── Landing-Page-Chat-Widget (Inbound-SDR) ────────────────────────────────────
+# Gegenstück zum Outbound-SDR-Flow oben: static/chat_widget.js bettet sich
+# per einer einzigen <script>-Zeile in JEDE Landing Page ein und spricht
+# ausschließlich diesen Endpoint an.
+
+class LandingVisitorInfo(BaseModel):
+    """
+    Optionale Formulardaten aus dem Chat-Widget (z. B. ein vorgelagertes
+    Namens-/E-Mail-Feld). Bewusst ein eigenes, eng begrenztes Schema statt
+    eines freien dict -- dieser Endpoint ist öffentlich/unauthentifiziert
+    (siehe landing_chat()-Docstring), ein beliebiges dict wäre eine
+    unnötig große Angriffsfläche (Prompt-Injection über exotische Keys,
+    unbegrenzte Payload-Größe).
+    """
+    name: str = Field(default="", max_length=200)
+    email: str = Field(default="", max_length=320)
+    company: str = Field(default="", max_length=200)
+    phone: str = Field(default="", max_length=50)
+
+
+class LandingChatRequest(BaseModel):
+    session_id: str = Field(
+        ..., min_length=1, max_length=100,
+        description="Vom Widget generiert und über die gesamte Konversation hinweg gleich gehalten (z. B. localStorage)",
+    )
+    message: str = Field(..., min_length=1, max_length=2_000)
+    visitor_info: LandingVisitorInfo = Field(default_factory=LandingVisitorInfo)
+
+
+class LandingChatResponse(BaseModel):
+    success: bool
+    session_id: str
+    reply: str = ""
+    should_book_demo: bool = False
+    booking_url: Optional[str] = None
+    icp_score: int = 0
+    dlp_findings: list[str] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
+@app.post(
+    "/api/v1/chat/landing",
+    response_model=LandingChatResponse,
+    tags=["Chat"],
+    summary="Inbound-Chat-Widget der Landing Page (SDR-Agent, Inbound-Modus)",
+    responses={
+        200: {"description": "Antwort generiert (auch bei DLP-Block: success=false, kein 4xx/5xx)"},
+        422: {"description": "Validierungsfehler im Request-Body"},
+        503: {"description": "SDR-Agent noch nicht initialisiert (Server startet gerade)"},
+    },
+)
+async def landing_chat(payload: LandingChatRequest) -> LandingChatResponse:
+    """
+    ÖFFENTLICH, KEIN API-Key (anders als /api/v1/agents/*) -- static/
+    chat_widget.js läuft im Browser jedes anonymen Landing-Page-Besuchers,
+    ein Secret könnte dort nie verborgen bleiben. Gleiches Muster wie die
+    ebenfalls unauthentifizierten Voice-Endpunkte oben (Vapi kann auch
+    keinen X-API-Key mitschicken); CORS ist bereits global offen (siehe
+    CORSMiddleware oben). Die Sicherheitsgrenze ist hier NICHT der API-Key,
+    sondern: (a) Input-DLP-Check auf jede Nachricht, (b) ein striktes
+    visitor_info-Schema statt eines freien dict, (c) eine Obergrenze im
+    Session-Store (agents/sdr_agent.py, _MAX_INBOUND_SESSIONS). Echtes
+    Rate-Limiting fehlt noch -- siehe CLAUDE.md, "Bekannte Einschränkungen".
+    """
+    sdr = _AGENT_REGISTRY.get("sdr")
+    if sdr is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="SDR agent not initialised")
+
+    # Input-DLP -- exakt derselbe Schritt, den BaseAgent.process() vor jedem
+    # LLM-Aufruf durchführt (agents/base_agent.py). Hier manuell, weil dieser
+    # Endpoint bewusst nicht über AgentRequest/BaseAgent.process() läuft --
+    # siehe SDRAgent.process_inbound_chat()-Docstring (mehrstufiges Chat-
+    # State statt eines einzelnen zustandslosen Text-Requests).
+    input_dlp = SecurityLayer.check_and_redact(payload.message)
+    if not input_dlp.approved:
+        log.warning("Landing chat blocked by DLP", session=payload.session_id, reason=input_dlp.blocked_reason)
+        return LandingChatResponse(
+            success=False,
+            session_id=payload.session_id,
+            error=f"Input blocked by DLP: {input_dlp.blocked_reason}",
+        )
+
+    try:
+        result = sdr.process_inbound_chat(
+            session_id=payload.session_id,
+            message=input_dlp.redacted_text,
+            visitor_info=payload.visitor_info.model_dump(),
+        )
+    except Exception as exc:
+        log.exception("Landing chat failed", session=payload.session_id)
+        return LandingChatResponse(success=False, session_id=payload.session_id, error=str(exc))
+
+    # Output-DLP -- die generierte Antwort selbst absichern, bevor sie den
+    # Prozess verlässt. Gleiche Philosophie wie SecurityLayer.sanitize_dict()
+    # in agents/base_agent.py: ein Hard-Block-Treffer im LLM-Output darf nie
+    # unbehandelt durchgehen, gerade nicht auf einem öffentlichen Endpoint.
+    try:
+        sanitized = SecurityLayer.sanitize_dict(result)
+    except OutputBlockedError as exc:
+        log.warning("Landing chat output blocked by DLP", session=payload.session_id)
+        return LandingChatResponse(
+            success=False,
+            session_id=payload.session_id,
+            error=f"Output blocked by DLP: {exc.blocked_reason}",
+            dlp_findings=input_dlp.findings,
+        )
+
+    return LandingChatResponse(
+        success=True,
+        session_id=payload.session_id,
+        reply=sanitized.get("reply", ""),
+        should_book_demo=sanitized.get("should_book_demo", False),
+        booking_url=sanitized.get("booking_url"),
+        icp_score=(sanitized.get("icp") or {}).get("score", 0),
+        dlp_findings=input_dlp.findings,
     )
 
 

@@ -72,6 +72,7 @@ _DEMO_JSON_FIELDS: dict[str, Any] = {
     "plan": "starter",
     "team_size": 5,
     "primary_use_case": "(Demo-Modus)",
+    "reply": "(Demo-Modus: keine echte Chat-Antwort generiert)",
 }
 
 _DEMO_TEXT = (
