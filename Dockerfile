@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY agents/ agents/
 COPY core/ core/
 COPY tools/ tools/
+COPY static/ static/
 COPY main.py .
 COPY novara_wissen.txt .
 

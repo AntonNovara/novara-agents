@@ -199,6 +199,17 @@ async def correlation_middleware(request: Request, call_next):
     return response
 
 
+# ── Root ──────────────────────────────────────────────────────────────────────
+# Einfacher, abhängigkeitsloser 200er auf GET / -- manche Plattform-/Netzwerk-
+# Diagnosen (und einfache Uptime-Checks) fragen die Root-Route ab statt eines
+# konfigurierten Healthcheck-Pfads. Bewusst ohne jeden Zugriff auf
+# _AGENT_REGISTRY o. ä., damit hier nichts werfen kann.
+
+@app.get("/", tags=["System"])
+async def root():
+    return {"status": "ok", "service": "novara-agent-factory"}
+
+
 # ── Health Endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/health", tags=["System"])
