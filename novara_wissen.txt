@@ -344,7 +344,7 @@ AUTOMATISIERTE MAKE.COM SZENARIEN (intern aktiv):
   2. CRM Daily Briefing — 08:00 Wien, zeigt actionable Leads
   3. Gmail Sent-to-CRM — loggt neue Kontakte automatisch bei Versand
 
-TERMINBUCHUNG: calendly.com/anton-novaraautomation/30min
+TERMINBUCHUNG: https://calendar.app.google/Dqmz7HkW2XNktT6q6
 
 RECHNUNGSSTELLUNG:
   - Sequentielle Nummerierung (NA-2026-001, NA-2026-002, ...)

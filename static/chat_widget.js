@@ -22,6 +22,11 @@
  *   data-greeting      Erste Bot-Nachricht beim ersten Öffnen.
  *   data-accent-color  Akzentfarbe (Bubble, Senden-Button, User-Bubbles).
  *                       Default "#0066FF" (Novara-Blau).
+ *   data-avatar-src    Bild-URL für den Bubble-Avatar (Memoji o. ä.).
+ *                       Default: <apiBase>/static/avatar.png. Existiert die
+ *                       Datei nicht, zeigt die Bubble automatisch einen
+ *                       Marken-Platzhalter (Gradient + "N") statt eines
+ *                       kaputten Bild-Icons.
  *   data-visitor-name / data-visitor-email / data-visitor-company
  *                      Optional, wenn die Seite die Besucheridentität schon
  *                      kennt (z. B. eingeloggter Bereich) -- wird 1:1 als
@@ -51,6 +56,7 @@
     title: DATA.title || "Novara Automation",
     greeting: DATA.greeting || "Hallo! Wie kann ich dir bei der Automatisierung deines Betriebs helfen?",
     accentColor: DATA.accentColor || "#0066FF",
+    avatarSrc: DATA.avatarSrc || "",
     visitorName: DATA.visitorName || "",
     visitorEmail: DATA.visitorEmail || "",
     visitorCompany: DATA.visitorCompany || "",
@@ -66,6 +72,13 @@
         "Bitte data-api-base=\"https://...\" am <script>-Tag setzen."
     );
     return;
+  }
+
+  // Default erst HIER setzen, nicht in der CONFIG-Literal oben -- braucht
+  // das bereits aufgelöste CONFIG.apiBase (avatar.png liegt im selben
+  // /static-Verzeichnis wie diese Datei selbst, siehe main.py app.mount).
+  if (!CONFIG.avatarSrc) {
+    CONFIG.avatarSrc = CONFIG.apiBase + "/static/avatar.png";
   }
 
   // ── Storage (per-Browser, nicht per-Server) ─────────────────────────────
@@ -128,9 +141,23 @@
   style.textContent =
     "#novara-chat-bubble{position:fixed;bottom:20px;right:20px;width:58px;height:58px;" +
     "border-radius:50%;background:" + CONFIG.accentColor + ";color:#fff;border:none;cursor:pointer;" +
-    "box-shadow:0 4px 16px rgba(0,0,0,.3);font-size:26px;z-index:2147483000;" +
+    "box-shadow:0 4px 16px rgba(0,0,0,.3);font-size:26px;z-index:2147483000;overflow:hidden;" +
     "display:flex;align-items:center;justify-content:center;padding:0;transition:transform .15s ease;}" +
     "#novara-chat-bubble:hover{transform:scale(1.06);}" +
+    // :not([hidden]) statt eines nackten Selektors -- sonst schlägt das hier
+    // gesetzte display:block/flex (Autoren-Stylesheet) das UA-Default
+    // [hidden]{display:none} IMMER, unabhängig von der Quellreihenfolge
+    // (Autoren-Regeln schlagen User-Agent-Regeln bei gleicher Spezifität
+    // immer, das ist keine reine Specificity-/Reihenfolge-Frage). Ohne das
+    // bliebe ein per .hidden=true verstecktes Element trotzdem sichtbar.
+    ".chat-avatar-img:not([hidden]){width:100%;height:100%;object-fit:cover;border-radius:50%;display:block;}" +
+    "#novara-chat-avatar-fallback:not([hidden]){width:100%;height:100%;display:flex;align-items:center;" +
+    "justify-content:center;background:linear-gradient(135deg,#0066FF,#C9A84C);color:#fff;" +
+    "font-family:'Space Grotesk',-apple-system,sans-serif;font-weight:700;font-size:22px;}" +
+    "#novara-chat-header-actions{display:flex;align-items:center;gap:10px;}" +
+    "#novara-chat-clear{background:none;border:none;color:#F2F2F8;font-size:15px;cursor:pointer;" +
+    "line-height:1;padding:0;opacity:.55;}" +
+    "#novara-chat-clear:hover{opacity:1;}" +
     "#novara-chat-panel{position:fixed;bottom:90px;right:20px;width:350px;max-width:calc(100vw - 24px);" +
     "height:500px;max-height:calc(100vh - 130px);background:#fff;border-radius:14px;" +
     "box-shadow:0 12px 40px rgba(0,0,0,.3);display:none;flex-direction:column;overflow:hidden;" +
@@ -175,13 +202,32 @@
   bubble.id = "novara-chat-bubble";
   bubble.type = "button";
   bubble.setAttribute("aria-label", "Chat öffnen");
-  bubble.textContent = "💬";
+  bubble.innerHTML =
+    '<img src="' + escapeHtml(CONFIG.avatarSrc) + '" class="chat-avatar-img" alt="" />' +
+    '<span id="novara-chat-avatar-fallback" hidden>N</span>';
+
+  // avatar.png existiert (noch) nicht standardmäßig -- eleganter
+  // Marken-Platzhalter (Gradient + Monogramm) statt eines kaputten
+  // Bild-Icons, bis das echte Memoji-Asset unter static/avatar.png liegt.
+  var avatarImg = bubble.querySelector(".chat-avatar-img");
+  var avatarFallback = bubble.querySelector("#novara-chat-avatar-fallback");
+  avatarImg.addEventListener(
+    "error",
+    function () {
+      avatarImg.hidden = true;
+      avatarFallback.hidden = false;
+    },
+    { once: true }
+  );
 
   var panel = document.createElement("div");
   panel.id = "novara-chat-panel";
   panel.innerHTML =
     '<div id="novara-chat-header"><span>' + escapeHtml(CONFIG.title) + "</span>" +
-    '<button id="novara-chat-close" type="button" aria-label="Schließen">×</button></div>' +
+    '<div id="novara-chat-header-actions">' +
+    '<button id="novara-chat-clear" type="button" aria-label="Verlauf löschen" title="Verlauf löschen">\u{1F5D1}</button>' +
+    '<button id="novara-chat-close" type="button" aria-label="Schließen">×</button>' +
+    "</div></div>" +
     '<div id="novara-chat-messages"></div>' +
     '<div id="novara-chat-input-row">' +
     '<input id="novara-chat-input" type="text" placeholder="Nachricht schreiben..." autocomplete="off" />' +
@@ -195,6 +241,7 @@
   var inputEl = panel.querySelector("#novara-chat-input");
   var sendBtn = panel.querySelector("#novara-chat-send");
   var closeBtn = panel.querySelector("#novara-chat-close");
+  var clearBtn = panel.querySelector("#novara-chat-clear");
 
   function renderMessage(role, text) {
     var div = document.createElement("div");
@@ -242,6 +289,29 @@
   });
   closeBtn.addEventListener("click", function () {
     setOpen(false);
+  });
+
+  // Verlauf/Session zurücksetzen -- für Tests ("von vorn anfangen") oder
+  // falls ein Besucher selbst neu beginnen möchte. Setzt bewusst eine NEUE
+  // session_id: der Server hält ICP-Score/Gesprächsverlauf unter der alten
+  // ID weiter vor (InboundChatSession in agents/sdr_agent.py), verwaist
+  // dort harmlos statt aktiv gelöscht zu werden -- die alte Session fällt
+  // irgendwann unter die Verdrängung durch _MAX_INBOUND_SESSIONS.
+  function resetSession() {
+    history = [];
+    messagesEl.innerHTML = "";
+    var existingCta = document.getElementById("novara-chat-cta");
+    if (existingCta) existingCta.remove();
+    sessionId = uuid();
+    safeSet(STORAGE_KEY_SESSION, sessionId);
+    safeSet(STORAGE_KEY_HISTORY, "[]");
+    renderMessage("bot", CONFIG.greeting);
+  }
+
+  clearBtn.addEventListener("click", function () {
+    if (window.confirm("Verlauf wirklich löschen und neu starten?")) {
+      resetSession();
+    }
   });
 
   // ── Networking ───────────────────────────────────────────────────────────
@@ -326,6 +396,9 @@
     },
     close: function () {
       setOpen(false);
+    },
+    reset: function () {
+      resetSession();
     },
   };
 })();

@@ -33,9 +33,9 @@ class Settings(BaseSettings):
     # InboundChatGraph): Termin-Link, der einem als ICP qualifizierten
     # Besucher zusammen mit should_book_demo=true zurückgegeben wird.
     # Default = derselbe reale Link wie in novara_wissen.txt
-    # ("TERMINBUCHUNG: calendly.com/anton-novaraautomation/30min").
+    # ("TERMINBUCHUNG: https://calendar.app.google/Dqmz7HkW2XNktT6q6").
     demo_booking_url: str = Field(
-        default="https://calendly.com/anton-novaraautomation/30min", alias="DEMO_BOOKING_URL"
+        default="https://calendar.app.google/Dqmz7HkW2XNktT6q6", alias="DEMO_BOOKING_URL"
     )
 
     # Google Calendar (book_appointment tool)

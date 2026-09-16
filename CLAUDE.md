@@ -679,7 +679,7 @@ Session-Store (siehe unten).
 
 // Response
 {"success": true, "session_id": "...", "reply": "...",
- "should_book_demo": true, "booking_url": "https://calendly.com/...",
+ "should_book_demo": true, "booking_url": "https://calendar.app.google/...",
  "icp_score": 82, "dlp_findings": [], "error": null}
 ```
 
