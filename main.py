@@ -20,6 +20,7 @@ import structlog
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Security, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, Field
 
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -30,9 +31,13 @@ from agents.sales_copilot_agent import SalesCopilotAgent
 from agents.sdr_agent import SDRAgent
 from agents.support_agent import SupportAgent
 from agents.voice_agent import VoiceAgent
+from core import consent
 from core.config import settings
+from core.security import SecurityLayer
+from tools import sequence_scheduler
 from tools.calendar_integration import GoogleCalendarTool
 from tools.document_parser import DocumentParser
+from tools.reply_classifier import ReplyClassifier
 
 # ── Logging Setup ─────────────────────────────────────────────────────────────
 
@@ -360,6 +365,107 @@ async def process_invoice_file(
     agent = _AGENT_REGISTRY.get("operations")
     log.info("Processing invoice file", filename=file.filename, session=sid)
     return agent.process(request)
+
+
+# ── Inbound Reply Webhook (SDR-Sequenz) ──────────────────────────────────────
+
+_REPLY_CLASSIFIER = ReplyClassifier()
+_REPLY_CHANNELS = ("email", "linkedin", "voice")
+
+
+class InboundReplyRequest(BaseModel):
+    """Eingehende Antwort auf einen SDR-Outreach (E-Mail-Reply, LinkedIn-Nachricht, ...)."""
+
+    identifier: str = Field(..., min_length=1, description="E-Mail-Adresse oder LinkedIn-URL des Absenders")
+    channel: str = Field(..., description="'email' | 'linkedin' | 'voice' — Kanal, über den die Antwort kam")
+    text: str = Field(..., min_length=1, max_length=8_000)
+    session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+
+
+class InboundReplyResponse(BaseModel):
+    success: bool
+    session_id: str
+    intent: str = ""
+    confidence: float = 0.0
+    rationale: str = ""
+    dlp_findings: list[str] = Field(default_factory=list)
+    sequence_id: Optional[str] = None
+    sequence_status: Optional[str] = None
+    consent_recorded: bool = False
+    error: Optional[str] = None
+
+
+@app.post(
+    "/api/v1/webhooks/inbound-reply",
+    response_model=InboundReplyResponse,
+    tags=["SDR"],
+    summary="Klassifiziert eine eingehende Antwort auf SDR-Outreach (interested/objection/opt_out)",
+    responses={
+        200: {"description": "Antwort klassifiziert und verarbeitet"},
+        401: {"description": "Unauthorized"},
+        422: {"description": "Unbekannter Kanal"},
+    },
+)
+async def inbound_reply_webhook(
+    payload: InboundReplyRequest,
+    _: str = Depends(require_api_key),
+) -> InboundReplyResponse:
+    if payload.channel not in _REPLY_CHANNELS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unbekannter Kanal '{payload.channel}'. Erlaubt: {_REPLY_CHANNELS}",
+        )
+
+    # Input-DLP -- derselbe Schritt, den BaseAgent.process() vor jedem
+    # LLM-Aufruf durchführt (der Text geht ggf. in den ReplyClassifier-
+    # LLM-Fallback ein und muss davor abgesichert sein).
+    input_dlp = SecurityLayer.check_and_redact(payload.text)
+    if not input_dlp.approved:
+        log.warning("Inbound reply blocked by DLP", session=payload.session_id, reason=input_dlp.blocked_reason)
+        return InboundReplyResponse(
+            success=False,
+            session_id=payload.session_id,
+            error=f"Input blocked by DLP: {input_dlp.blocked_reason}",
+        )
+
+    result = _REPLY_CLASSIFIER.classify(input_dlp.redacted_text)
+    log.info(
+        "Inbound reply classified",
+        session=payload.session_id,
+        channel=payload.channel,
+        intent=result.intent,
+        confidence=result.confidence,
+    )
+
+    consent_recorded = False
+    if result.intent == "opt_out":
+        consent.record_opt_out(
+            payload.identifier,
+            payload.channel,
+            reason=f"Antwort klassifiziert als Opt-out ({result.matched_pattern or result.rationale})",
+        )
+        consent_recorded = True
+
+    sequence_id: Optional[str] = None
+    sequence_status: Optional[str] = None
+    if result.intent in ("opt_out", "interested"):
+        seq = sequence_scheduler.find_by_identifier(payload.identifier)
+        if seq is not None:
+            stop_reason = "opt_out" if result.intent == "opt_out" else "interested — Mensch übernimmt"
+            seq = sequence_scheduler.stop(seq.sequence_id, reason=stop_reason)
+            sequence_id, sequence_status = seq.sequence_id, seq.status
+
+    return InboundReplyResponse(
+        success=True,
+        session_id=payload.session_id,
+        intent=result.intent,
+        confidence=result.confidence,
+        rationale=result.rationale,
+        dlp_findings=input_dlp.findings,
+        sequence_id=sequence_id,
+        sequence_status=sequence_status,
+        consent_recorded=consent_recorded,
+    )
 
 
 # ── Voice / Vapi Endpunkte ────────────────────────────────────────────────────

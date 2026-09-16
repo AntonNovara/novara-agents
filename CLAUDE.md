@@ -455,6 +455,64 @@ Kette im SDR-Graph ohne LLM-Aufruf).
 
 ---
 
+## Sequence Scheduler & Reply Classifier (Sprint 2, 15.09.2026)
+
+Schließt den größten funktionalen Rückstand gegenüber Ava/Alice (siehe
+Wettbewerbsanalyse): der SDR-Agent verschickte bisher genau EINE
+Outreach-Nachricht und hatte keinen Mechanismus für Follow-ups oder
+eingehende Antworten.
+
+**`tools/sequence_scheduler.py`** — Multi-Touch-Kadenz mit Retry-Logik pro
+Schritt. Reihenfolge: der Kanal, über den `compose_outreach`/`write_to_crm`
+den Erstkontakt bereits erzeugt hat (Schritt 0, Ergebnis sofort verbucht),
+dann die übrigen Kanäle aus `_FOLLOWUP_ORDER` (E-Mail → LinkedIn → Anruf).
+Ein Schritt bleibt bei Fehlschlag `"pending"` (Retry möglich), solange
+`attempts <= max_retries`; danach `"failed"`, und die Kadenz rückt
+automatisch zum nächsten Schritt vor. Schritte ohne bekannten Identifier
+ODER mit einem Opt-out für ihren Kanal werden beim Enrollment sofort
+`"skipped"`. **Führt selbst nichts zeitgesteuert aus** — es gibt (noch)
+keinen echten Worker, der einen fälligen Schritt automatisch anstößt; in
+Produktion würde ein Cron/Celery-Beat-Prozess periodisch `next_due_step()`
+abfragen. Der `"voice"`-Schritt bleibt IMMER `"skipped"`, weil
+`ProspectContact`/`LeadRecord` aktuell keine Telefonnummer erfassen und es
+ohnehin keinen ausgehenden Dialer gibt (`agents/voice_agent.py` ist
+inbound-only). Prozessweiter In-Memory-Singleton, gleiches Muster wie
+`core/consent.py`.
+
+**`tools/reply_classifier.py`** — klassifiziert eingehende Antworten in
+`interested` | `objection` | `opt_out` | `unclear`. Opt-out wird NICHT dem
+LLM überlassen: ein Regex-Hard-Match läuft zuerst (dieselbe Philosophie wie
+`core/security.py` — eine DSGVO/ePrivacy-relevante Entscheidung braucht eine
+deterministische Garantie). Erst wenn kein Opt-out-Muster greift, entscheidet
+ein LLM-Fallback zwischen `interested` und `objection` (`core.llm.build_llm()`,
+inkl. Demo-Modus).
+
+**Webhook `POST /api/v1/webhooks/inbound-reply`** (`main.py`) — orchestriert
+beide Module plus den Consent-Ledger:
+1. Input-DLP auf den Reply-Text (`SecurityLayer.check_and_redact()`) — exakt
+   derselbe Schritt, den `BaseAgent.process()` vor jedem LLM-Aufruf macht.
+   Ein Hard-Block-Treffer wird abgelehnt, BEVOR der Text den
+   Klassifikations-Prompt erreicht.
+2. `ReplyClassifier.classify()`.
+3. `intent == "opt_out"` → `core.consent.record_opt_out()` für den
+   angegebenen Identifier+Kanal.
+4. `intent in ("opt_out", "interested")` → die laufende Sequenz (gefunden
+   über `sequence_scheduler.find_by_identifier()`) wird per `stop()` sofort
+   beendet — bei Opt-out, weil der Kanal blockiert ist; bei Interesse, weil
+   ab hier ein Mensch übernehmen soll, keine weitere automatisierte Nachricht
+   mehr sinnvoll ist.
+5. `objection`/`unclear` → keine Aktion; die Kadenz läuft normal weiter (der
+   nächste Schritt wird erst fällig, sobald ein künftiger Worker ihn anstößt).
+
+Regressionstests: `test_system.py` TEST 15 (Kadenz-Aufbau, Retry-Erschöpfung,
+Skip-Logik, `stop()`, `find_by_identifier()`-Normalisierung), TEST 16
+(deterministische Opt-out-Muster, LLM-Fallback im Demo-Modus, voller
+Webhook-Pfad inkl. DLP-Block und unbekanntem Kanal — Route-Handler direkt
+aufgerufen statt über `TestClient`, weil `main.py`s Lifespan sonst einen
+echten Anthropic-Egress-Check macht).
+
+---
+
 ## Implementierte Agenten
 
 ### 1. Operations Agent (`agents/operations_agent.py`)
@@ -546,7 +604,8 @@ Qualifiziert eingehende Firmen-Leads, ermittelt Ansprechpartner und erstellt per
 ```
 analyze_input → search_leads → score_lead → [score ≥ 40?]
                                                ├── ja  → check_consent → [Opt-out?]
-                                               │                          ├── nein → compose_outreach → write_to_crm → finalize
+                                               │                          ├── nein → compose_outreach → write_to_crm
+                                               │                          │              → schedule_sequence → finalize
                                                │                          └── ja   → finalize_opted_out
                                                └── nein → finalize_disqualified
 ```
@@ -561,6 +620,7 @@ analyze_input → search_leads → score_lead → [score ≥ 40?]
 | `check_consent` | `core.consent` (Sprint 1, 14.09.2026) | Fragt `is_allowed(identifier, channel)` für E-Mail/LinkedIn-Identifier des Top-Kontakts ab; blockt bei Opt-out |
 | `compose_outreach` | LLM | Hochpersonalisierter E-Mail- oder LinkedIn-Text mit SUBJECT-Parsing; hängt `AI_DISCLOSURE_DE` (Art. 50) deterministisch an |
 | `write_to_crm` | `CRMIntegrationSDR` | Mock → in Prod: HubSpot / Salesforce / Pipedrive |
+| `schedule_sequence` | `tools.sequence_scheduler` (Sprint 2, 15.09.2026) | Meldet den Lead für die Multi-Touch-Kadenz an, verbucht das CRM-Schreibergebnis des Erstkontakts sofort in der Retry-Logik |
 | `finalize_disqualified` | — | Kein CRM-Eintrag, kein Outreach |
 | `finalize_opted_out` | — | Score reicht, aber Opt-out für den Kanal vorhanden: kein Outreach-Text, kein CRM-Eintrag |
 
@@ -581,9 +641,19 @@ analyze_input → search_leads → score_lead → [score ≥ 40?]
 **Tools:**
 - `LeadDatabase` / `ProspectContact` — Mock → in Prod: CRM-API oder LinkedIn Sales Navigator
 - `CRMIntegrationSDR` / `LeadRecord` — Pipeline `outbound-sdr`, Stage `new_lead`
+- `SequenceScheduler` (Sprint 2) — Multi-Touch-Kadenz E-Mail → LinkedIn → Anruf, siehe eigener Abschnitt unten
 
 ```bash
 POST /api/v1/agents/sdr/process
+```
+
+**Reply-Handling (Sprint 2):** Antworten auf einen laufenden Outreach werden
+NICHT vom SDR-Graphen selbst verarbeitet, sondern über einen eigenen
+Webhook, der Klassifikation, Consent-Ledger und Sequence Scheduler
+zusammenführt — siehe Abschnitt "Sequence Scheduler & Reply Classifier"
+unten.
+```bash
+POST /api/v1/webhooks/inbound-reply
 ```
 
 ---
@@ -690,22 +760,24 @@ nicht während:**
   `book_appointment`) werden direkt im Webhook-Handler ausgeführt, ohne
   einen Factory-Agenten zu involvieren.
 
-> **Kritisch: Der Live-Gesprächspfad hat KEINE DLP-Schicht — nicht die
-> abgeschwächte, gar keine.** `VoiceAgent` erbt nicht von `BaseAgent` und
-> importiert `core.security` an keiner Stelle (verifiziert: kein Treffer für
-> `security`/`SecurityLayer`/`DLP`/`sanitize`/`redact` in
-> `agents/voice_agent.py`). `BaseAgent.process()` ist die EINZIGE Stelle, an
-> der `SecurityLayer.check_and_redact()` (Input) und `sanitize_dict()`
-> (Output) aufgerufen werden — und `voice_chat_completions()` in `main.py`
-> ruft `_VOICE_AGENT.stream()`/`.complete()` direkt auf, niemals
-> `BaseAgent.process()`. Alles, was der Anrufer sagt, geht unverändert in
-> den Anthropic-Request: keine PII-Redaktion, kein Credential-Hard-Block,
-> nicht einmal die einfachste Stufe-1-Prompt-Injection-Prüfung. Erst das
-> TRANSKRIPT NACH Gesprächsende durchläuft (via `sdr.process(...)`) die DLP
-> — für die Dauer des eigentlichen Telefonats besteht während des gesamten
-> Live-Gesprächs keinerlei Schutz. Das ist eine strengere Lücke als der in
-> "Security Layer" oben dokumentierte Stufe-2-Restfall (dort existiert
-> wenigstens eine unvollkommene Heuristik; hier existiert keine).
+> **Behoben (Sprint 2, 15.09.2026): Der Live-Gesprächspfad hatte KEINE
+> DLP-Schicht.** `VoiceAgent` erbt weiterhin nicht von `BaseAgent`
+> (`voice_chat_completions()` in `main.py` ruft `_VOICE_AGENT.stream()`/
+> `.complete()` direkt auf, nicht `BaseAgent.process()`) — aber
+> `complete()`/`stream()` schicken jetzt jede User-Nachricht durch
+> `_sanitize_conversation()` (`agents/voice_agent.py`), die pro Turn
+> `SecurityLayer.check_and_redact()` aufruft: normale PII wird wie überall
+> im System behandelt (Kontakt bleibt lesbar, IBAN/Steuernummer/Credentials
+> werden redigiert bzw. hart geblockt), und ein Hard-Block-Treffer stoppt
+> den LLM-Aufruf für den betroffenen Turn komplett — der Anrufer bekommt
+> `_VOICE_BLOCKED_FALLBACK_DE` statt dass der Rohtext je das Modell
+> erreicht. Läuft über die gesamte Historie, nicht nur die neueste
+> Nachricht (Verteidigung in der Tiefe). Vorher ging alles, was der Anrufer
+> sagte, unverändert in den Anthropic-Request; das TRANSKRIPT NACH
+> Gesprächsende durchlief zwar schon vorher (via `sdr.process(...)`) die
+> DLP, aber für die Dauer des eigentlichen Telefonats bestand kein Schutz.
+> Regressionstest: `test_system.py` TEST 17 (Hard-Block-Treffer,
+> normale PII-Behandlung, Assistant-Turns werden nie geprüft).
 >
 > **Absicherung (2026-08-20): Start-Gate statt nur Dokumentation.** Eine
 > Notiz in CLAUDE.md hilft nichts, wenn sie vor einem Redeploy niemand
@@ -723,6 +795,14 @@ nicht während:**
 > da `settings` ein gecachtes Singleton ist): `test_system.py` TEST 11 —
 > ohne Variable MUSS der Start fehlschlagen, mit `VOICE_AGENT_DLP_REVIEWED=true`
 > MUSS er normal funktionieren.
+>
+> **Gate bleibt bestehen, auch nach der DLP-Nachrüstung oben.** Die Existenz
+> von `_sanitize_conversation()` ist keine automatische Freigabe — der Sinn
+> des Gates verschiebt sich von "es gibt hier überhaupt keine Prüfung" zu
+> "die neue Prüfung wurde noch nicht bewusst gegen echte Gesprächsverläufe
+> reviewt" (Deckungsgrad der Heuristik am gesprochenen statt getippten Wort,
+> Verhalten bei sehr langen Gesprächen, ...). `VOICE_AGENT_DLP_REVIEWED`
+> bleibt ein expliziter menschlicher Freigabe-Schritt, kein Auto-Flag.
 
 **Vollständig implementiert, kein Gerüst.** Echte Fehlerbehandlung auf jeder
 Ebene: kaputte JSON-Bodies von Vapi werden abgefangen, Anthropic-Fehler
@@ -782,6 +862,8 @@ novara-agents/
     ├── lead_database.py            # LeadDatabase, 15 Mock-Kontakte, Fuzzy-Suche
     ├── notification_system.py      # NotificationSystem, SentEmail – Mock E-Mail-Versand
     ├── onboarding_tracker.py       # OnboardingTracker, build_checklist(), ChecklistItem
+    ├── reply_classifier.py         # ReplyClassifier — interested/objection/opt_out (Sprint 2)
+    ├── sequence_scheduler.py       # SequenceScheduler — Multi-Touch-Kadenz + Retries (Sprint 2)
     └── ticket_system.py            # TicketSystem, TicketRecord, TicketPriority
 ```
 
@@ -824,4 +906,6 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | LLM-Caching = keins | Anthropic Prompt Caching für wiederholte System-Prompts aktivieren |
 | Kein Rate-Limiting | FastAPI `slowapi` Middleware ergänzen |
 | Consent-Ledger (`core/consent.py`) = In-Memory | Persistenter Store (Postgres/Redis), identische Interface-Methoden |
+| Sequence Scheduler (`tools/sequence_scheduler.py`) = In-Memory, kein Worker | Persistenter Store + Cron/Celery-Beat-Worker, der `next_due_step()` periodisch abfragt |
+| Kein Telefonnummer-Feld in `ProspectContact`/`LeadRecord` | "voice"-Kadenzschritt bleibt dadurch immer `skipped` — Datenmodell um Telefonnummer erweitern |
 | Kein Auth außer API-Key | OAuth2 / JWT für Multi-Tenant-Szenarien |

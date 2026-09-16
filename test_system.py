@@ -222,6 +222,14 @@ def test_sdr_routing(live: bool) -> None:
             info(f"lead_score={score}, qualified={qualified}, DLP={resp.dlp_findings}")
             if qualified and "outreach" in r:
                 ok("Routing qualifiziert → compose_outreach", f"score {score}, Kanal {r['outreach'].get('channel')}")
+                seq = r.get("sequence") or {}
+                if seq.get("sequence_id") and len(seq.get("steps", [])) == 3:
+                    ok(
+                        "schedule_sequence meldet den Lead für die Multi-Touch-Kadenz an",
+                        f"sequence_id={seq['sequence_id']}, steps={[s['channel'] for s in seq['steps']]}",
+                    )
+                else:
+                    fail("schedule_sequence hat keine (vollständige) Sequenz erzeugt", str(seq))
             elif qualified is False:
                 warn("Lead wurde disqualifiziert", f"score {score} (LLM-Bewertung – inhaltlich prüfen)")
             else:
@@ -1226,6 +1234,305 @@ def test_consent_ledger() -> None:
         traceback.print_exc()
 
 
+# ── Test 15: Sequence Scheduler ─────────────────────────────────────────────
+
+def test_sequence_scheduler() -> None:
+    section("TEST 15 — Sequence Scheduler: Multi-Touch-Kadenz, Retries, Skip-Logik")
+    info(
+        "tools/sequence_scheduler.py muss (a) den bereits versendeten Erstkontakt korrekt "
+        "verbuchen, (b) bei Fehlschlag bis max_retries erneut versuchen und danach 'failed' "
+        "markieren und automatisch weiterrücken, (c) Schritte ohne Identifier oder mit "
+        "Opt-out sofort überspringen, und (d) über stop() sofort beendet werden können."
+    )
+    try:
+        from tools.sequence_scheduler import SequenceScheduler
+        import core.consent as consent_module
+    except Exception as exc:
+        fail("Import tools.sequence_scheduler", str(exc))
+        return
+
+    scheduler = SequenceScheduler()
+
+    # 15a: Erstkontakt erfolgreich -> Schritt 0 sofort "sent", Kadenz rückt vor.
+    seq = scheduler.enroll(
+        lead_key="Elektro Test GmbH",
+        identifiers={
+            "email": "seq-test-a@example.at",
+            "linkedin": "linkedin.com/in/seq-test-a",
+            "voice": None,
+        },
+        first_channel="email",
+        first_success=True,
+    )
+    if seq.steps[0].status == "sent" and seq.current_step == 1:
+        ok("Erstkontakt-Schritt wird als 'sent' verbucht, Kadenz rückt zu Schritt 1 vor")
+    else:
+        fail("Erstkontakt-Verbuchung falsch", f"status={seq.steps[0].status}, current_step={seq.current_step}")
+
+    if seq.steps[1].channel == "linkedin" and seq.steps[1].status == "pending":
+        ok("Zweiter Schritt (linkedin) ist 'pending' — Identifier bekannt, kein Opt-out")
+    else:
+        fail("Zweiter Schritt unerwartet", str(seq.steps[1]))
+
+    if seq.steps[2].channel == "voice" and seq.steps[2].status == "skipped":
+        ok("Dritter Schritt (voice) ist 'skipped' — kein Identifier bekannt (kein Dialer vorhanden)")
+    else:
+        fail("Dritter Schritt unerwartet", str(seq.steps[2]))
+
+    # 15b: Retry-Logik — max_retries des linkedin-Schritts ist 1: erster
+    # Fehlschlag bleibt "pending" (Retry erlaubt), zweiter überschreitet die
+    # Grenze -> "failed", Kadenz rückt automatisch weiter.
+    scheduler.record_attempt(seq.sequence_id, 1, success=False, reason="Timeout")
+    if seq.steps[1].status == "pending" and seq.current_step == 1:
+        ok("Erster Fehlschlag bleibt 'pending' (Retry erlaubt, max_retries=1)")
+    else:
+        fail(
+            "Erster Fehlschlag falsch behandelt",
+            f"status={seq.steps[1].status}, current_step={seq.current_step}",
+        )
+
+    scheduler.record_attempt(seq.sequence_id, 1, success=False, reason="Timeout erneut")
+    # current_step rückt nicht nur EINEN Schritt weiter, sondern über den
+    # bereits "skipped" dritten Schritt (voice) gleich bis ans Ende --
+    # _advance() überspringt jede zusammenhängende Folge von
+    # sent/failed/skipped-Schritten in einem Durchlauf.
+    if seq.steps[1].status == "failed" and seq.current_step == len(seq.steps):
+        ok("Zweiter Fehlschlag überschreitet max_retries → 'failed', Kadenz rückt bis ans Ende weiter")
+    else:
+        fail(
+            "Retry-Erschöpfung falsch behandelt",
+            f"status={seq.steps[1].status}, current_step={seq.current_step}",
+        )
+
+    if seq.status == "completed":
+        ok("Sequenz wird 'completed', sobald alle Schritte sent/failed/skipped sind")
+    else:
+        fail("Sequenz-Status falsch", seq.status)
+
+    # 15c: Ein Opt-out VOR dem Enrollment wird sofort respektiert.
+    consent_module.record_opt_out("opted-out@example.at", "linkedin", reason="Testfall TEST 15c")
+    seq2 = scheduler.enroll(
+        lead_key="Opt-out Test GmbH",
+        identifiers={
+            "email": "seq-test-b@example.at",
+            "linkedin": "opted-out@example.at",
+            "voice": None,
+        },
+        first_channel="email",
+        first_success=True,
+    )
+    linkedin_step = next(s for s in seq2.steps if s.channel == "linkedin")
+    if linkedin_step.status == "skipped" and "Opt-out" in linkedin_step.last_reason:
+        ok("Ein Opt-out für einen Kanal wird beim Enrollment sofort respektiert (Schritt 'skipped')")
+    else:
+        fail("Opt-out beim Enrollment nicht respektiert", str(linkedin_step))
+
+    # 15d: stop() beendet eine aktive Sequenz sofort, unabhängig vom Fortschritt.
+    seq3 = scheduler.enroll(
+        lead_key="Stop Test GmbH",
+        identifiers={"email": "seq-test-c@example.at", "linkedin": None, "voice": None},
+        first_channel="email",
+        first_success=True,
+    )
+    stopped = scheduler.stop(seq3.sequence_id, reason="interested — Mensch übernimmt")
+    if stopped.status == "stopped" and stopped.stopped_reason:
+        ok("stop() beendet eine aktive Sequenz sofort", stopped.stopped_reason)
+    else:
+        fail("stop() hat die Sequenz nicht wie erwartet beendet", str(stopped))
+
+    # 15e: find_by_identifier normalisiert (Groß-/Kleinschreibung) und findet die Sequenz.
+    found = scheduler.find_by_identifier("SEQ-TEST-C@EXAMPLE.AT")
+    if found and found.sequence_id == seq3.sequence_id:
+        ok("find_by_identifier normalisiert und findet die richtige Sequenz")
+    else:
+        fail("find_by_identifier hat die Sequenz nicht gefunden", str(found))
+
+
+# ── Test 16: Reply Classifier + Inbound-Reply-Webhook ───────────────────────
+
+def test_reply_classifier_and_webhook() -> None:
+    section("TEST 16 — Reply Classifier + /api/v1/webhooks/inbound-reply")
+    info(
+        "Opt-out MUSS über ein deterministisches Muster erkannt werden, nicht nur per LLM "
+        "(gleiche Philosophie wie core/security.py). Der Webhook muss einen erkannten "
+        "Opt-out automatisch in core.consent registrieren UND eine laufende Sequenz stoppen, "
+        "und einen DLP-Hard-Block-Treffer im eingehenden Text ablehnen, bevor er je den "
+        "Klassifikations-LLM-Prompt erreicht."
+    )
+    try:
+        from tools.reply_classifier import ReplyClassifier
+    except Exception as exc:
+        fail("Import ReplyClassifier", str(exc))
+        return
+
+    classifier = ReplyClassifier()
+
+    opt_out_texts = (
+        "Bitte keine weiteren E-Mails mehr, danke.",
+        "Bitte nicht mehr kontaktieren, wir haben kein Interesse.",
+        "Please unsubscribe me from this list.",
+        "Stop contacting me please.",
+    )
+    for text in opt_out_texts:
+        result = classifier.classify(text)
+        if result.intent == "opt_out" and result.confidence == 1.0:
+            ok("Opt-out deterministisch erkannt", f"text={text!r}")
+        else:
+            fail("Opt-out NICHT erkannt", f"text={text!r}, result={result}")
+
+    # Kein Opt-out-Muster -> LLM-Fallback (im Demo-Modus liefert build_llm() den
+    # Fake-Client zurück; dessen generisches JSON-Feld "intent": "general" ist
+    # nicht in {interested, objection}, muss also sicher auf "unclear" fallen).
+    result = classifier.classify("Klingt interessant, erzählen Sie mir mehr über die Preise.")
+    if result.intent in ("interested", "objection", "unclear"):
+        ok("Kein Opt-out-Muster → LLM-Fallback liefert ein gültiges Intent", str(result.intent))
+    else:
+        fail("LLM-Fallback lieferte ein ungültiges Intent", str(result))
+
+    # Voller Webhook-Pfad — Route-Handler direkt aufgerufen (kein TestClient/
+    # Lifespan nötig, main.py macht sonst einen echten Anthropic-Egress-Check
+    # beim Start, der in dieser Sandbox ohne Netzwerk hängen würde).
+    try:
+        import asyncio
+        import main as main_module
+        import core.consent as consent_module
+        import tools.sequence_scheduler as scheduler_module
+    except Exception as exc:
+        fail("Import main.py für Webhook-Test", str(exc))
+        return
+
+    test_identifier = "webhook-test-lead@example.at"
+    seq = scheduler_module.enroll(
+        lead_key="Webhook Test GmbH",
+        identifiers={"email": test_identifier, "linkedin": None, "voice": None},
+        first_channel="email",
+        first_success=True,
+    )
+
+    async def _call_webhook(text: str, identifier: str = test_identifier, channel: str = "email"):
+        return await main_module.inbound_reply_webhook(
+            main_module.InboundReplyRequest(identifier=identifier, channel=channel, text=text),
+            "test-key",
+        )
+
+    try:
+        resp = asyncio.run(_call_webhook("Bitte keine weiteren E-Mails mehr, danke."))
+        seq_after = scheduler_module.get(seq.sequence_id)
+        if (
+            resp.success
+            and resp.intent == "opt_out"
+            and resp.consent_recorded
+            and resp.sequence_status == "stopped"
+            and seq_after is not None
+            and seq_after.status == "stopped"
+        ):
+            ok(
+                "Webhook: Opt-out registriert Consent UND stoppt die laufende Sequenz",
+                f"intent={resp.intent}, sequence_status={resp.sequence_status}",
+            )
+        else:
+            fail("Webhook Opt-out-Pfad unerwartetes Ergebnis", str(resp))
+
+        if consent_module.is_allowed(test_identifier, "email") is False:
+            ok("core.consent verzeichnet den Opt-out tatsächlich (is_allowed() == False)")
+        else:
+            fail("core.consent hat den Opt-out nicht übernommen")
+    except Exception:
+        fail("Webhook Opt-out-Pfad — Exception", "")
+        traceback.print_exc()
+
+    # DLP-Hard-Block: ein Credential-Leak im Reply-Text darf nie den
+    # Klassifikations-LLM-Prompt erreichen.
+    try:
+        resp = asyncio.run(
+            _call_webhook("api_key: sk-ant-abcdefghijklmnopqrstuvwx", identifier="dlp-test@example.at")
+        )
+        if not resp.success and resp.error and "Input blocked by DLP" in resp.error:
+            ok("Webhook blockt einen Credential-Leak im Reply-Text per Input-DLP", resp.error)
+        else:
+            fail("Webhook hätte den Credential-Leak blocken müssen", str(resp))
+    except Exception:
+        fail("Webhook DLP-Block — Exception", "")
+        traceback.print_exc()
+
+    # Unbekannter Kanal -> 422
+    try:
+        from fastapi import HTTPException
+
+        asyncio.run(_call_webhook("Text", channel="sms"))
+        fail("Webhook hätte bei unbekanntem Kanal 422 werfen müssen")
+    except HTTPException as exc:
+        if exc.status_code == 422:
+            ok("Webhook lehnt einen unbekannten Kanal mit 422 ab")
+        else:
+            fail("Webhook falscher Statuscode für unbekannten Kanal", str(exc.status_code))
+    except Exception:
+        fail("Webhook unbekannter Kanal — unerwartete Exception", "")
+        traceback.print_exc()
+
+
+# ── Test 17: Voice Agent — DLP auf dem Live-Gesprächspfad ───────────────────
+
+def test_voice_agent_dlp_sanitization() -> None:
+    section("TEST 17 — Voice Agent: DLP-Filter auf jeder User-Nachricht vor dem LLM-Aufruf")
+    info(
+        "Schließt den in CLAUDE.md dokumentierten kritischen Gap 'Der "
+        "Live-Gesprächspfad hat KEINE DLP-Schicht': _sanitize_conversation() muss "
+        "(a) einen Hard-Block-Treffer (Credential-Leak, Prompt-Injection) erkennen "
+        "und den blocked_reason zurückgeben, statt den Rohtext durchzulassen, und "
+        "(b) normale PII wie im Rest des Systems behandeln (Kontakt bleibt lesbar, "
+        "IBAN/Steuernummer werden redigiert). Reine Funktionsprüfung, kein echter "
+        "Anthropic-Client nötig (der würde VOICE_AGENT_DLP_REVIEWED voraussetzen)."
+    )
+    try:
+        from agents.voice_agent import _sanitize_conversation
+    except Exception as exc:
+        fail("Import _sanitize_conversation", str(exc))
+        return
+
+    # 17a: Hard-Block-Treffer stoppt den Turn.
+    blocked_history = [
+        {"role": "user", "content": "Hallo, ich rufe wegen der Elektroinstallation an."},
+        {"role": "assistant", "content": "Servus! Wie kann ich helfen?"},
+        {"role": "user", "content": "api_key: sk-ant-abcdefghijklmnopqrstuvwx"},
+    ]
+    sanitized, blocked_reason = _sanitize_conversation(blocked_history)
+    if blocked_reason and "credential" in blocked_reason.lower():
+        ok("Credential-Leak in einer User-Nachricht wird erkannt und blockiert", blocked_reason)
+    else:
+        fail("Credential-Leak wurde NICHT blockiert", f"blocked_reason={blocked_reason!r}")
+
+    # 17b: normale PII wird wie überall im System behandelt (Kontakt bleibt
+    # lesbar, IBAN wird redigiert), kein Hard-Block ausgelöst.
+    normal_history = [
+        {
+            "role": "user",
+            "content": "Meine Telefonnummer ist +43 664 123 45 67, IBAN AT611904300234573201.",
+        },
+    ]
+    sanitized, blocked_reason = _sanitize_conversation(normal_history)
+    if blocked_reason is None:
+        content = sanitized[0]["content"]
+        if "+43 664 123 45 67" in content and "AT611904300234573201" not in content:
+            ok("Normale PII: Telefon bleibt lesbar, IBAN wird redigiert, kein Hard-Block", content)
+        else:
+            fail("Normale PII falsch behandelt", content)
+    else:
+        fail("Normale PII wurde fälschlich blockiert", blocked_reason)
+
+    # 17c: Assistant-Nachrichten werden nie durch die DLP-Prüfung geschickt
+    # (sie sind bereits vom LLM erzeugt bzw. Systemtext, nicht Anrufer-Input).
+    mixed_history = [
+        {"role": "assistant", "content": "api_key: sk-ant-should-not-matter-here-at-all"},
+        {"role": "user", "content": "Ja, das passt."},
+    ]
+    sanitized, blocked_reason = _sanitize_conversation(mixed_history)
+    if blocked_reason is None and sanitized[0]["content"] == mixed_history[0]["content"]:
+        ok("Assistant-Nachrichten laufen unverändert durch (nur User-Turns werden geprüft)")
+    else:
+        fail("Assistant-Nachricht wurde unerwartet verändert oder hat geblockt", f"{sanitized}, {blocked_reason}")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -1254,6 +1561,9 @@ def main() -> int:
     test_output_dlp_enforcement()
     test_ai_disclosure()
     test_consent_ledger()
+    test_sequence_scheduler()
+    test_reply_classifier_and_webhook()
+    test_voice_agent_dlp_sanitization()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

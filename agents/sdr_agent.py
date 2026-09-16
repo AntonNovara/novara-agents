@@ -22,6 +22,8 @@ Workflow (LangGraph StateGraph):
         │         │       ↓                   (EU AI Act Art. 50, siehe AI_DISCLOSURE_DE)
         │         │  write_to_crm     ← CRMIntegrationSDR.upsert_lead()
         │         │       ↓
+        │         │  schedule_sequence ← tools.sequence_scheduler: meldet den Lead für die
+        │         │       ↓                Multi-Touch-Kadenz an (E-Mail/LinkedIn/Anruf, Retries)
         │         │     finalize
         │         │
         │         └── Opt-out hinterlegt
@@ -49,6 +51,7 @@ from core import consent
 from core.config import settings
 from core.knowledge import load_novara_wissen
 from core.llm import build_llm
+from tools import sequence_scheduler
 from tools.crm_integration import CRMIntegrationSDR, LeadRecord
 from tools.lead_database import LeadDatabase, LeadSearchResult, ProspectContact
 
@@ -132,6 +135,9 @@ class SDRState(TypedDict):
 
     # set by write_to_crm
     crm_result: dict
+
+    # set by schedule_sequence
+    sequence_id: str
 
     # final
     final_result: dict
@@ -478,12 +484,39 @@ class SDRGraph:
         result = self._crm.upsert_lead(record)
         return {**state, "crm_result": result.model_dump()}
 
+    # ── Node: schedule_sequence ──────────────────────────────────────────────
+
+    def schedule_sequence(self, state: SDRState) -> SDRState:
+        logger.info("Node: schedule_sequence", extra={"session": state["session_id"]})
+
+        top = state["contacts"][0]
+        identifiers = {
+            "email": top.get("email") or None,
+            "linkedin": top.get("linkedin_url") or None,
+            # ProspectContact/LeadRecord erfassen aktuell keine Telefonnummer
+            # (siehe tools/crm_integration.py, _lead_record_to_sheet_row) --
+            # der "voice"-Schritt bleibt dadurch immer "skipped", bis das
+            # Datenmodell eine Nummer erfasst. Kein automatischer Dialer
+            # existiert ohnehin (agents/voice_agent.py ist inbound-only).
+            "voice": None,
+        }
+        crm_result = state.get("crm_result", {})
+        seq = sequence_scheduler.enroll(
+            lead_key=state["company_name"],
+            identifiers=identifiers,
+            first_channel=state["outreach_channel"],
+            first_success=bool(crm_result.get("success")),
+            first_reason=crm_result.get("message", ""),
+        )
+        return {**state, "sequence_id": seq.sequence_id}
+
     # ── Node: finalize ───────────────────────────────────────────────────────
 
     def finalize(self, state: SDRState) -> SDRState:
         logger.info("Node: finalize", extra={"session": state["session_id"]})
 
         top = state["contacts"][0] if state["contacts"] else {}
+        sequence = sequence_scheduler.get(state.get("sequence_id", ""))
         final: dict[str, Any] = {
             "qualified": True,
             "company": {
@@ -512,6 +545,21 @@ class SDRGraph:
                 "message": state["outreach_text"],
             },
             "crm": state["crm_result"],
+            "sequence": {
+                "sequence_id": sequence.sequence_id,
+                "status": sequence.status,
+                "steps": [
+                    {
+                        "channel": s.channel,
+                        "day_offset": s.day_offset,
+                        "status": s.status,
+                        "attempts": s.attempts,
+                        "max_retries": s.max_retries,
+                        "last_reason": s.last_reason,
+                    }
+                    for s in sequence.steps
+                ],
+            } if sequence else {},
         }
         return {**state, "final_result": final, "error": None}
 
@@ -597,6 +645,7 @@ class SDRGraph:
         graph.add_node("check_consent", self.check_consent)
         graph.add_node("compose_outreach", self.compose_outreach)
         graph.add_node("write_to_crm", self.write_to_crm)
+        graph.add_node("schedule_sequence", self.schedule_sequence)
         graph.add_node("finalize", self.finalize)
         graph.add_node("finalize_disqualified", self.finalize_disqualified)
         graph.add_node("finalize_opted_out", self.finalize_opted_out)
@@ -622,7 +671,8 @@ class SDRGraph:
             },
         )
         graph.add_edge("compose_outreach", "write_to_crm")
-        graph.add_edge("write_to_crm", "finalize")
+        graph.add_edge("write_to_crm", "schedule_sequence")
+        graph.add_edge("schedule_sequence", "finalize")
         graph.add_edge("finalize", END)
         graph.add_edge("finalize_disqualified", END)
         graph.add_edge("finalize_opted_out", END)
@@ -652,6 +702,7 @@ class SDRGraph:
             "outreach_text": "",
             "outreach_subject": "",
             "crm_result": {},
+            "sequence_id": "",
             "final_result": {},
             "error": None,
         }

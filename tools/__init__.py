@@ -6,6 +6,8 @@ from tools.faq_database import FAQDatabase, FAQEntry, FAQSearchResult
 from tools.lead_database import LeadDatabase, ProspectContact, LeadSearchResult
 from tools.notification_system import NotificationSystem, NotificationResult, SentEmail
 from tools.onboarding_tracker import OnboardingTracker, OnboardingRecord, ChecklistItem, build_checklist
+from tools.reply_classifier import ReplyClassifier, ClassificationResult
+from tools.sequence_scheduler import SequenceScheduler, Sequence, StepRecord
 from tools.ticket_system import TicketSystem, TicketRecord, TicketResult, TicketPriority
 
 __all__ = [
@@ -17,5 +19,7 @@ __all__ = [
     "LeadDatabase", "ProspectContact", "LeadSearchResult",
     "NotificationSystem", "NotificationResult", "SentEmail",
     "OnboardingTracker", "OnboardingRecord", "ChecklistItem", "build_checklist",
+    "ReplyClassifier", "ClassificationResult",
+    "SequenceScheduler", "Sequence", "StepRecord",
     "TicketSystem", "TicketRecord", "TicketResult", "TicketPriority",
 ]

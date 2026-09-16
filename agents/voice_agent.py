@@ -9,7 +9,7 @@ import json
 import socket as _socket
 import time
 import uuid
-from typing import Iterator, Any
+from typing import Any, Iterator, Optional
 
 import anthropic
 import httpx
@@ -18,6 +18,7 @@ from anthropic import DefaultHttpxClient
 
 from core.config import settings
 from core.knowledge import load_novara_wissen
+from core.security import SecurityLayer
 
 # Force IPv4 DNS for api.anthropic.com — Railway IPv6 egress fails silently.
 # httpx.HTTPTransport(local_address="0.0.0.0") was unreliable: httpcore creates
@@ -118,6 +119,56 @@ def _with_disclosure_prefix(content: str) -> str:
     return f"{disclosure} {content}" if content else disclosure
 
 
+# DLP für den Live-Gesprächspfad (schließt den in CLAUDE.md dokumentierten
+# kritischen Gap "Der Live-Gesprächspfad hat KEINE DLP-Schicht"). Vapi
+# übernimmt Speech-to-Text selbst -- was hier als `content` einer
+# User-Message ankommt, ist bereits Text, kein Audio. "Audio-zu-Text durch
+# die DLP-Filter schicken" heißt daher konkret: JEDE transkribierte
+# User-Äußerung läuft durch SecurityLayer.check_and_redact(), BEVOR sie ins
+# Anthropic-Prompt einfließt -- exakt dieselbe Prüfung, die BaseAgent.process()
+# für alle textbasierten Agenten schon immer vor jedem LLM-Aufruf durchführt.
+_VOICE_BLOCKED_FALLBACK_DE = (
+    "Entschuldigung, das kann ich am Telefon nicht besprechen. "
+    "Wie kann ich Ihnen sonst weiterhelfen?"
+)
+
+
+def _sanitize_conversation(anthropic_messages: list[dict]) -> tuple[list[dict], Optional[str]]:
+    """
+    Wendet SecurityLayer.check_and_redact() auf jede User-Nachricht an.
+
+    Kontaktdaten (E-Mail/Telefon) bleiben wie überall im System lesbar,
+    sensible Daten (IBAN, Steuernummer, ...) werden redigiert -- der Text,
+    den das LLM sieht, ist also NIE der unveränderte Rohtext des Anrufers.
+
+    Ein Hard-Block-Treffer (Credential-Leak oder Rollenumdefinitions-Versuch
+    mit KI-Identitäts-/Verneinungs-Cue, siehe core/security.py) stoppt den
+    LLM-Aufruf für diesen Turn KOMPLETT -- die zweite Rückgabe ist dann der
+    `blocked_reason`, und der Aufrufer (complete()/stream()) darf die
+    Original-Nachricht nie ans Modell weiterreichen, sondern muss stattdessen
+    _VOICE_BLOCKED_FALLBACK_DE ausgeben. Läuft über die gesamte bisherige
+    Historie, nicht nur die neueste Nachricht -- billige Regex-Prüfung,
+    Verteidigung in der Tiefe falls eine frühere Nachricht aus irgendeinem
+    Grund ungefiltert im Verlauf gelandet wäre.
+    """
+    sanitized: list[dict] = []
+    for m in anthropic_messages:
+        if m["role"] != "user":
+            sanitized.append(m)
+            continue
+        dlp = SecurityLayer.check_and_redact(m["content"])
+        if not dlp.approved:
+            log.warning(
+                "Voice-Turn durch DLP blockiert",
+                blocked_reason=dlp.blocked_reason,
+            )
+            return sanitized, dlp.blocked_reason
+        if dlp.findings:
+            log.info("Voice-Turn: PII redigiert", findings=dlp.findings)
+        sanitized.append({"role": m["role"], "content": dlp.redacted_text})
+    return sanitized, None
+
+
 class VoiceAgent:
     """Streaming-fähiger Konversationsagent für Telefongespräche via Vapi."""
 
@@ -206,23 +257,27 @@ class VoiceAgent:
             if m.get("role") in ("user", "assistant") and m.get("content")
         ]
         first_turn = _is_first_turn(anthropic_messages)
+        anthropic_messages, blocked_reason = _sanitize_conversation(anthropic_messages)
 
-        try:
-            response = self._client.messages.create(
-                model=model,
-                system=_SYSTEM_PROMPT,
-                messages=anthropic_messages,
-                max_tokens=300,
-            )
-            content = response.content[0].text if response.content else ""
-        except Exception as exc:
-            log.error(
-                "Anthropic complete() fehlgeschlagen – Fallback ausgegeben",
-                model=model,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-            content = "Entschuldigung, da ist kurz etwas schiefgelaufen. Können Sie das bitte wiederholen?"
+        if blocked_reason:
+            content = _VOICE_BLOCKED_FALLBACK_DE
+        else:
+            try:
+                response = self._client.messages.create(
+                    model=model,
+                    system=_SYSTEM_PROMPT,
+                    messages=anthropic_messages,
+                    max_tokens=300,
+                )
+                content = response.content[0].text if response.content else ""
+            except Exception as exc:
+                log.error(
+                    "Anthropic complete() fehlgeschlagen – Fallback ausgegeben",
+                    model=model,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                content = "Entschuldigung, da ist kurz etwas schiefgelaufen. Können Sie das bitte wiederholen?"
 
         if first_turn:
             content = _with_disclosure_prefix(content)
@@ -257,6 +312,7 @@ class VoiceAgent:
             if m.get("role") in ("user", "assistant") and m.get("content")
         ]
         first_turn = _is_first_turn(anthropic_messages)
+        anthropic_messages, blocked_reason = _sanitize_conversation(anthropic_messages)
 
         # Erstes Chunk: role
         yield _sse_chunk(completion_id, created, model, {"role": "assistant"}, None)
@@ -267,24 +323,31 @@ class VoiceAgent:
             disclosure = AI_DISCLOSURE_DE.format(client_name=_CLIENT_NAME)
             yield _sse_chunk(completion_id, created, model, {"content": f"{disclosure} "}, None)
 
-        try:
-            with self._client.messages.stream(
-                model=model,
-                system=_SYSTEM_PROMPT,
-                messages=anthropic_messages,
-                max_tokens=300,
-            ) as stream:
-                for text in stream.text_stream:
-                    yield _sse_chunk(completion_id, created, model, {"content": text}, None)
-        except Exception as exc:
-            log.error(
-                "Anthropic stream() fehlgeschlagen – Fallback ausgegeben",
-                model=model,
-                error_type=type(exc).__name__,
-                error=str(exc),
+        if blocked_reason:
+            # Kein LLM-Aufruf mit dem blockierten Rohtext -- deterministische
+            # Ausweich-Antwort statt dass der Versuch je das Modell erreicht.
+            yield _sse_chunk(
+                completion_id, created, model, {"content": _VOICE_BLOCKED_FALLBACK_DE}, None
             )
-            fallback = "Entschuldigung, da ist kurz etwas schiefgelaufen. Können Sie das bitte wiederholen?"
-            yield _sse_chunk(completion_id, created, model, {"content": fallback}, None)
+        else:
+            try:
+                with self._client.messages.stream(
+                    model=model,
+                    system=_SYSTEM_PROMPT,
+                    messages=anthropic_messages,
+                    max_tokens=300,
+                ) as stream:
+                    for text in stream.text_stream:
+                        yield _sse_chunk(completion_id, created, model, {"content": text}, None)
+            except Exception as exc:
+                log.error(
+                    "Anthropic stream() fehlgeschlagen – Fallback ausgegeben",
+                    model=model,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                fallback = "Entschuldigung, da ist kurz etwas schiefgelaufen. Können Sie das bitte wiederholen?"
+                yield _sse_chunk(completion_id, created, model, {"content": fallback}, None)
 
         # Letzter Chunk: finish_reason
         yield _sse_chunk(completion_id, created, model, {}, "stop")
