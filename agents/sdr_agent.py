@@ -1039,13 +1039,17 @@ class InboundChatGraph:
             company=state["company_name"] or contact_fields["company"],
         )
         if new_lead is not None:
-            # Seiteneffekt, darf die Chat-Antwort niemals zum Absturz bringen
-            # -- send_lead_notification() wirft selbst nie, dieses try/except
-            # ist eine zusätzliche Absicherung gegen Fehler in capture()/
-            # mark_notified() selbst.
+            # notify_lead_async() verschickt in einem Hintergrund-Thread und
+            # kehrt sofort zurück (siehe tools/lead_notifier.py) -- finalize()
+            # läuft synchron innerhalb von main.py landing_chat(), das dem
+            # Website-Besucher SOFORT antworten muss. Ein SMTP-Ausfall
+            # (Netzwerk oder Credentials) darf diese Antwort weder verzögern
+            # noch zu einem HTTP 400/500 führen. Dieses try/except ist eine
+            # zusätzliche Absicherung on top von notify_lead_async()s eigenem
+            # try/except (das selbst nie wirft) -- schützt zusätzlich gegen
+            # einen Fehler beim Thread-Start selbst (z. B. Ressourcenlimit).
             try:
-                if lead_notifier.send_lead_notification(new_lead):
-                    lead_capture.mark_notified("landing_chat", state["session_id"])
+                lead_notifier.notify_lead_async(new_lead)
             except Exception as exc:
                 logger.warning("Lead-Benachrichtigung (landing_chat) fehlgeschlagen: %s", exc)
 

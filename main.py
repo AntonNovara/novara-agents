@@ -862,6 +862,16 @@ async def voice_webhook(request: Request):
                     # unabhängig vom SDR-Hintergrundtask oben, damit ein Fehler
                     # hier niemals den bereits abgeschlossenen SDR-Handoff
                     # rückwirkend als fehlgeschlagen erscheinen lässt.
+                    #
+                    # notify_lead_async() (statt send_lead_notification()
+                    # direkt): dieser gesamte Block läuft als asyncio.Task auf
+                    # main.py's Event Loop -- ein synchroner, blockierender
+                    # SMTP-Call HIER würde den Loop für alle anderen
+                    # gleichzeitigen Requests (auch den Landing-Chat!) bis zu
+                    # _SMTP_TIMEOUT_SECONDS lang einfrieren. notify_lead_async()
+                    # verschickt stattdessen in einem separaten Thread und
+                    # kehrt sofort zurück -- der end-of-call-report-Handler
+                    # antwortet Vapi damit unabhängig vom SMTP-Ausgang.
                     try:
                         contact_fields = lead_capture.extract_contact_fields(transcript)
                         new_lead = lead_capture.capture(
@@ -873,8 +883,8 @@ async def voice_webhook(request: Request):
                             phone=contact_fields["phone"],
                             company=contact_fields["company"],
                         )
-                        if new_lead is not None and lead_notifier.send_lead_notification(new_lead):
-                            lead_capture.mark_notified("voice", session_id)
+                        if new_lead is not None:
+                            lead_notifier.notify_lead_async(new_lead)
                     except Exception as lead_exc:
                         log.error("Voice-Lead-Capture fehlgeschlagen", error=str(lead_exc))
 

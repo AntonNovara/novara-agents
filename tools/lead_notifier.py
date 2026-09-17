@@ -8,11 +8,25 @@ funktioniert daher auch auf Railway, wo kein an einen bestimmten Mac
 gebundenes OAuth-Token verfügbar ist. Zielserver: Gmail (smtp.gmail.com:587,
 STARTTLS). Credentials ausschließlich über die Umgebungsvariablen
 SMTP_EMAIL / SMTP_PASSWORD (core/config.py) — niemals hart codiert.
+
+WICHTIG — nie im Request-/Antwortpfad blockieren: `send_lead_notification()`
+ist eine normale synchrone Funktion (leicht unit-testbar), aber ihre
+Aufrufer sitzen beide auf einem Pfad, der dem Endkunden sofort antworten
+muss — main.py landing_chat() (Chat-Antwort an den Website-Besucher) und
+main.py voice_webhook()s end-of-call-report-Handler (Response an Vapi).
+`notify_lead_async()` unten ist deshalb der einzige Aufrufweg, den beide
+Stellen tatsächlich nutzen: sie stößt den SMTP-Versand in einem
+Hintergrund-Thread an und kehrt sofort zurück, ohne auf den Netzwerk-
+Roundtrip (DNS/Connect/TLS/Login/Send, siehe SMTP-Timeout unten) zu warten.
+Ein SMTP-Ausfall (Netzwerk ODER falsche Credentials) landet ausschließlich
+als Warn-Log — er darf niemals die Konversation unterbrechen oder einen
+HTTP 400/500 an den Client bzw. an Vapi auslösen.
 """
 from __future__ import annotations
 
 import logging
 import smtplib
+import threading
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import TYPE_CHECKING
@@ -26,6 +40,12 @@ logger = logging.getLogger(__name__)
 
 _SMTP_HOST = "smtp.gmail.com"
 _SMTP_PORT = 587
+# Kurzes Timeout (DNS+Connect+TLS+Login+Send zusammen) -- ein hängender/
+# langsamer SMTP-Server soll den Hintergrund-Thread nicht unbegrenzt am
+# Leben halten. Wirkt nicht auf die Chat-/Webhook-Latenz (siehe
+# notify_lead_async() unten), begrenzt aber, wie lange ein einzelner
+# Benachrichtigungsversuch im Hintergrund offen bleibt.
+_SMTP_TIMEOUT_SECONDS = 8
 _NOTIFY_RECIPIENT = "anton@novaraautomation.com"
 _SUBJECT = "\U0001f6a8 Nuevo Lead capturado por IA - Novara Automation"
 
@@ -77,7 +97,7 @@ def send_lead_notification(lead: "CapturedLead") -> bool:
     msg.attach(MIMEText(_build_body(lead), "plain", "utf-8"))
 
     try:
-        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=10) as server:
+        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=_SMTP_TIMEOUT_SECONDS) as server:
             server.starttls()
             server.login(smtp_email, smtp_password)
             server.sendmail(smtp_email, [_NOTIFY_RECIPIENT], msg.as_string())
@@ -87,7 +107,50 @@ def send_lead_notification(lead: "CapturedLead") -> bool:
         )
         return True
     except Exception as exc:
+        # Fängt ALLES ab: DNS-Fehler, Verbindungs-Timeout (smtplib respektiert
+        # den obigen timeout=_SMTP_TIMEOUT_SECONDS auf jeder Socket-Operation),
+        # SMTPAuthenticationError bei falschen Credentials, etc. -- der
+        # Aufrufer bekommt so oder so nur True/False, nie eine Exception.
         logger.warning(
-            "Lead-Benachrichtigung fehlgeschlagen: %s", exc, extra={"session": lead.session_id}
+            "Lead-Benachrichtigung fehlgeschlagen (Netzwerk oder Credentials): %s",
+            exc,
+            extra={"session": lead.session_id, "source": lead.source},
         )
         return False
+
+
+def notify_lead_async(lead: "CapturedLead") -> None:
+    """
+    Stößt send_lead_notification() in einem Daemon-Hintergrund-Thread an und
+    kehrt SOFORT zurück -- das ist der einzige Aufrufweg, den
+    agents/sdr_agent.py (InboundChatGraph.finalize(), synchron aus main.py
+    landing_chat() heraus aufgerufen) und main.py (voice_webhook()s
+    end-of-call-report-Handler) tatsächlich benutzen. Beide Aufrufer sitzen
+    auf einem Pfad, der dem Client (Website-Besucher bzw. Vapi) sofort
+    antworten muss; ein SMTP-Roundtrip (bis zu _SMTP_TIMEOUT_SECONDS Sekunden
+    pro Verbindungsschritt) darf diese Antwort nie verzögern, und ein
+    SMTP-Fehler darf sie erst recht nie zu einem HTTP 400/500 machen.
+
+    Markiert den Lead bei Erfolg selbst als benachrichtigt
+    (core.lead_capture.mark_notified()) -- der Aufrufer bekommt wegen der
+    Hintergrundausführung keinen synchronen Rückgabewert mehr, auf den er
+    das stützen könnte. Der try/except um den gesamten Thread-Body ist eine
+    zusätzliche Absicherung on top von send_lead_notification()s eigenem
+    try/except (das selbst nie wirft) -- schützt zusätzlich gegen einen
+    Fehler in mark_notified()/dem Import selbst, damit ein Hintergrund-Thread
+    niemals mit einer unbehandelten Exception endet.
+    """
+    def _run() -> None:
+        try:
+            if send_lead_notification(lead):
+                from core import lead_capture  # lokaler Import: core/lead_capture.py importiert dieses Modul nicht, kein Zyklus
+
+                lead_capture.mark_notified(lead.source, lead.session_id)
+        except Exception as exc:
+            logger.warning(
+                "Lead-Benachrichtigung (Hintergrund-Thread) fehlgeschlagen: %s",
+                exc,
+                extra={"session": lead.session_id, "source": lead.source},
+            )
+
+    threading.Thread(target=_run, name=f"lead-notify-{lead.session_id}", daemon=True).start()
