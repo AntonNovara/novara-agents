@@ -508,6 +508,24 @@ class LandingVisitorInfo(BaseModel):
     phone: str = Field(default="", max_length=50)
 
 
+class LandingAttachment(BaseModel):
+    """
+    Optionaler Anhang (PDF-Angebot, Planungs-Tabelle, Foto einer Baustelle),
+    den ein Besucher im Chat mitschickt — verarbeitet von
+    agents/sdr_agent.py InboundChatGraph.document_node() (Node 2/4, siehe
+    CLAUDE.md, Abschnitt "4-Node-Refactor"). content_base64 ist auf ca.
+    11 MB begrenzt (Base64 inflationiert ~33 % gegenüber den Rohbytes) --
+    document_node() prüft die dekodierte Größe zusätzlich hart gegen
+    _MAX_ATTACHMENT_BYTES (8 MB); die Feldgrenze hier ist nur die erste,
+    billige Abwehr gegen offensichtlich überdimensionierte Payloads auf
+    diesem öffentlichen/unauthentifizierten Endpoint (siehe
+    landing_chat()-Docstring).
+    """
+    filename: str = Field(default="Anhang", max_length=255)
+    mime_type: str = Field(default="", max_length=100)
+    content_base64: str = Field(..., min_length=1, max_length=11_500_000)
+
+
 class LandingChatRequest(BaseModel):
     session_id: str = Field(
         ..., min_length=1, max_length=100,
@@ -515,6 +533,7 @@ class LandingChatRequest(BaseModel):
     )
     message: str = Field(..., min_length=1, max_length=2_000)
     visitor_info: LandingVisitorInfo = Field(default_factory=LandingVisitorInfo)
+    attachment: Optional[LandingAttachment] = None
 
 
 class LandingChatResponse(BaseModel):
@@ -575,6 +594,7 @@ async def landing_chat(payload: LandingChatRequest) -> LandingChatResponse:
             session_id=payload.session_id,
             message=input_dlp.redacted_text,
             visitor_info=payload.visitor_info.model_dump(),
+            attachment=payload.attachment.model_dump() if payload.attachment else None,
         )
     except Exception as exc:
         log.exception("Landing chat failed", session=payload.session_id)

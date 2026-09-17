@@ -1798,15 +1798,19 @@ def test_mcp_server() -> None:
 # ── Test 21: Landing-Page-Chat-Widget / Inbound-SDR ─────────────────────────
 
 def test_inbound_chat(live: bool) -> None:
-    section("TEST 21 — SDR-Agent Inbound-Modus: Landing-Page-Chat-Widget")
+    section("TEST 21 — SDR-Agent Inbound-Modus: Landing-Page-Chat-Widget (4-Node-Graph)")
     info(
-        "InboundChatGraph muss (a) die Session-Store-Obergrenze respektieren "
-        "(älteste Session verworfen statt unbegrenztem Wachstum), (b) die "
-        "EU-AI-Act-Art.-50-Offenlegung nur beim ersten Turn einer Session "
-        "anhängen, (c) should_book_demo/booking_url deterministisch an der "
-        "ICP-Schwelle koppeln und customer_state NUR bei Qualifikation + "
-        "bekanntem Identifier befüllen -- alles ohne LLM-Aufruf testbar, da "
-        "diese Logik in reinem Python-Code sitzt, nicht im Prompt."
+        "InboundChatGraph (receptionist_node → [document_node] → "
+        "appointment_node → supervisor_node) muss (a) die Session-Store-"
+        "Obergrenze respektieren (älteste Session verworfen statt "
+        "unbegrenztem Wachstum), (b) die EU-AI-Act-Art.-50-Offenlegung nur "
+        "beim ersten Turn einer Session anhängen (supervisor_node), (c) "
+        "should_book_demo/booking_url deterministisch an der ICP-Schwelle "
+        "koppeln (appointment_node) und customer_state NUR bei "
+        "Qualifikation + bekanntem Identifier befüllen (supervisor_node), "
+        "(d) jeden Anhang-Fehlerpfad (document_node) graceful abfangen "
+        "statt zu werfen -- alles ohne LLM-Aufruf testbar, da diese Logik "
+        "in reinem Python-Code sitzt, nicht im Prompt."
     )
     try:
         from agents.sdr_agent import (
@@ -1815,6 +1819,7 @@ def test_inbound_chat(live: bool) -> None:
         )
         import agents.sdr_agent as sdr_module
         from core import customer_state
+        import base64 as _b64
     except Exception as exc:
         fail("Import für Inbound-Chat-Test", str(exc))
         return
@@ -1835,27 +1840,36 @@ def test_inbound_chat(live: bool) -> None:
         for sid in ("cap-test-1", "cap-test-2", "cap-test-3"):
             _inbound_sessions.pop(sid, None)
 
-    # llm=None ist hier sicher: apply_disclosure() und finalize() rufen
-    # self._llm nie auf (nur respond_and_qualify() tut das, siehe unten 21d).
+    # llm=None ist hier sicher: document_node() (PDF-Pfad + kein-Anhang-Pfad),
+    # appointment_node() und supervisor_node() rufen self._llm nie auf (nur
+    # receptionist_node() und document_node()s Bild-Pfad tun das -- siehe 21e/21f).
     graph = InboundChatGraph(llm=None)
 
-    # 21b: AI-Act-Offenlegung nur beim ersten Turn.
+    _COMMON_STATE_DEFAULTS = {
+        "attachment": None, "contact_name": "", "document_summary": "",
+        "attachment_error": "", "qualified": False, "booking_url": None,
+    }
+
+    # 21b: AI-Act-Offenlegung nur beim ersten Turn (jetzt Teil von supervisor_node).
     first_state = {
+        **_COMMON_STATE_DEFAULTS,
         "session_id": "disclosure-test", "message": "Was kostet Growth?", "visitor_info": {},
         "history": [], "is_first_turn": True, "turn_count": 0, "created_at": "",
         "reply_text": "Growth kostet 2.490€ einmalig.", "icp_score": 0, "icp_rationale": "",
         "company_name": "", "industry": "", "pain_points": [], "language": "de", "final_result": {},
     }
-    after_first = graph.apply_disclosure(dict(first_state))
+    after_first = graph.supervisor_node(dict(first_state))
     second_state = {**first_state, "is_first_turn": False, "reply_text": "Noch was: der Prozess dauert ca. 2 Wochen."}
-    after_second = graph.apply_disclosure(dict(second_state))
+    after_second = graph.supervisor_node(dict(second_state))
     if "KI-System" in after_first["reply_text"] and "KI-System" not in after_second["reply_text"]:
-        ok("AI-Act-Offenlegung wird nur beim ersten Turn angehängt, nicht bei jeder Antwort")
+        ok("AI-Act-Offenlegung wird nur beim ersten Turn angehängt (supervisor_node), nicht bei jeder Antwort")
     else:
         fail("AI-Act-Offenlegungs-Logik unerwartet", f"first={after_first['reply_text']!r}, second={after_second['reply_text']!r}")
 
-    # 21c: finalize() — qualifiziert vs. nicht, customer_state nur bei Treffer.
+    # 21c: appointment_node() + supervisor_node() — qualifiziert vs. nicht,
+    # customer_state nur bei Treffer.
     base_state = {
+        **_COMMON_STATE_DEFAULTS,
         "session_id": "finalize-test-qualified", "message": "Wir sind ein Elektrikerbetrieb, 5 MA.",
         "visitor_info": {"email": "inbound-test@example.at"}, "history": [], "is_first_turn": False,
         "turn_count": 0, "created_at": "", "reply_text": "Klingt nach einem guten Fit für uns!",
@@ -1863,19 +1877,22 @@ def test_inbound_chat(live: bool) -> None:
         "company_name": "Elektro Test GmbH", "industry": "Elektrikerbetrieb", "pain_points": ["verpasste Anrufe"],
         "language": "de", "final_result": {},
     }
-    qualified_result = graph.finalize(dict(base_state))["final_result"]
+    qualified_result = graph.supervisor_node(graph.appointment_node(dict(base_state)))["final_result"]
     if (
         qualified_result["qualified"] is True
         and qualified_result["should_book_demo"] is True
         and qualified_result["booking_url"]
     ):
-        ok("finalize() setzt should_book_demo=true + booking_url ab der ICP-Schwelle", qualified_result["booking_url"])
+        ok(
+            "appointment_node()+supervisor_node() setzen should_book_demo=true + booking_url ab der ICP-Schwelle",
+            qualified_result["booking_url"],
+        )
     else:
-        fail("finalize() (qualifiziert) unerwartetes Ergebnis", str(qualified_result))
+        fail("appointment_node()/supervisor_node() (qualifiziert) unerwartetes Ergebnis", str(qualified_result))
 
     state_after = customer_state.get(email="inbound-test@example.at")
     if state_after is not None and "sdr" in state_after.stages and state_after.stages["sdr"].data.get("source") == "landing_chat":
-        ok("finalize() schreibt einen customer_state-Snapshot für qualifizierte, identifizierte Besucher")
+        ok("supervisor_node() schreibt einen customer_state-Snapshot für qualifizierte, identifizierte Besucher")
     else:
         fail("customer_state-Snapshot fehlt oder unerwartet", str(state_after))
 
@@ -1885,18 +1902,84 @@ def test_inbound_chat(live: bool) -> None:
         "icp_score": QUALIFICATION_THRESHOLD - 10,
         "visitor_info": {"email": "inbound-unqualified@example.at"},
     }
-    unqualified_result = graph.finalize(dict(unqualified_state))["final_result"]
+    unqualified_result = graph.supervisor_node(graph.appointment_node(dict(unqualified_state)))["final_result"]
     if unqualified_result["qualified"] is False and unqualified_result["should_book_demo"] is False and unqualified_result["booking_url"] is None:
-        ok("finalize() setzt should_book_demo=false + kein booking_url unterhalb der ICP-Schwelle")
+        ok("appointment_node()+supervisor_node() setzen should_book_demo=false + kein booking_url unterhalb der ICP-Schwelle")
     else:
-        fail("finalize() (nicht qualifiziert) unerwartetes Ergebnis", str(unqualified_result))
+        fail("appointment_node()/supervisor_node() (nicht qualifiziert) unerwartetes Ergebnis", str(unqualified_result))
 
     if customer_state.get(email="inbound-unqualified@example.at") is None:
-        ok("finalize() schreibt KEINEN customer_state-Snapshot für nicht qualifizierte Besucher")
+        ok("supervisor_node() schreibt KEINEN customer_state-Snapshot für nicht qualifizierte Besucher")
     else:
         fail("customer_state wurde fälschlich für einen nicht qualifizierten Besucher befüllt")
 
-    # 21d: voller Durchlauf über SDRAgent.process_inbound_chat() inkl. LLM +
+    # 21e: document_node() — jeder Fehlerpfad setzt attachment_error statt zu werfen.
+    doc_base_state = {**base_state, "session_id": "document-node-test"}
+
+    state_none = dict(doc_base_state)  # attachment bereits None über _COMMON_STATE_DEFAULTS
+    result_none = graph.document_node(state_none)
+    if not result_none.get("attachment_error") and not result_none.get("document_summary"):
+        ok("document_node() ohne Anhang ist ein sicherer No-op")
+    else:
+        fail("document_node() (kein Anhang) unerwartetes Ergebnis", str(result_none))
+
+    state_unsupported = {
+        **doc_base_state,
+        "attachment": {"filename": "notiz.txt", "mime_type": "text/plain", "content_base64": _b64.b64encode(b"hallo").decode()},
+    }
+    result_unsupported = graph.document_node(dict(state_unsupported))
+    if result_unsupported.get("attachment_error") and not result_unsupported.get("document_summary"):
+        ok("document_node() lehnt nicht unterstützte Dateitypen sauber ab (attachment_error, kein Crash)")
+    else:
+        fail("document_node() (nicht unterstützter Dateityp) unerwartetes Ergebnis", str(result_unsupported))
+
+    state_bad_b64 = {
+        **doc_base_state,
+        "attachment": {"filename": "x.pdf", "mime_type": "application/pdf", "content_base64": "not-valid-base64!!!"},
+    }
+    result_bad_b64 = graph.document_node(dict(state_bad_b64))
+    if result_bad_b64.get("attachment_error"):
+        ok("document_node() fängt kaputtes Base64 ab, ohne zu werfen")
+    else:
+        fail("document_node() (kaputtes Base64) unerwartetes Ergebnis", str(result_bad_b64))
+
+    oversized_b64 = _b64.b64encode(b"0" * (sdr_module._MAX_ATTACHMENT_BYTES + 1)).decode()
+    state_oversized = {
+        **doc_base_state,
+        "attachment": {"filename": "gross.pdf", "mime_type": "application/pdf", "content_base64": oversized_b64},
+    }
+    result_oversized = graph.document_node(dict(state_oversized))
+    if result_oversized.get("attachment_error"):
+        ok("document_node() lehnt Anhänge über der Größengrenze ab (>8 MB)")
+    else:
+        fail("document_node() (Übergröße) unerwartetes Ergebnis", str(result_oversized))
+
+    original_extract_pdf = sdr_module.DocumentParser.extract_text_from_pdf
+    sdr_module.DocumentParser.extract_text_from_pdf = lambda self, pdf_bytes: "Angebot Novara: Automatisierung, Gesamtbetrag 2.490,00 EUR"
+    try:
+        state_pdf = {
+            **doc_base_state,
+            "attachment": {"filename": "angebot.pdf", "mime_type": "application/pdf", "content_base64": _b64.b64encode(b"%PDF-1.4 fake").decode()},
+        }
+        result_pdf = graph.document_node(dict(state_pdf))
+    finally:
+        sdr_module.DocumentParser.extract_text_from_pdf = original_extract_pdf
+    if result_pdf.get("document_summary") and not result_pdf.get("attachment_error"):
+        ok("document_node() extrahiert PDF-Text korrekt (DocumentParser gemockt)", result_pdf["document_summary"][:80])
+    else:
+        fail("document_node() (PDF happy path) unerwartetes Ergebnis", str(result_pdf))
+
+    state_image_no_llm = {
+        **doc_base_state,
+        "attachment": {"filename": "baustelle.jpg", "mime_type": "image/jpeg", "content_base64": _b64.b64encode(b"\xff\xd8\xff\xe0fake").decode()},
+    }
+    result_image_no_llm = graph.document_node(dict(state_image_no_llm))
+    if result_image_no_llm.get("attachment_error") and not result_image_no_llm.get("document_summary"):
+        ok("document_node() degradiert graceful, wenn kein LLM für die Bildanalyse verfügbar ist")
+    else:
+        fail("document_node() (Bild ohne LLM) unerwartetes Ergebnis", str(result_image_no_llm))
+
+    # 21f: voller Durchlauf über SDRAgent.process_inbound_chat() inkl. LLM +
     # main.py-Endpoint-Logik (DLP) -- nur mit echtem Key, gleiches Muster wie
     # test_sdr_routing() oben.
     if not live:
@@ -1915,7 +1998,7 @@ def test_inbound_chat(live: bool) -> None:
         )
         info(f"icp_score={result.get('icp', {}).get('score')}, should_book_demo={result.get('should_book_demo')}")
         if result.get("reply") and "icp" in result:
-            ok("process_inbound_chat() liefert eine Antwort + ICP-Einschätzung (LLM)", result["reply"][:200])
+            ok("process_inbound_chat() liefert eine Antwort + ICP-Einschätzung (LLM, 4-Node-Graph)", result["reply"][:200])
         else:
             fail("process_inbound_chat() unerwartetes Ergebnis (live)", str(result))
     except Exception:

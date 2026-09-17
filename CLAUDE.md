@@ -644,6 +644,112 @@ Test-Lead dort anlegen.
 
 ---
 
+## 4-Node-Refactor: InboundChatGraph (17.09.2026)
+
+`InboundChatGraph` (Landing-Page-Chat-Widget, siehe Abschnitt weiter unten)
+war bisher ein 3-Node-Graph (`respond_and_qualify` → `apply_disclosure` →
+`finalize`). Refactor auf eine explizite, benannte 4-Node-Architektur mit
+optionalem Anhang-Pfad:
+
+```
+receptionist_node ──[hat Anhang?]──┬── ja  → document_node ──┐
+                                    └── nein ─────────────────┼→ appointment_node → supervisor_node → END
+```
+
+**1. `receptionist_node`** (vormals `respond_and_qualify`, Logik
+unverändert) — Begrüßung/Antwort auf Deutsch oder Englisch, ICP-
+Qualifizierung über den gesamten Gesprächsverlauf. Enthält weiterhin das
+zweistufige try/except aus dem vorherigen Fix (LLM-Aufruf-Fehler →
+generische Entschuldigung; LLM antwortet, aber kein valides JSON → Rohtext
+als Antwort, siehe Abschnitt "Robuste LLM-JSON-Extraktion" unten) —
+**unverändert erhalten**, wie vom Refactor-Auftrag gefordert.
+
+**2. `document_node`** (neu) — Extraktion aus einem optionalen Anhang (PDF-
+Angebot, Planungs-Tabelle, Foto einer Baustelle). Nur erreicht, wenn
+`state["attachment"]` gesetzt ist (`_route_after_receptionist()`, eine
+`add_conditional_edges`-Kante nach `receptionist_node`). Dafür nimmt
+`main.py`s `LandingChatRequest` jetzt ein optionales `attachment`-Feld
+entgegen (`LandingAttachment`: `filename`, `mime_type`, `content_base64`,
+Feldgrenze ~11 MB Base64 ≈ 8 MB Rohbytes). `SDRAgent.process_inbound_chat()`
+und `InboundChatGraph.run()` reichen es unverändert durch.
+
+- `application/pdf` (oder `.pdf`-Dateiname) → `tools.document_parser.
+  DocumentParser.extract_text_from_pdf()` (generische Textextraktion via
+  pdfplumber, bereits vorhanden für den Operations Agent — hier bewusst
+  NICHT die invoice-spezifische `parse_pdf()`, ein "presupuesto" hat andere
+  Feldstruktur als eine Rechnung). Extrahierter Text läuft durch
+  `SecurityLayer.check_and_redact()` (dieselbe DLP-Prüfung wie jede andere
+  Nutzereingabe) und wird auf `_MAX_DOCUMENT_TEXT_CHARS` (4.000 Zeichen)
+  gekappt.
+- `image/*` → ein zusätzlicher `self._llm.invoke()`-Aufruf mit einem
+  Anthropic-Bild-Content-Block (`{"type": "image", "source": {"type":
+  "base64", "media_type": ..., "data": ...}}`) und einem eigenen,
+  freitextigen System-Prompt (`_SYSTEM_DOCUMENT_IMAGE`, bewusst "KEIN JSON"
+  — das hält `_DemoChatModel`s `_expects_json()`-Erkennung im Demo-Modus
+  auf dem Freitext-Zweig). Die Bildbeschreibung läuft ebenfalls durch DLP.
+- Alles andere (unbekannter MIME-Typ, kaputtes Base64, > 8 MB, kaputtes
+  PDF, LLM-Fehler bei der Bildbeschreibung) → `attachment_error` gesetzt,
+  NIE eine Exception. Kein Anhang im State (`None`/leer) → sofortiger
+  No-op (return unverändert), damit ein direkter Testaufruf ohne Anhang
+  nicht fälschlich in den "Dateityp wird nicht unterstützt"-Zweig fällt.
+
+**3. `appointment_node`** (neu, Logik aus dem vorherigen `finalize()`
+herausgelöst) — entscheidet, ob JETZT aktiv der Termin-Link
+(`settings.demo_booking_url`) angeboten wird. "Gestión de la
+disponibilidad" bedeutet hier bewusst KEINE eigene Google-Calendar-
+Verfügbarkeitsabfrage: `demo_booking_url` ist bereits eine selbstbedienende
+Google-Calendar-Terminseite, die ihre eigene Verfügbarkeit verwaltet
+(dieselbe Architekturentscheidung wie der frühere Commit "feat: switch
+booking link to Google Calendar") — eine zusätzliche Custom-Slot-Logik mit
+`tools/calendar_integration.py` (bisher nur vom Voice-Agent für echte
+Termin-Buchungen genutzt) hier würde das nur duplizieren. Identische
+ICP-Schwellenlogik wie vorher.
+
+**4. `supervisor_node`** (neu, vereint das vorherige `apply_disclosure()`
++ den Rest von `finalize()`) — Qualitätskontrolle + defensive JSON-
+Serialisierung:
+1. EU-AI-Act-Art.-50-Offenlegung deterministisch anhängen (identisch zum
+   vorherigen `apply_disclosure()`).
+2. Anhang-Zusammenfassung/-Fehler aus `document_node` deterministisch in
+   die Antwort einweben (kein zweiter LLM-Call) — Erfolg: kurzer
+   Hinweissatz; Fehler: die nutzerverständliche `attachment_error`-Meldung.
+3. Session-Persistenz, Lead-Capture (`core/lead_capture.py`, jetzt inkl.
+   Anhang-Auszug in der Lead-Mail — Anton sieht den Inhalt eines
+   hochgeladenen Angebots direkt in der Benachrichtigung) und
+   `customer_state`-Snapshot — unverändert aus dem vorherigen `finalize()`.
+4. `final_result` über die neue Funktion `_build_defensive_final_result()`
+   gebaut statt eines einzigen dict-Literals: jedes Feld einzeln
+   validiert/gecastet (`_safe_str`/`_safe_list`/`_safe_int`), damit EIN
+   unerwarteter Feldtyp aus einem vorgelagerten Node (z. B. `pain_points`
+   als String statt Liste) nicht das gesamte `final_result` zum Absturz
+   bringt — letzte Verteidigungslinie vor `main.py landing_chat()`, das
+   dieses Ergebnis 1:1 in `LandingChatResponse` einsetzt.
+
+**Kompatibilität:** `POST /api/v1/chat/landing` bleibt abwärtskompatibel —
+`attachment` ist optional, bestehende `chat_widget.js`-Clients ohne dieses
+Feld funktionieren unverändert. `chat_widget.js` selbst hat noch KEINE
+UI zum Hochladen eines Anhangs — der Node ist über die API voll
+funktionsfähig/testbar, aber noch nicht ans Frontend angebunden (siehe
+"Bekannte Einschränkungen" unten).
+
+Regressionstest: `test_system.py` TEST 21, erweitert um 21e (`document_node`:
+kein Anhang → No-op, nicht unterstützter MIME-Typ, kaputtes Base64,
+Übergröße, PDF-Happy-Path mit gemocktem `DocumentParser.
+extract_text_from_pdf`, Bild-Anhang ohne verfügbares LLM → graceful
+degradation). 21b/21c wurden auf die neuen Node-Namen (`supervisor_node`,
+`appointment_node`+`supervisor_node`) umgestellt, decken aber weiterhin
+exakt dieselbe Logik ab wie vorher.
+
+> **Bekannte Einschränkung:** `static/chat_widget.js` bietet noch keine
+> Datei-Upload-UI für `attachment` — Frontend-Arbeit, separat von diesem
+> Backend-Refactor. `document_node`s Bild-Pfad ist nur im Zusammenspiel mit
+> einem echten LLM (Vision-fähiges Claude-Modell) end-to-end getestet
+> (kein dedizierter Live-Test in `test_system.py`, da das echte Bilddaten +
+> gültigen `ANTHROPIC_API_KEY` erfordern würde) — die Graceful-Degradation
+> ohne LLM ist über TEST 21e abgedeckt.
+
+---
+
 ## Robuste LLM-JSON-Extraktion im Inbound-Chat (17.09.2026)
 
 **Behoben: `respond_and_qualify()` warf "Expecting value: line 1 column 1",
@@ -1281,3 +1387,4 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | `static/chat_widget.js` nutzt kein Shadow DOM — CSS-Kollisionen mit sehr aggressiven globalen Host-Seiten-Styles theoretisch möglich | Bei Bedarf auf Shadow-DOM-Kapselung umstellen |
 | Lead-Capture (`core/lead_capture.py`) = In-Memory, kein persistenter Store | Postgres/Redis statt Prozess-Singleton, analog zu Consent-Ledger/Sequence Scheduler/Customer State |
 | Lead-Benachrichtigung (`tools/lead_notifier.py`) = einfaches SMTP-Anwendungspasswort, kein Retry/Queue bei SMTP-Ausfall | Bei Bedarf Retry-Queue oder Wechsel auf einen transaktionalen E-Mail-Dienst (SendGrid/Postmark/SES) |
+| `InboundChatGraph.document_node()` (Anhang-Extraktion) ist über die API voll funktionsfähig, aber `static/chat_widget.js` hat noch keine Upload-UI dafür | Frontend-Arbeit: Datei-Auswahl + Base64-Kodierung im Widget ergänzen, `attachment`-Feld an `/api/v1/chat/landing` mitschicken |

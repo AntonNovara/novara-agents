@@ -49,6 +49,7 @@ keinen Kaltakquise-Kanal und daher keinen Opt-out zu prüfen.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -66,8 +67,10 @@ from core import consent, customer_state, lead_capture
 from core.config import settings
 from core.knowledge import load_novara_wissen
 from core.llm import build_llm, cached_system_message
+from core.security import SecurityLayer
 from tools import lead_notifier, sequence_scheduler
 from tools.crm_integration import CRMIntegrationSDR, LeadRecord
+from tools.document_parser import DocumentParser
 from tools.lead_database import LeadDatabase, LeadSearchResult, ProspectContact
 
 logger = logging.getLogger(__name__)
@@ -998,6 +1001,7 @@ class InboundChatState(TypedDict):
     session_id: str
     message: str                    # DLP-bereinigte Besucher-Nachricht (main.py prüft VOR diesem Aufruf)
     visitor_info: dict[str, Any]    # optionale Formulardaten: name/email/company/phone
+    attachment: Optional[dict[str, Any]]  # optional: {"filename", "mime_type", "content_base64"}, siehe main.py LandingAttachment
 
     # aus der Session geladen, VOR diesem Turn
     history: list[dict[str, str]]
@@ -1005,7 +1009,7 @@ class InboundChatState(TypedDict):
     turn_count: int
     created_at: str
 
-    # von respond_and_qualify gesetzt/aktualisiert
+    # von receptionist_node gesetzt/aktualisiert
     reply_text: str
     icp_score: int
     icp_rationale: str
@@ -1015,22 +1019,118 @@ class InboundChatState(TypedDict):
     contact_name: str        # LLM-extrahierter Besuchername, siehe core/lead_capture.py
     language: str
 
+    # von document_node gesetzt
+    document_summary: str    # extrahierter/beschriebener Anhaltsinhalt, sonst ""
+    attachment_error: str    # nutzerverständliche Fehlermeldung bei fehlgeschlagener Extraktion, sonst ""
+
+    # von appointment_node gesetzt
+    qualified: bool
+    booking_url: Optional[str]
+
     final_result: dict[str, Any]
+
+
+# ── Inbound Chat: Anhang-Extraktion (document_node) ─────────────────────────────
+
+# 8 MB deckt ein mehrseitiges PDF-Angebot oder ein Handy-Foto großzügig ab,
+# begrenzt aber Missbrauch auf diesem öffentlichen/unauthentifizierten
+# Endpoint (siehe main.py landing_chat()-Docstring zum Bedrohungsmodell).
+_MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+# Deckelt, wie viel PDF-Text in den Chat-Kontext/die Lead-Mail einfließt --
+# ein 30-seitiges Angebot soll weder das Token-Budget noch die
+# Benachrichtigungsmail sprengen.
+_MAX_DOCUMENT_TEXT_CHARS = 4_000
+
+_SYSTEM_DOCUMENT_IMAGE = """\
+Du analysierst ein Foto oder einen Screenshot, das ein Website-Besucher im
+Chat mit Novara Automation hochgeladen hat (typisch: Foto einer Baustelle,
+eines handschriftlichen Angebots, einer Excel-Planzeile). Beschreibe in 2-3
+knappen Sätzen auf Deutsch, was zu sehen ist und welche für ein
+Automatisierungs-Erstgespräch relevanten Details erkennbar sind (Zahlen,
+Mengen, Zustand, Firma, ...). Antworte in reinem Fließtext, KEIN JSON.
+Erfinde nichts, das nicht erkennbar ist.
+"""
+
+
+def _build_defensive_final_result(
+    state: InboundChatState, qualified: bool, tier: str, reply: str
+) -> dict[str, Any]:
+    """
+    Baut final_result robust gegen unerwartete Typen in vorgelagerten
+    State-Feldern — jedes Feld einzeln validiert/gecastet statt eines
+    einzigen dict-Literals, das bei EINEM kaputten Feld (z. B. pain_points
+    als String statt Liste, weil ein Node aus irgendeinem Grund einen
+    unerwarteten Wert hinterlassen hat) komplett fehlschlagen würde. Letzte
+    Verteidigungslinie vor main.py landing_chat(), das dieses Ergebnis 1:1
+    in LandingChatResponse einsetzt (Pydantic validiert dort zusätzlich,
+    aber ein sauberes dict hier ist die erste Linie). Gleiche Philosophie
+    wie core/security.py SecurityLayer.sanitize_dict(): die letzte Instanz
+    vor dem Verlassen des Prozesses darf sich nicht blind auf vorgelagerte
+    Nodes verlassen.
+    """
+    def _safe_str(value: Any, default: str = "") -> str:
+        return value if isinstance(value, str) else default
+
+    def _safe_list(value: Any) -> list:
+        return value if isinstance(value, list) else []
+
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "reply": _safe_str(reply),
+        "qualified": bool(qualified),
+        "should_book_demo": bool(qualified),
+        "booking_url": state.get("booking_url") if qualified else None,
+        "icp": {
+            "score": _safe_int(state.get("icp_score"), 0),
+            "tier": _safe_str(tier, "low"),
+            "rationale": _safe_str(state.get("icp_rationale")),
+        },
+        "company": {
+            "name": _safe_str(state.get("company_name")),
+            "industry": _safe_str(state.get("industry")),
+            "pain_points": _safe_list(state.get("pain_points")),
+        },
+        "language": _safe_str(state.get("language"), "de"),
+    }
 
 
 # ── Inbound Chat: Graph ───────────────────────────────────────────────────────
 
 class InboundChatGraph:
-    """LangGraph-Workflow für das Landing-Page-Chat-Widget (Inbound-SDR)."""
+    """
+    LangGraph-Workflow für das Landing-Page-Chat-Widget (Inbound-SDR).
+
+    4-Node-Architektur (Refactor 17.09.2026, siehe CLAUDE.md):
+
+        receptionist_node ──[hat Anhang?]──┬── ja  → document_node ──┐
+                                            └── nein ─────────────────┼→ appointment_node → supervisor_node → END
+
+    1. receptionist_node — Begrüßung/Antwort auf Deutsch oder Englisch,
+       ICP-Qualifizierung, Intent (bisher respond_and_qualify()).
+    2. document_node — Extraktion aus einem optionalen Anhang (PDF-Angebot,
+       Planungs-Tabelle, Foto einer Baustelle). Nur erreicht, wenn ein
+       Anhang mitgeschickt wurde (main.py LandingAttachment).
+    3. appointment_node — entscheidet, ob JETZT aktiv der Termin-Link
+       (settings.demo_booking_url) angeboten wird (bisher Teil von finalize()).
+    4. supervisor_node — EU-AI-Act-Offenlegung, Anhang-Hinweis in die Antwort
+       einweben, Session-Persistenz, Lead-Capture/-Benachrichtigung,
+       defensive JSON-Serialisierung (bisher apply_disclosure() + Rest von
+       finalize()).
+    """
 
     def __init__(self, llm: Any) -> None:
         self._llm = llm
         self._graph = self._build_graph()
 
-    # ── Node: respond_and_qualify ────────────────────────────────────────────
+    # ── Node 1/4: receptionist_node ──────────────────────────────────────────
 
-    def respond_and_qualify(self, state: InboundChatState) -> InboundChatState:
-        logger.info("Node: respond_and_qualify", extra={"session": state["session_id"]})
+    def receptionist_node(self, state: InboundChatState) -> InboundChatState:
+        logger.info("Node: receptionist_node", extra={"session": state["session_id"]})
 
         messages: list = [cached_system_message(_SYSTEM_INBOUND_CHAT)]
         for turn in state["history"]:
@@ -1057,7 +1157,7 @@ class InboundChatGraph:
             # Anthropic-Fehler, ...) -- es gibt keinen Antworttext, der sich
             # retten ließe. Nur hier ist die generische Entschuldigung die
             # einzig ehrliche Antwort.
-            logger.warning("respond_and_qualify: LLM-Aufruf fehlgeschlagen: %s", exc)
+            logger.warning("receptionist_node: LLM-Aufruf fehlgeschlagen: %s", exc)
             return {**state, "reply_text": fallback_reply}
 
         try:
@@ -1080,7 +1180,7 @@ class InboundChatGraph:
             # übrigen Felder bleiben unverändert (monotonic, kein
             # Rückschritt ggü. dem bisherigen Sessionstand).
             logger.warning(
-                "respond_and_qualify: LLM-Antwort war kein valides JSON, nutze Rohtext als Antwort: %s",
+                "receptionist_node: LLM-Antwort war kein valides JSON, nutze Rohtext als Antwort: %s",
                 exc,
             )
             raw_reply = _strip_markdown_fence(response.content) if isinstance(response.content, str) else ""
@@ -1102,39 +1202,149 @@ class InboundChatGraph:
             "language": data.get("language") or state["language"],
         }
 
-    # ── Node: apply_disclosure ───────────────────────────────────────────────
+    # ── Node 2/4: document_node ──────────────────────────────────────────────
 
-    def apply_disclosure(self, state: InboundChatState) -> InboundChatState:
-        logger.info("Node: apply_disclosure", extra={"session": state["session_id"]})
+    def document_node(self, state: InboundChatState) -> InboundChatState:
+        """
+        Extraktion aus einem optionalen Anhang (PDF-Angebot, Planungs-
+        Tabelle, Foto einer Baustelle). Nur erreicht, wenn
+        state["attachment"] gesetzt ist (siehe _route_after_receptionist()).
 
-        # EU AI Act Art. 50: einmal pro Session beim ersten Turn, nicht bei
-        # jeder einzelnen Chat-Antwort -- Letzteres wäre weder von Art. 50
-        # gefordert noch zumutbare Chat-UX. Deterministisch angehängt statt
-        # nur per Prompt-Instruktion, gleiche Philosophie wie compose_outreach()
-        # im Outbound-Flow oben (core/security.py: eine Prompt-Anweisung ist
-        # eine Empfehlung, kein Beweis).
-        reply = state["reply_text"]
+        JEDER Fehlerpfad (kaputtes Base64, zu große Datei, nicht
+        unterstützter Dateityp, kaputtes PDF, LLM-Fehler bei der
+        Bildbeschreibung) setzt attachment_error statt eine Exception zu
+        werfen -- ein fehlgeschlagener Anhang darf die Konversation nie
+        unterbrechen, gleiche Philosophie wie receptionist_node()s
+        zweistufiges try/except.
+        """
+        logger.info("Node: document_node", extra={"session": state["session_id"]})
+        attachment = state.get("attachment")
+        if not attachment:
+            # Sauberer No-op statt "Dateityp '' wird nicht unterstützt" --
+            # _route_after_receptionist() leitet zwar nie ohne Anhang
+            # hierher, aber der Node selbst soll trotzdem defensiv bleiben,
+            # falls er je direkt (z. B. in Tests) ohne Anhang aufgerufen wird.
+            return state
+
+        filename = attachment.get("filename") or "Anhang"
+        mime_type = (attachment.get("mime_type") or "").lower().strip()
+        content_b64 = attachment.get("content_base64", "")
+
+        try:
+            raw_bytes = base64.b64decode(content_b64, validate=True)
+        except Exception as exc:
+            logger.warning("document_node: Base64-Dekodierung fehlgeschlagen: %s", exc)
+            return {**state, "attachment_error": "Die Datei konnte nicht gelesen werden."}
+
+        if len(raw_bytes) > _MAX_ATTACHMENT_BYTES:
+            logger.warning("document_node: Anhang zu groß", extra={"bytes": len(raw_bytes)})
+            return {**state, "attachment_error": "Die Datei ist zu groß (max. 8 MB)."}
+
+        if mime_type == "application/pdf" or filename.lower().endswith(".pdf"):
+            try:
+                text = DocumentParser().extract_text_from_pdf(raw_bytes)
+            except Exception as exc:
+                logger.warning("document_node: PDF-Extraktion fehlgeschlagen: %s", exc)
+                return {**state, "attachment_error": "Das PDF konnte nicht gelesen werden."}
+            # Extrahierter Text ist Fremdinhalt wie jede andere Nutzereingabe
+            # -- dieselbe DLP-Prüfung, die main.py auf `message` bereits VOR
+            # diesem Node durchführt (siehe landing_chat()-Docstring).
+            dlp = SecurityLayer.check_and_redact(text)
+            return {
+                **state,
+                "document_summary": dlp.redacted_text.strip()[:_MAX_DOCUMENT_TEXT_CHARS],
+                "attachment_error": "",
+            }
+
+        if mime_type.startswith("image/"):
+            try:
+                response = self._llm.invoke([
+                    cached_system_message(_SYSTEM_DOCUMENT_IMAGE),
+                    HumanMessage(content=[
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": mime_type, "data": content_b64},
+                        },
+                    ]),
+                ])
+                description = response.content if isinstance(response.content, str) else str(response.content)
+            except Exception as exc:
+                logger.warning("document_node: Bildbeschreibung fehlgeschlagen: %s", exc)
+                return {**state, "attachment_error": "Das Bild konnte nicht analysiert werden."}
+            dlp = SecurityLayer.check_and_redact(description)
+            return {**state, "document_summary": dlp.redacted_text.strip(), "attachment_error": ""}
+
+        logger.info(
+            "document_node: nicht unterstützter Dateityp",
+            # "filename" ist ein reserviertes LogRecord-Attribut (der
+            # Python-logging-Quelldatei-Name) -- ein extra-Key mit demselben
+            # Namen wirft KeyError("Attempt to overwrite 'filename' ...")
+            # beim Logging-Aufruf selbst, siehe Python-Doku zu Logger.info().
+            extra={"mime_type": mime_type, "attachment_filename": filename},
+        )
+        return {**state, "attachment_error": f"Dateityp '{mime_type or 'unbekannt'}' wird aktuell nicht unterstützt."}
+
+    # ── Node 3/4: appointment_node ───────────────────────────────────────────
+
+    def appointment_node(self, state: InboundChatState) -> InboundChatState:
+        """
+        Entscheidet, ob dem Besucher JETZT aktiv ein Termin angeboten wird.
+
+        "Gestión de la disponibilidad" heißt hier bewusst NICHT eine eigene
+        Verfügbarkeitsabfrage gegen Google Calendar -- settings.demo_booking_url
+        ist bereits eine selbstbedienende Google-Calendar-Terminseite (siehe
+        core/config.py), die ihre eigene Verfügbarkeit verwaltet; eine
+        zusätzliche Custom-Slot-Logik hier würde das nur duplizieren
+        (dieselbe Architekturentscheidung wie der frühere Commit "feat:
+        switch booking link to Google Calendar"). Dieser Node entscheidet
+        nur, WANN der Link gezeigt wird -- identische Schwellenlogik wie
+        vorher in finalize() (gleiche ICP-Schwelle wie der Outbound-Flow).
+        """
+        logger.info("Node: appointment_node", extra={"session": state["session_id"]})
+        qualified = state["icp_score"] >= QUALIFICATION_THRESHOLD
+        return {
+            **state,
+            "qualified": qualified,
+            "booking_url": settings.demo_booking_url if qualified else None,
+        }
+
+    # ── Node 4/4: supervisor_node ────────────────────────────────────────────
+
+    def supervisor_node(self, state: InboundChatState) -> InboundChatState:
+        """
+        Qualitätskontrolle + defensive JSON-Serialisierung, letzter Schritt
+        vor der Antwort an main.py landing_chat(). Vereint drei vorher
+        separate Verantwortlichkeiten:
+
+        1. EU-AI-Act-Art.-50-Offenlegung deterministisch anhängen (identische
+           Logik wie das frühere apply_disclosure()).
+        2. Anhang-Zusammenfassung/-Fehler aus document_node deterministisch
+           in die Antwort einweben (kein zweiter LLM-Call).
+        3. final_result über _build_defensive_final_result() bauen statt
+           eines einzigen dict-Literals, das bei einem unerwarteten Feldtyp
+           komplett scheitern würde.
+
+        Übernimmt außerdem Session-Persistenz und Lead-Capture/
+        -Benachrichtigung (vorher Teil von finalize()) -- beides gehört
+        inhaltlich hierher, weil es NACH der endgültigen reply_text-Fassung
+        passieren muss.
+        """
+        logger.info("Node: supervisor_node", extra={"session": state["session_id"]})
+
+        reply = state.get("reply_text") or ""
+        if state.get("attachment_error"):
+            reply = f"{reply}\n\n(Leider konnte ich deinen Anhang nicht verarbeiten: {state['attachment_error']})"
+        elif state.get("document_summary"):
+            reply = f"{reply}\n\n(Ich habe deine Datei erhalten und ausgewertet — das fließt in unser Gespräch ein.)"
+
         if state["is_first_turn"]:
             disclosure = AI_DISCLOSURE_DE.format(client_name=_CLIENT_NAME)
             if disclosure not in reply:
                 reply = f"{reply}\n\n{disclosure}"
-        return {**state, "reply_text": reply}
-
-    # ── Node: finalize ───────────────────────────────────────────────────────
-
-    def finalize(self, state: InboundChatState) -> InboundChatState:
-        logger.info("Node: finalize", extra={"session": state["session_id"]})
-
-        qualified = state["icp_score"] >= QUALIFICATION_THRESHOLD
-        tier = "low"
-        for label, threshold in _ICP_TIER_THRESHOLDS.items():
-            if state["icp_score"] >= threshold:
-                tier = label
-                break
 
         history = state["history"] + [
             {"role": "user", "content": state["message"]},
-            {"role": "assistant", "content": state["reply_text"]},
+            {"role": "assistant", "content": reply},
         ]
         history = history[-_MAX_INBOUND_HISTORY_TURNS:]
 
@@ -1152,15 +1362,21 @@ class InboundChatGraph:
         ))
 
         # Lead-Capture (core/lead_capture.py): unabhängig von der ICP-
-        # Qualifizierung oben -- ein Besucher kann Kontaktdaten nennen, bevor
-        # genug über die Firma bekannt ist, um den ICP-Score zu heben. Regex
-        # (E-Mail/Telefon, deterministisch) + bereits bekannte visitor_info-
-        # Formulardaten + der LLM-extrahierte contact_name aus diesem Turn.
+        # Qualifizierung unten -- ein Besucher kann Kontaktdaten nennen,
+        # bevor genug über die Firma bekannt ist, um den ICP-Score zu heben.
+        # Regex (E-Mail/Telefon, deterministisch) + bereits bekannte
+        # visitor_info-Formulardaten + der LLM-extrahierte contact_name.
+        # Der Anhang-Auszug fließt mit in die Lead-Mail ein (Anton sieht so
+        # z. B. den Inhalt eines hochgeladenen Angebots direkt in der
+        # Benachrichtigung), ohne die Erkennung selbst zu beeinflussen.
         contact_fields = lead_capture.extract_contact_fields(state["message"], state.get("visitor_info"))
+        lead_message = state["message"]
+        if state.get("document_summary"):
+            lead_message = f"{lead_message}\n\n[Anhang-Auszug]\n{state['document_summary']}"
         new_lead = lead_capture.capture(
             source="landing_chat",
             session_id=state["session_id"],
-            message=state["message"],
+            message=lead_message,
             name=state.get("contact_name") or contact_fields["name"],
             email=contact_fields["email"],
             phone=contact_fields["phone"],
@@ -1168,18 +1384,26 @@ class InboundChatGraph:
         )
         if new_lead is not None:
             # notify_lead_async() verschickt in einem Hintergrund-Thread und
-            # kehrt sofort zurück (siehe tools/lead_notifier.py) -- finalize()
-            # läuft synchron innerhalb von main.py landing_chat(), das dem
-            # Website-Besucher SOFORT antworten muss. Ein SMTP-Ausfall
-            # (Netzwerk oder Credentials) darf diese Antwort weder verzögern
-            # noch zu einem HTTP 400/500 führen. Dieses try/except ist eine
-            # zusätzliche Absicherung on top von notify_lead_async()s eigenem
-            # try/except (das selbst nie wirft) -- schützt zusätzlich gegen
-            # einen Fehler beim Thread-Start selbst (z. B. Ressourcenlimit).
+            # kehrt sofort zurück (siehe tools/lead_notifier.py) --
+            # supervisor_node läuft synchron innerhalb von main.py
+            # landing_chat(), das dem Website-Besucher SOFORT antworten
+            # muss. Ein SMTP-Ausfall (Netzwerk oder Credentials) darf diese
+            # Antwort weder verzögern noch zu einem HTTP 400/500 führen.
+            # Dieses try/except ist eine zusätzliche Absicherung on top von
+            # notify_lead_async()s eigenem try/except (das selbst nie
+            # wirft) -- schützt zusätzlich gegen einen Fehler beim
+            # Thread-Start selbst (z. B. Ressourcenlimit).
             try:
                 lead_notifier.notify_lead_async(new_lead)
             except Exception as exc:
                 logger.warning("Lead-Benachrichtigung (landing_chat) fehlgeschlagen: %s", exc)
+
+        qualified = bool(state.get("qualified", False))
+        tier = "low"
+        for label, threshold in _ICP_TIER_THRESHOLDS.items():
+            if state["icp_score"] >= threshold:
+                tier = label
+                break
 
         # customer_state nur schreiben, wenn qualifiziert UND wenigstens ein
         # Identifier bekannt ist -- gleiches Muster wie write_to_crm() im
@@ -1203,46 +1427,48 @@ class InboundChatGraph:
                 agent_session_id=state["session_id"],
             )
 
-        final: dict[str, Any] = {
-            "reply": state["reply_text"],
-            "qualified": qualified,
-            "should_book_demo": qualified,
-            "booking_url": settings.demo_booking_url if qualified else None,
-            "icp": {
-                "score": state["icp_score"],
-                "tier": tier,
-                "rationale": state["icp_rationale"],
-            },
-            "company": {
-                "name": state["company_name"],
-                "industry": state["industry"],
-                "pain_points": state["pain_points"],
-            },
-            "language": state["language"],
-        }
-        return {**state, "final_result": final}
+        final_result = _build_defensive_final_result(state, qualified, tier, reply)
+        return {**state, "reply_text": reply, "final_result": final_result}
+
+    # ── Routing ───────────────────────────────────────────────────────────────
+
+    def _route_after_receptionist(self, state: InboundChatState) -> str:
+        return "document_node" if state.get("attachment") else "appointment_node"
 
     # ── Graph Builder ─────────────────────────────────────────────────────────
 
     def _build_graph(self):
         graph = StateGraph(InboundChatState)
-        graph.add_node("respond_and_qualify", self.respond_and_qualify)
-        graph.add_node("apply_disclosure", self.apply_disclosure)
-        graph.add_node("finalize", self.finalize)
+        graph.add_node("receptionist_node", self.receptionist_node)
+        graph.add_node("document_node", self.document_node)
+        graph.add_node("appointment_node", self.appointment_node)
+        graph.add_node("supervisor_node", self.supervisor_node)
 
-        graph.set_entry_point("respond_and_qualify")
-        graph.add_edge("respond_and_qualify", "apply_disclosure")
-        graph.add_edge("apply_disclosure", "finalize")
-        graph.add_edge("finalize", END)
+        graph.set_entry_point("receptionist_node")
+        graph.add_conditional_edges(
+            "receptionist_node",
+            self._route_after_receptionist,
+            {"document_node": "document_node", "appointment_node": "appointment_node"},
+        )
+        graph.add_edge("document_node", "appointment_node")
+        graph.add_edge("appointment_node", "supervisor_node")
+        graph.add_edge("supervisor_node", END)
 
         return graph.compile()
 
-    def run(self, session_id: str, message: str, visitor_info: dict[str, Any]) -> dict[str, Any]:
+    def run(
+        self,
+        session_id: str,
+        message: str,
+        visitor_info: dict[str, Any],
+        attachment: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         session = _get_inbound_session(session_id)
         initial: InboundChatState = {
             "session_id": session_id,
             "message": message,
             "visitor_info": visitor_info,
+            "attachment": attachment,
             "history": session.history,
             "is_first_turn": len(session.history) == 0,
             "turn_count": session.turn_count,
@@ -1255,6 +1481,10 @@ class InboundChatGraph:
             "pain_points": session.pain_points,
             "contact_name": session.contact_name,
             "language": "de",
+            "document_summary": "",
+            "attachment_error": "",
+            "qualified": False,
+            "booking_url": None,
             "final_result": {},
         }
         final_state = self._graph.invoke(initial)
@@ -1303,7 +1533,11 @@ class SDRAgent(BaseAgent):
         )
 
     def process_inbound_chat(
-        self, session_id: str, message: str, visitor_info: Optional[dict[str, Any]] = None
+        self,
+        session_id: str,
+        message: str,
+        visitor_info: Optional[dict[str, Any]] = None,
+        attachment: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """
         Inbound-Modus für das Landing-Page-Chat-Widget (main.py:
@@ -1317,5 +1551,12 @@ class SDRAgent(BaseAgent):
         läuft bereits VOR diesem Aufruf in main.py -- exakt dasselbe Muster
         wie beim strukturell ähnlichen /api/v1/webhooks/inbound-reply
         (dort ebenfalls kein AgentRequest, aus demselben Grund).
+
+        `attachment` (main.py LandingAttachment.model_dump(), optional) wird
+        unverändert an InboundChatGraph.run() durchgereicht -- document_node
+        (Node 2/4) übernimmt Dekodierung/Größenprüfung/DLP auf den
+        extrahierten Inhalt selbst.
         """
-        return self._inbound.run(session_id=session_id, message=message, visitor_info=visitor_info or {})
+        return self._inbound.run(
+            session_id=session_id, message=message, visitor_info=visitor_info or {}, attachment=attachment
+        )
