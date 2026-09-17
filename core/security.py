@@ -509,6 +509,20 @@ class SecurityLayer:
         return match.group(0) if match else None
 
     @classmethod
+    def extract_phone(cls, text: str) -> Optional[str]:
+        """
+        Bestes-Aufwand-Extraktion der ersten Telefonnummer aus Freitext —
+        analog zu extract_email() oben, für core/lead_capture.py (Landing-
+        Chat + Voice-Transkript). AT zuerst geprüft, nicht DE: Novaras
+        gesamtes ICP ist Wien/Österreich (siehe phone_at-Pattern-Kommentar
+        oben), eine +43-Nummer soll also nicht durch einen breiteren
+        DE-Treffer verdeckt werden, falls beide Muster überlappend zuschlagen
+        würden.
+        """
+        match = _PII_PATTERNS["phone_at"].search(text) or _PII_PATTERNS["phone_de"].search(text)
+        return match.group(0) if match else None
+
+    @classmethod
     def sanitize_dict(cls, data: dict[str, Any]) -> dict[str, Any]:
         """
         Recursively redact PII from all string values in a dict.

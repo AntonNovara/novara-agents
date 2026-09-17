@@ -644,6 +644,81 @@ Test-Lead dort anlegen.
 
 ---
 
+## Einwandbehandlung, Lead-Capture & SMTP-Benachrichtigung (17.09.2026)
+
+Drei zusammenhängende Ergänzungen am Inbound-SDR-Pfad (Landing-Chat +
+Voice), alle mit dem gleichen Ziel: aus einem qualifizierten Gespräch
+zuverlässiger einen echten Termin/Lead machen.
+
+**1. Verkaufs-/Einwandbehandlungs-Regeln in beiden System-Prompts.**
+`_SYSTEM_INBOUND_CHAT` (`agents/sdr_agent.py`) und `_SYSTEM_PROMPT`
+(`agents/voice_agent.py`) enthalten jetzt beide dieselben drei
+SDR-Direktiven: (a) Einwand "zu teuer" → auf ROI/Zeitersparnis/Investition
+lenken, nie erfundene Zahlen, nur Werte aus `novara_wissen.txt`; (b) Einwand
+"KI zu kompliziert"/keine IT-Kenntnisse → "Done-for-you" betonen, 100% von
+Novara umgesetzt; (c) subtile Qualifizierung (Firmengröße ODER größter
+Engpass) VOR dem aktiven Terminangebot, aber nicht als Verhör in der ersten
+Antwort. Reine Prompt-Instruktionen (kein deterministischer Code dahinter,
+anders als z. B. die AI-Act-Offenlegung) — ein LLM kann davon abweichen,
+siehe generelle Einschränkung zu Prompt-Regeln in `core/security.py`.
+
+**2. `core/lead_capture.py`** — In-Memory-Register (Prozess-Singleton
+`_register`, gleiches Muster wie `core/consent.py`), das erkennt, wann ein
+Besucher Kontaktdaten preisgibt, und sie strukturiert speichert
+(`CapturedLead`: `name`, `email`, `phone`, `company`, `message_excerpt`,
+`captured_at`, `notified`). E-Mail/Telefon werden deterministisch per Regex
+erkannt (`SecurityLayer.extract_email()`/neu `extract_phone()` — AT vor DE
+geprüft, Novaras ICP ist Wien/Österreich), `visitor_info`-Formulardaten
+fließen mit ein; der Name kommt NICHT aus Regex, sondern (Landing-Chat) aus
+einem neuen `contact_name`-Feld im JSON-Output von `respond_and_qualify()`
+bzw. bleibt leer (Voice — kein strukturierter Pro-Turn-Output dort).
+Schlüssel ist `(source, session_id)`, NICHT der Kontakt-Identifier selbst
+(anders als `core/consent.py`/`core/customer_state.py`) — es geht um
+"wurde für DIESE Konversation schon benachrichtigt?", nicht um einen
+globalen Kunden-Datensatz; `core.customer_state` übernimmt bereits die
+identifier-basierte Zusammenführung über die Journey. Bewusst UNABHÄNGIG
+von der ICP-Qualifizierung — ein Besucher kann Kontaktdaten nennen, bevor
+der ICP-Score die Schwelle erreicht.
+
+- **Landing-Chat:** `InboundChatGraph.finalize()` ruft nach JEDEM Turn
+  `lead_capture.capture(source="landing_chat", ...)` auf.
+- **Voice:** `main.py`s `end-of-call-report`-Handler (`_run_sdr_bg()`) ruft
+  nach Gesprächsende `lead_capture.capture(source="voice", ...)` auf dem
+  vollständigen Transkript auf — NICHT live pro Turn (der
+  Streaming-Pfad in `agents/voice_agent.py` liefert keine strukturierte
+  JSON-Antwort, siehe dessen Abschnitt oben), sondern an derselben Stelle,
+  an der bereits `sdr.process(transcript)` für den Outbound-Handoff läuft.
+  Eigener try/except, unabhängig vom SDR-Hintergrundtask, damit ein Fehler
+  hier den bereits abgeschlossenen SDR-Handoff nicht rückwirkend als
+  fehlgeschlagen erscheinen lässt.
+
+**3. `tools/lead_notifier.py`** — `send_lead_notification(lead)` verschickt
+bei einer NEUEN Erfassung (`capture()` gibt nur bei Erstfassung oder noch
+nicht erfolgreich benachrichtigten Leads etwas zurück, siehe dessen
+Docstring) eine E-Mail an `anton@novaraautomation.com`
+(Betreff `🚨 Nuevo Lead capturado por IA - Novara Automation`, Kontaktdaten +
+Gesprächsauszug im Body) über `smtplib`/`email.mime` an Gmail
+(`smtp.gmail.com:587`, STARTTLS). Credentials ausschließlich über
+`SMTP_EMAIL`/`SMTP_PASSWORD` (`core/config.py`, `.env.example`) — ein
+Gmail-**Anwendungspasswort**, nicht das normale Konto-Passwort. Bewusst
+NICHT dieselbe Gmail-OAuth-Brücke wie `tools/email_sender.py` (die hängt an
+einem lokal an diesen Mac gebundenen Token und funktioniert nicht auf
+Railway) — einfache SMTP-Credentials sind das einzige E-Mail-Sende-Verfahren
+in diesem Repo, das tatsächlich auf Railway läuft. Wirft NIE: fehlende
+Credentials oder jeder SMTP-Fehler geben `False` zurück und werden nur
+geloggt — ein Benachrichtigungs-Seiteneffekt darf weder die Chat-Antwort an
+den Website-Besucher noch die Webhook-Response an Vapi zum Absturz bringen.
+
+> **Bekannte Einschränkung, gleiches Muster wie die übrigen In-Memory-Stores
+> im Repo:** `core/lead_capture.py` ist Prozess-Singleton, geht bei
+> Neustart verloren. TODO vor Produktivbetrieb: persistenter Store
+> (Postgres/Redis), siehe "Bekannte Einschränkungen" unten. Kein eigener
+> Regressionstest in `test_system.py` — `capture()`/`send_lead_notification()`
+> laufen aber automatisch innerhalb der bestehenden TEST 13/17/21-Läufe mit
+> (dort ohne `SMTP_EMAIL`/`SMTP_PASSWORD`, also über den No-Op-Pfad).
+
+---
+
 ## Landing-Page-Chat-Widget: Inbound-SDR (16.09.2026)
 
 Zweiter, unabhängiger Workflow im SDR-Agenten (`agents/sdr_agent.py`,
@@ -1152,3 +1227,5 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | MCP-Server (`tools/mcp_server.py`) läuft als eigener Prozess mit eigenem In-Memory-Store | Teilt sich nichts mit `main.py`'s Agenten-Prozess (weder Mock-CRM-Daten noch `customer_state`) — vor Produktivbetrieb gemeinsamen persistenten Store einführen |
 | `POST /api/v1/chat/landing` ist öffentlich/unauthentifiziert, `InboundChatSession`-Store (`agents/sdr_agent.py`) = In-Memory mit nur einer groben `_MAX_INBOUND_SESSIONS`-Obergrenze statt echtem Rate-Limiting | FastAPI `slowapi` Middleware speziell für diesen Endpoint + persistenter Session-Store (Redis) vor echtem Produktiv-Traffic |
 | `static/chat_widget.js` nutzt kein Shadow DOM — CSS-Kollisionen mit sehr aggressiven globalen Host-Seiten-Styles theoretisch möglich | Bei Bedarf auf Shadow-DOM-Kapselung umstellen |
+| Lead-Capture (`core/lead_capture.py`) = In-Memory, kein persistenter Store | Postgres/Redis statt Prozess-Singleton, analog zu Consent-Ledger/Sequence Scheduler/Customer State |
+| Lead-Benachrichtigung (`tools/lead_notifier.py`) = einfaches SMTP-Anwendungspasswort, kein Retry/Queue bei SMTP-Ausfall | Bei Bedarf Retry-Queue oder Wechsel auf einen transaktionalen E-Mail-Dienst (SendGrid/Postmark/SES) |

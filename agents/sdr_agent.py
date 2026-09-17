@@ -62,11 +62,11 @@ from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
-from core import consent, customer_state
+from core import consent, customer_state, lead_capture
 from core.config import settings
 from core.knowledge import load_novara_wissen
 from core.llm import build_llm, cached_system_message
-from tools import sequence_scheduler
+from tools import lead_notifier, sequence_scheduler
 from tools.crm_integration import CRMIntegrationSDR, LeadRecord
 from tools.lead_database import LeadDatabase, LeadSearchResult, ProspectContact
 
@@ -785,6 +785,7 @@ class InboundChatSession(BaseModel):
     company_name: str = ""
     industry: str = ""
     pain_points: list[str] = Field(default_factory=list)
+    contact_name: str = ""  # LLM-extrahierter Besuchername, siehe _SYSTEM_INBOUND_CHAT + core/lead_capture.py
     turn_count: int = 0
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -808,14 +809,17 @@ def _save_inbound_session(session: InboundChatSession) -> None:
 # ── Inbound Chat: Prompt ─────────────────────────────────────────────────────
 
 _SYSTEM_INBOUND_CHAT = f"""\
-Du bist der Chat-Assistent auf der Novara-Automation-Landing-Page. Ein
-Website-Besucher chattet direkt mit dir (Inbound, keine Kaltakquise).
+Du bist ein erfahrener SDR (Sales Development Representative) von Novara
+Automation und führst den Chat auf der Novara-Automation-Landing-Page. Ein
+Website-Besucher chattet direkt mit dir (Inbound, keine Kaltakquise) — deine
+Aufgabe ist nicht nur Fragen beantworten, sondern aktiv, aber nie aufdringlich,
+Richtung qualifiziertem Termin verkaufen.
 
 === NOVARA WISSENSDATENBANK (deine EINZIGE Quelle für Fakten) ===
 {_WISSEN}
 === ENDE WISSENSDATENBANK ===
 
-DEINE AUFGABE (zwei Dinge gleichzeitig, in JEDER Antwort):
+DEINE AUFGABE (mehrere Dinge gleichzeitig, in JEDER Antwort):
 1. Beantworte die Frage des Besuchers hilfreich, konkret und im Ton eines
    Kollegen — NUR mit Fakten aus der Wissensdatenbank oben (Pakete, Preise,
    Prozess, Zielgruppe). Erfinde NIEMALS ein Feature, einen Preis oder eine
@@ -824,6 +828,33 @@ DEINE AUFGABE (zwei Dinge gleichzeitig, in JEDER Antwort):
 2. Schätze im Hintergrund den ICP-Fit des Besuchers anhand des GESAMTEN
    bisherigen Gesprächsverlaufs ein (nicht nur der letzten Nachricht) —
    Firma, Branche, Größe, Schmerzpunkte, alles was bisher gesagt wurde.
+3. Behandle Einwände proaktiv nach den Regeln unten und qualifiziere subtil,
+   statt nur zu reagieren.
+4. Dein Endziel in JEDEM Gespräch: den Besucher zu einem Termin über den
+   Buchungslink (DEMO_BOOKING_URL) zu führen, sobald er dafür bereit wirkt.
+
+EINWANDBEHANDLUNG (immer in der Sprache des Besuchers, aber inhaltlich exakt so):
+- Einwand "zu teuer" / Preis zu hoch: Lenke IMMER auf ROI, eingesparte Zeit
+  und den Charakter als Investition statt Ausgabe — z. B. wie viele Stunden
+  manuelle Arbeit oder verpasste Anrufe/Aufträge das Paket im Monat wettmacht.
+  Nenne die Zahlen NUR aus der Wissensdatenbank, erfinde keine ROI-Werte.
+- Einwand "KI ist zu kompliziert" / keine technischen Kenntnisse: Betone
+  ausdrücklich, dass Novara "Done-for-you" ist — zu 100% von uns umgesetzt,
+  der Kunde braucht KEINERLEI IT-Kenntnisse, es entsteht kein zusätzlicher
+  Aufwand für sein Team.
+- Andere Einwände (Zeitpunkt, Vertrauen, "muss das intern abstimmen", ...):
+  ernst nehmen, kurz einordnen, dann sanft zur nächsten Qualifizierungsfrage
+  oder zum Terminvorschlag überleiten — nie einfach stehen lassen.
+
+SUBTILE QUALIFIZIERUNG: Bevor du einen Termin anbietest, versuche im
+natürlichen Gesprächsfluss (nicht als Verhör, nicht in der allerersten
+Antwort) herauszufinden: die ungefähre Firmengröße/Mitarbeiterzahl ODER den
+größten aktuellen Engpass/Schmerzpunkt des Besuchers (z. B. verpasste
+Anrufe, manuelle Angebote, keine Zeit für Admin). Eine dieser beiden
+Informationen reicht, um danach glaubwürdig einen Termin vorzuschlagen.
+Dräng NICHT auf Firmendaten als allererste Reaktion auf eine reine
+Informationsanfrage — beantworte zuerst die eigentliche Frage, aber nutze
+danach eine natürliche Gelegenheit für genau eine kurze Rückfrage.
 
 ICP-Scoring gemäß Wissensdatenbank (identische Skala wie im Outbound-SDR):
   SEHR HOCH (85-100): Elektrikerbetrieb Wien, 1-10 MA, Inhaber auf Baustelle,
@@ -837,11 +868,17 @@ ICP-Scoring gemäß Wissensdatenbank (identische Skala wie im Outbound-SDR):
 
 WICHTIG: Wenn der Besucher noch keine Firmendaten preisgegeben hat, ist ein
 niedriger Score korrekt (nicht raten!) — 0 ist der richtige Default bei
-einer reinen Informationsanfrage ohne jeden Firmenbezug. Dräng NICHT aktiv
-auf Firmendaten ("Wie heißt Ihre Firma?" als erste Reaktion) — beantworte
-zuerst die eigentliche Frage; wenn es sich im Gesprächsfluss natürlich
-ergibt, darfst du eine kurze, beiläufige Rückfrage stellen, aber das ist
-kein Pflichtschritt in jeder Antwort.
+einer reinen Informationsanfrage ohne jeden Firmenbezug.
+
+Sobald der ICP-Fit erkennbar hoch genug ist (siehe Skala oben) UND der
+Besucher mindestens eine Qualifizierungsinfo genannt hat, biete den Termin
+aktiv an — z. B. "Das klingt nach einem guten Fit, am schnellsten klären wir
+das in einem kurzen Erstgespräch, wollen wir das gleich einplanen?" statt nur
+zu warten, bis der Besucher selbst danach fragt.
+
+Wenn der Besucher von sich aus Kontaktdaten nennt (Name, Telefonnummer,
+E-Mail, Firma), bedanke dich kurz dafür und nutze sie natürlich weiter im
+Gespräch — erfinde nie einen Namen oder eine Adresse, die nicht genannt wurde.
 
 Gib AUSSCHLIESSLICH valides JSON zurück (kein Text davor/danach):
 {{
@@ -851,6 +888,8 @@ Gib AUSSCHLIESSLICH valides JSON zurück (kein Text davor/danach):
   "industry": string (z.B. "Elektrikerbetrieb", "Installateur", "Malerbetrieb", ..., sonst ""),
   "company_size": integer oder null,
   "pain_points": [Liste von Strings, max 4, sonst leere Liste],
+  "contact_name": string (Vor-/Nachname des Besuchers, NUR wenn er ihn im
+                   Gespräch tatsächlich genannt hat, sonst ""),
   "icp_score": integer 0-100 (Gesamteinschätzung über das GANZE Gespräch, nicht nur diese Nachricht),
   "icp_rationale": string (1 Satz Begründung auf Deutsch),
   "language": "de" | "en"  (Sprache DIESER Besucher-Nachricht)
@@ -878,6 +917,7 @@ class InboundChatState(TypedDict):
     company_name: str
     industry: str
     pain_points: list[str]
+    contact_name: str        # LLM-extrahierter Besuchername, siehe core/lead_capture.py
     language: str
 
     final_result: dict[str, Any]
@@ -922,6 +962,7 @@ class InboundChatGraph:
                 "company_name": data.get("company_name") or state["company_name"],
                 "industry": data.get("industry") or state["industry"],
                 "pain_points": data.get("pain_points") or state["pain_points"],
+                "contact_name": data.get("contact_name") or state.get("contact_name", ""),
                 # Monotonic: ein einmal erkannter ICP-Fit soll nicht durch
                 # LLM-Rauschen in einer späteren Antwort wieder sinken --
                 # sonst könnte should_book_demo mitten im Gespräch flackern.
@@ -977,9 +1018,36 @@ class InboundChatGraph:
             company_name=state["company_name"],
             industry=state["industry"],
             pain_points=state["pain_points"],
+            contact_name=state.get("contact_name", ""),
             turn_count=state["turn_count"] + 1,
             created_at=state["created_at"],
         ))
+
+        # Lead-Capture (core/lead_capture.py): unabhängig von der ICP-
+        # Qualifizierung oben -- ein Besucher kann Kontaktdaten nennen, bevor
+        # genug über die Firma bekannt ist, um den ICP-Score zu heben. Regex
+        # (E-Mail/Telefon, deterministisch) + bereits bekannte visitor_info-
+        # Formulardaten + der LLM-extrahierte contact_name aus diesem Turn.
+        contact_fields = lead_capture.extract_contact_fields(state["message"], state.get("visitor_info"))
+        new_lead = lead_capture.capture(
+            source="landing_chat",
+            session_id=state["session_id"],
+            message=state["message"],
+            name=state.get("contact_name") or contact_fields["name"],
+            email=contact_fields["email"],
+            phone=contact_fields["phone"],
+            company=state["company_name"] or contact_fields["company"],
+        )
+        if new_lead is not None:
+            # Seiteneffekt, darf die Chat-Antwort niemals zum Absturz bringen
+            # -- send_lead_notification() wirft selbst nie, dieses try/except
+            # ist eine zusätzliche Absicherung gegen Fehler in capture()/
+            # mark_notified() selbst.
+            try:
+                if lead_notifier.send_lead_notification(new_lead):
+                    lead_capture.mark_notified("landing_chat", state["session_id"])
+            except Exception as exc:
+                logger.warning("Lead-Benachrichtigung (landing_chat) fehlgeschlagen: %s", exc)
 
         # customer_state nur schreiben, wenn qualifiziert UND wenigstens ein
         # Identifier bekannt ist -- gleiches Muster wie write_to_crm() im
@@ -1053,6 +1121,7 @@ class InboundChatGraph:
             "company_name": session.company_name,
             "industry": session.industry,
             "pain_points": session.pain_points,
+            "contact_name": session.contact_name,
             "language": "de",
             "final_result": {},
         }

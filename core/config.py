@@ -102,6 +102,19 @@ class Settings(BaseSettings):
     support_escalation_email_live: bool = Field(default=False, alias="SUPPORT_ESCALATION_EMAIL_LIVE")
     support_escalation_email_to: str = Field(default="", alias="SUPPORT_ESCALATION_EMAIL_TO")
 
+    # Lead-Capture-Benachrichtigung (core/lead_capture.py, tools/lead_notifier.py):
+    # Gmail-Anwendungspasswort für den SMTP-Versand, sobald ein Website-Chat-
+    # oder Voice-Besucher Kontaktdaten preisgibt. Bewusst eigenständige,
+    # einfache SMTP-Credentials statt der bestehenden Gmail-OAuth-Brücke
+    # (tools/email_sender.py) — die ist an ein lokales, an diesen Mac
+    # gebundenes OAuth-Token geknüpft und funktioniert NICHT auf Railway;
+    # SMTP_EMAIL/SMTP_PASSWORD sind normale Env-Vars, die auf jedem
+    # Deployment (auch Railway) gesetzt werden können. Ohne beide Werte
+    # überspringt send_lead_notification() den Versand (fail-safe, kein
+    # Absturz des Chat-/Voice-Antwortpfads).
+    smtp_email: SecretStr = Field(default="", alias="SMTP_EMAIL")
+    smtp_password: SecretStr = Field(default="", alias="SMTP_PASSWORD")
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

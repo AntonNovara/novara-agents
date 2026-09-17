@@ -32,10 +32,10 @@ from agents.sales_copilot_agent import SalesCopilotAgent
 from agents.sdr_agent import SDRAgent
 from agents.support_agent import SupportAgent
 from agents.voice_agent import VoiceAgent
-from core import consent
+from core import consent, lead_capture
 from core.config import settings
 from core.security import OutputBlockedError, SecurityLayer
-from tools import sequence_scheduler
+from tools import lead_notifier, sequence_scheduler
 from tools.calendar_integration import GoogleCalendarTool
 from tools.document_parser import DocumentParser
 from tools.reply_classifier import ReplyClassifier
@@ -851,6 +851,32 @@ async def voice_webhook(request: Request):
                         )
                     except Exception as sdr_exc:
                         log.error("SDR-Hintergrundtask fehlgeschlagen", error=str(sdr_exc))
+
+                    # ── Lead-Capture + Benachrichtigung (core/lead_capture.py) ──
+                    # Läuft NACH dem Gespräch auf dem vollen Transkript (anders
+                    # als der Landing-Chat, der pro Turn erfasst) — der
+                    # Live-Gesprächspfad liefert keine strukturierte JSON-
+                    # Antwort pro Turn (siehe agents/voice_agent.py), Regex auf
+                    # das vollständige Transkript ist hier die zuverlässigere
+                    # Stelle für E-Mail/Telefon-Erkennung. Eigener try/except,
+                    # unabhängig vom SDR-Hintergrundtask oben, damit ein Fehler
+                    # hier niemals den bereits abgeschlossenen SDR-Handoff
+                    # rückwirkend als fehlgeschlagen erscheinen lässt.
+                    try:
+                        contact_fields = lead_capture.extract_contact_fields(transcript)
+                        new_lead = lead_capture.capture(
+                            source="voice",
+                            session_id=session_id,
+                            message=transcript,
+                            name=contact_fields["name"],
+                            email=contact_fields["email"],
+                            phone=contact_fields["phone"],
+                            company=contact_fields["company"],
+                        )
+                        if new_lead is not None and lead_notifier.send_lead_notification(new_lead):
+                            lead_capture.mark_notified("voice", session_id)
+                    except Exception as lead_exc:
+                        log.error("Voice-Lead-Capture fehlgeschlagen", error=str(lead_exc))
 
                 asyncio.create_task(_run_sdr_bg())
                 log.info("Voice call → SDR Agent gestartet (async)", session=session_id)
