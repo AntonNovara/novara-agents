@@ -32,6 +32,20 @@
  *                      kennt (z. B. eingeloggter Bereich) -- wird 1:1 als
  *                      visitor_info an den Endpoint durchgereicht.
  *
+ * Datei-Anhänge (PDF/Foto): eine \u{1F4CE}-Büroklammer neben dem Eingabefeld
+ * öffnet die native Dateiauswahl (accept="application/pdf,image/*"). Die
+ * gewählte Datei wird per FileReader.readAsDataURL() im Browser zu Base64
+ * kodiert und als "attachment": {filename, mime_type, content_base64} im
+ * selben POST wie die nächste Chat-Nachricht mitgeschickt -- Gegenstück zu
+ * main.py LandingAttachment / agents/sdr_agent.py InboundChatGraph.
+ * document_node(). Client-seitig auf 8 MB begrenzt (dieselbe Grenze wie
+ * document_node()s _MAX_ATTACHMENT_BYTES) und auf PDF/Bild-MIME-Typen
+ * geprüft -- beides nur eine UX-Vorabprüfung, KEINE Sicherheitsgrenze
+ * (das Skript läuft im Browser jedes Besuchers); document_node() prüft
+ * Größe/Typ/Base64-Validität serverseitig ohnehin erneut. Ein Anhang ohne
+ * Begleittext bekommt automatisch eine Standardnachricht, weil `message`
+ * serverseitig ein Pflichtfeld ist (main.py LandingChatRequest).
+ *
  * Bewusst KEIN Shadow DOM (Einfachheit/"liviano" vor Isolations-Härte) --
  * alle IDs/Klassen sind mit "novara-chat-" präfixiert, um Kollisionen mit
  * dem Rest der Seite unwahrscheinlich zu machen.
@@ -184,9 +198,22 @@
     "#novara-chat-input{flex:1;border:1px solid #d1d5db;border-radius:20px;padding:9px 14px;" +
     "font-size:14px;outline:none;font-family:inherit;}" +
     "#novara-chat-input:focus{border-color:" + CONFIG.accentColor + ";}" +
+    "#novara-chat-attach{background:none;border:none;color:#6b7280;font-size:19px;cursor:pointer;" +
+    "flex-shrink:0;width:34px;height:38px;display:flex;align-items:center;justify-content:center;" +
+    "border-radius:50%;transition:background .15s ease;}" +
+    "#novara-chat-attach:hover{background:#f0f0f3;}" +
+    "#novara-chat-attach:disabled{opacity:.4;cursor:default;}" +
     "#novara-chat-send{background:" + CONFIG.accentColor + ";color:#fff;border:none;border-radius:50%;" +
     "width:38px;height:38px;cursor:pointer;font-size:16px;flex-shrink:0;}" +
     "#novara-chat-send:disabled{opacity:.5;cursor:default;}" +
+    "#novara-chat-attachment-chip{margin:0 12px 8px;padding:7px 10px;background:#f0f0f3;" +
+    "border-radius:8px;font-size:12.5px;color:#333;display:none;align-items:center;gap:8px;}" +
+    "#novara-chat-attachment-chip.novara-visible{display:flex;}" +
+    "#novara-chat-attachment-chip .novara-attachment-name{flex:1;overflow:hidden;text-overflow:ellipsis;" +
+    "white-space:nowrap;}" +
+    "#novara-chat-attachment-remove{background:none;border:none;color:#6b7280;cursor:pointer;" +
+    "font-size:15px;line-height:1;padding:0;flex-shrink:0;}" +
+    "#novara-chat-attachment-remove:hover{color:#1a1a1a;}" +
     "@media (max-width:420px){#novara-chat-panel{right:12px;bottom:84px;}#novara-chat-bubble{right:12px;}}";
   document.head.appendChild(style);
 
@@ -229,7 +256,13 @@
     '<button id="novara-chat-close" type="button" aria-label="Schließen">×</button>' +
     "</div></div>" +
     '<div id="novara-chat-messages"></div>' +
+    '<div id="novara-chat-attachment-chip">' +
+    '<span class="novara-attachment-name"></span>' +
+    '<button id="novara-chat-attachment-remove" type="button" aria-label="Anhang entfernen">×</button>' +
+    "</div>" +
     '<div id="novara-chat-input-row">' +
+    '<input id="novara-chat-file-input" type="file" accept="application/pdf,image/*" hidden />' +
+    '<button id="novara-chat-attach" type="button" aria-label="Datei anhängen" title="PDF oder Foto anhängen">\u{1F4CE}</button>' +
     '<input id="novara-chat-input" type="text" placeholder="Nachricht schreiben..." autocomplete="off" />' +
     '<button id="novara-chat-send" type="button" aria-label="Senden">➤</button>' +
     "</div>";
@@ -242,6 +275,11 @@
   var sendBtn = panel.querySelector("#novara-chat-send");
   var closeBtn = panel.querySelector("#novara-chat-close");
   var clearBtn = panel.querySelector("#novara-chat-clear");
+  var fileInputEl = panel.querySelector("#novara-chat-file-input");
+  var attachBtn = panel.querySelector("#novara-chat-attach");
+  var attachmentChipEl = panel.querySelector("#novara-chat-attachment-chip");
+  var attachmentNameEl = attachmentChipEl.querySelector(".novara-attachment-name");
+  var attachmentRemoveBtn = panel.querySelector("#novara-chat-attachment-remove");
 
   function renderMessage(role, text) {
     var div = document.createElement("div");
@@ -302,6 +340,7 @@
     messagesEl.innerHTML = "";
     var existingCta = document.getElementById("novara-chat-cta");
     if (existingCta) existingCta.remove();
+    clearPendingAttachment();
     sessionId = uuid();
     safeSet(STORAGE_KEY_SESSION, sessionId);
     safeSet(STORAGE_KEY_HISTORY, "[]");
@@ -314,21 +353,119 @@
     }
   });
 
+  // ── Anhänge (PDF/Foto) ───────────────────────────────────────────────────
+  // Gegenstück zu main.py LandingAttachment + agents/sdr_agent.py
+  // InboundChatGraph.document_node(): filename/mime_type/content_base64,
+  // dieselbe Größengrenze (8 MB Rohbytes) wie document_node()s
+  // _MAX_ATTACHMENT_BYTES -- Client-seitig geprüft, damit ein zu großer
+  // Upload gar nicht erst den Server-Roundtrip verbraucht, ändert aber
+  // nichts an der serverseitigen Prüfung (das Widget läuft im Browser
+  // jedes Besuchers, ein Client-Check ist nie die Sicherheitsgrenze).
+  var MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+  var pendingAttachment = null; // {filename, mime_type, content_base64} oder null
+
+  function isSupportedAttachmentType(file) {
+    var type = (file.type || "").toLowerCase();
+    if (type === "application/pdf") return true;
+    if (type.indexOf("image/") === 0) return true;
+    // Manche Browser/Betriebssysteme setzen file.type nicht zuverlässig --
+    // Dateiendung als Fallback, exakt dieselbe PDF-Erkennung wie
+    // document_node() serverseitig (mime_type ODER .pdf-Dateiname).
+    return !type && /\.pdf$/i.test(file.name || "");
+  }
+
+  function renderAttachmentChip() {
+    if (!pendingAttachment) {
+      attachmentChipEl.classList.remove("novara-visible");
+      attachmentNameEl.textContent = "";
+      return;
+    }
+    attachmentNameEl.textContent = "\u{1F4CE} " + pendingAttachment.filename;
+    attachmentChipEl.classList.add("novara-visible");
+  }
+
+  function clearPendingAttachment() {
+    pendingAttachment = null;
+    fileInputEl.value = "";
+    renderAttachmentChip();
+  }
+
+  function handleFileSelected(file) {
+    if (!file) return;
+
+    if (!isSupportedAttachmentType(file)) {
+      renderMessage("bot", "Dieser Dateityp wird nicht unterstützt. Bitte ein PDF oder ein Foto (JPG/PNG) anhängen.");
+      fileInputEl.value = "";
+      return;
+    }
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      renderMessage("bot", "Die Datei ist zu groß (max. 8 MB). Bitte eine kleinere Datei anhängen.");
+      fileInputEl.value = "";
+      return;
+    }
+
+    var reader = new FileReader();
+    reader.onload = function () {
+      // readAsDataURL liefert "data:<mime>;base64,<payload>" -- main.py
+      // LandingAttachment.content_base64 erwartet NUR den Payload-Teil.
+      var result = String(reader.result || "");
+      var commaIndex = result.indexOf(",");
+      var base64Payload = commaIndex >= 0 ? result.slice(commaIndex + 1) : "";
+      if (!base64Payload) {
+        renderMessage("bot", "Die Datei konnte nicht gelesen werden. Bitte versuch es erneut.");
+        return;
+      }
+      pendingAttachment = {
+        filename: file.name || "Anhang",
+        mime_type: file.type || (/\.pdf$/i.test(file.name || "") ? "application/pdf" : ""),
+        content_base64: base64Payload,
+      };
+      renderAttachmentChip();
+      inputEl.focus();
+    };
+    reader.onerror = function () {
+      renderMessage("bot", "Die Datei konnte nicht gelesen werden. Bitte versuch es erneut.");
+    };
+    reader.readAsDataURL(file);
+  }
+
+  attachBtn.addEventListener("click", function () {
+    fileInputEl.click();
+  });
+  fileInputEl.addEventListener("change", function () {
+    handleFileSelected(fileInputEl.files && fileInputEl.files[0]);
+  });
+  attachmentRemoveBtn.addEventListener("click", function () {
+    clearPendingAttachment();
+  });
+
   // ── Networking ───────────────────────────────────────────────────────────
 
   var sending = false;
 
   function sendMessage() {
     var text = inputEl.value.trim();
-    if (!text || sending) return;
+    var attachmentToSend = pendingAttachment;
+    if (!text && !attachmentToSend) return;
+    if (sending) return;
 
-    renderMessage("user", text);
-    history.push({ role: "user", content: text });
+    // message ist serverseitig ein Pflichtfeld (main.py LandingChatRequest,
+    // min_length=1) -- bei einem reinen Datei-Upload ohne Begleittext einen
+    // sinnvollen Default mitschicken statt eine leere Nachricht zu senden.
+    var messageToSend = text || ("Ich habe eine Datei angehängt: " + attachmentToSend.filename);
+    var displayText = attachmentToSend
+      ? (text ? text + "\n\u{1F4CE} " + attachmentToSend.filename : "\u{1F4CE} " + attachmentToSend.filename)
+      : text;
+
+    renderMessage("user", displayText);
+    history.push({ role: "user", content: displayText });
     persistHistory();
     inputEl.value = "";
+    clearPendingAttachment();
 
     sending = true;
     sendBtn.disabled = true;
+    attachBtn.disabled = true;
     var typingEl = renderMessage("bot", "…");
     typingEl.classList.add("novara-msg-typing");
 
@@ -337,13 +474,23 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id: sessionId,
-        message: text,
+        message: messageToSend,
         visitor_info: {
           name: CONFIG.visitorName,
           email: CONFIG.visitorEmail,
           company: CONFIG.visitorCompany,
           phone: "",
         },
+        // Gegenstück zu main.py LandingAttachment -- null, wenn kein Anhang
+        // gewählt wurde (Optional-Feld, Pydantic akzeptiert null wie ein
+        // fehlendes Feld).
+        attachment: attachmentToSend
+          ? {
+              filename: attachmentToSend.filename,
+              mime_type: attachmentToSend.mime_type,
+              content_base64: attachmentToSend.content_base64,
+            }
+          : null,
       }),
     })
       .then(function (res) {
@@ -379,6 +526,7 @@
       .finally(function () {
         sending = false;
         sendBtn.disabled = false;
+        attachBtn.disabled = false;
       });
   }
 
