@@ -644,6 +644,58 @@ Test-Lead dort anlegen.
 
 ---
 
+## Robuste LLM-JSON-Extraktion im Inbound-Chat (17.09.2026)
+
+**Behoben: `respond_and_qualify()` warf "Expecting value: line 1 column 1",
+sobald Claude nicht im geforderten JSON antwortete.** Das alte
+`_parse_llm_json()` versuchte ausschließlich `json.loads(text.strip())`
+(nach optionalem Fence-Strip nur am TEXTANFANG) — reiner Fließtext, in eine
+Fence eingebetteter Fließtext (keine JSON drin), oder JSON mit vorangestelltem
+Erklärtext ("Hier ist die Analyse:\n```json\n{...}") ließen `json.loads` sofort
+mit genau dieser Fehlermeldung scheitern (dem klassischen json-Modul-Fehler
+für "Text beginnt nicht mit einem gültigen JSON-Token"). Der bisherige
+`except Exception`-Block in `respond_and_qualify()` fing das zwar ab und
+verhinderte einen HTTP 500, zeigte dem Website-Besucher aber IMMER die
+generische Entschuldigung ("technisch etwas schiefgelaufen") — selbst wenn
+Claudes Antwort inhaltlich brauchbar war, nur eben nicht JSON-verpackt.
+
+`_parse_llm_json()` ist jetzt dreistufig: (1) direkter `json.loads`-Versuch,
+(2) Codefence-Suche IRGENDWO im Text (nicht nur am Anfang,
+`re.search` statt `str.startswith`-Gate), (3) ein balanciertes
+`{...}`-Objekt irgendwo im Text (`_extract_balanced_json_object()` — zählt
+Klammertiefe manuell, ignoriert Klammern innerhalb von String-Literalen,
+damit z. B. ein reply-Text mit `{`/`}` die Suche nicht verwirrt). Erst wenn
+alle drei Stufen scheitern, wirft die Funktion `ValueError` mit einem
+Text-Ausschnitt für die Logs.
+
+`respond_and_qualify()` unterscheidet jetzt zwei Fehlerarten mit getrennten
+Fallbacks: (a) der LLM-**Aufruf** selbst schlägt fehl (Netzwerk, Rate-Limit,
+Anthropic-Fehler) → generische Entschuldigung, es gibt keinen Text zu
+retten; (b) das LLM **antwortet**, aber `_parse_llm_json()` findet trotz
+aller drei Stufen kein JSON → der rohe Antworttext (nur von einer
+umschließenden Codefence befreit, `_strip_markdown_fence()`) wird direkt als
+`reply_text` verwendet, alle anderen Felder (`icp_score`, `company_name`,
+...) bleiben unverändert auf dem bisherigen Sessionstand (monotonic, kein
+Rückschritt). Der Besucher bekommt so die tatsächliche Antwort des Modells
+statt einer Fehlermeldung, und `should_book_demo`/`booking_url` bleiben
+konsistent mit dem zuletzt bekannten ICP-Score.
+
+`analyze_input`/`search_leads`-Persona (Outbound-Flow, selbe Datei) rufen
+dieselbe `_parse_llm_json()` auf und profitieren automatisch von den
+zusätzlichen Extraktionsstufen — ihre bestehenden Except-Blöcke (feste
+Default-Werte bzw. Fallback-Persona) bleiben unverändert, greifen jetzt aber
+seltener, weil weniger Antworten überhaupt als "kein JSON" durchfallen.
+
+Manuell verifiziert (kein dedizierter Regressionstest in `test_system.py`,
+da reines Parsing ohne LLM-Aufruf): reines JSON, JSON in einer Fence, JSON
+mit vorangestelltem Fließtext, JSON in einer Fence mit umgebendem
+Fließtext, reiner Fließtext ohne jedes JSON, in eine Fence verpackter
+Fließtext, sowie ein leerer String — in allen sieben Fällen entweder
+korrekt geparst oder sauber auf den Rohtext-Fallback zurückgefallen, nie
+eine unbehandelte Exception.
+
+---
+
 ## Einwandbehandlung, Lead-Capture & SMTP-Benachrichtigung (17.09.2026)
 
 Drei zusammenhängende Ergänzungen am Inbound-SDR-Pfad (Landing-Chat +

@@ -105,13 +105,108 @@ _WISSEN = load_novara_wissen()
 
 # ── LLM singleton ─────────────────────────────────────────────────────────────
 
+def _extract_balanced_json_object(text: str) -> Optional[str]:
+    """
+    Findet die erste vollständige, klammer-balancierte '{...}'-Teilzeichenkette
+    in `text`, egal wo sie beginnt. Zählt die Klammertiefe manuell statt einer
+    gierigen Regex (r"\\{.*\\}") zu vertrauen — die würde bei verschachtelten
+    Objekten oder mehreren JSON-Blöcken im selben Text am falschen "}" enden.
+    Ignoriert Klammern innerhalb von String-Literalen (inkl. Escape-Sequenzen),
+    damit ein reply-Text wie "... die {Firma} ..." die Zählung nicht stört.
+    Gibt None zurück, wenn keine öffnende '{' existiert oder die Klammern nie
+    wieder auf Tiefe 0 zurückkehren (abgeschnittene Antwort).
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _strip_markdown_fence(text: str) -> str:
+    """
+    Entfernt eine Markdown-Codefence (```...``` oder ```json...```), falls der
+    GESAMTE getrimmte Text von einer eingeschlossen ist -- ohne jede JSON-
+    Parse-Pflicht. Fallback-Helfer für respond_and_qualify(), wenn das LLM in
+    reinem Fließtext (ggf. in eine Fence verpackt) statt im geforderten JSON
+    geantwortet hat; siehe _parse_llm_json()s Docstring für den Normalfall.
+    """
+    stripped = text.strip()
+    match = re.match(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", stripped, re.DOTALL)
+    return match.group(1).strip() if match else stripped
+
+
 def _parse_llm_json(text: str) -> dict:
-    """Parse JSON from LLM output, stripping markdown code fences if present."""
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*\n?", "", text)
-        text = re.sub(r"\n?```\s*$", "", text)
-    return json.loads(text.strip())
+    """
+    Parst ein JSON-Objekt aus einer LLM-Antwort, mehrstufig und robust gegen
+    reale Claude-Ausgabeformate, die kein reines JSON sind:
+
+    1. Direkter Versuch (`json.loads` auf den getrimmten Text) — der
+       Normalfall, wenn das LLM sich an die Prompt-Vorgabe hält.
+    2. Markdown-Codefence IRGENDWO im Text (nicht nur am Anfang) — Claude
+       stellt einer ```json-Fence gelegentlich erklärenden Fließtext voran
+       ("Hier ist die Analyse:\\n```json\\n{...}\\n```").
+    3. Ein balanciertes '{...}'-Objekt irgendwo im Text (siehe
+       _extract_balanced_json_object) — deckt reinen Fließtext mit
+       eingebettetem JSON ab ("Sicher, hier ist meine Antwort: {...} Lass es
+       mich wissen.") und war der eigentliche Auslöser des Bugs: ein LLM, das
+       in reinem Text ODER unstrukturiertem Markdown ohne jede Fence
+       antwortet, ließ das alte `json.loads(text.strip())` sofort mit
+       "Expecting value: line 1 column 1" scheitern, noch bevor überhaupt
+       nach einem JSON-Objekt gesucht wurde.
+
+    Wirft ValueError mit einer klaren Meldung (inkl. Text-Ausschnitt), wenn
+    sich GAR KEIN JSON-Objekt extrahieren lässt — die Aufrufer (
+    respond_and_qualify, analyze_input, search_leads-Persona) fangen das
+    jeweils ab und wenden ihren eigenen, kontextpassenden Fallback an (siehe
+    deren Except-Blöcke): respond_and_qualify nutzt in diesem Fall den
+    Rohtext selbst als Chat-Antwort (_strip_markdown_fence) statt eine
+    generische Fehlermeldung zu zeigen, die anderen beiden Nodes fallen auf
+    feste Default-Werte zurück.
+    """
+    stripped = text.strip()
+
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", stripped, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    obj = _extract_balanced_json_object(stripped)
+    if obj is not None:
+        try:
+            return json.loads(obj)
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"Kein valides JSON-Objekt in LLM-Antwort gefunden: {stripped[:200]!r}")
 
 
 # ── Graph State ────────────────────────────────────────────────────────────────
@@ -952,27 +1047,60 @@ class InboundChatGraph:
             "Entschuldigung, da ist gerade technisch etwas schiefgelaufen — "
             "magst du deine Frage nochmal stellen?"
         )
+
+        # Zwei getrennte try/except-Stufen, bewusst NICHT eine gemeinsame:
+        # unterschiedliche Fehlerarten verdienen unterschiedliche Fallbacks.
         try:
             response = self._llm.invoke(messages)
-            data = _parse_llm_json(response.content)
-            new_score = int(data.get("icp_score", state["icp_score"]))
-            return {
-                **state,
-                "reply_text": data.get("reply") or fallback_reply,
-                "company_name": data.get("company_name") or state["company_name"],
-                "industry": data.get("industry") or state["industry"],
-                "pain_points": data.get("pain_points") or state["pain_points"],
-                "contact_name": data.get("contact_name") or state.get("contact_name", ""),
-                # Monotonic: ein einmal erkannter ICP-Fit soll nicht durch
-                # LLM-Rauschen in einer späteren Antwort wieder sinken --
-                # sonst könnte should_book_demo mitten im Gespräch flackern.
-                "icp_score": max(state["icp_score"], new_score),
-                "icp_rationale": data.get("icp_rationale") or state["icp_rationale"],
-                "language": data.get("language") or state["language"],
-            }
         except Exception as exc:
-            logger.warning("respond_and_qualify LLM failed: %s", exc)
+            # Der LLM-AUFRUF selbst ist fehlgeschlagen (Netzwerk, Rate-Limit,
+            # Anthropic-Fehler, ...) -- es gibt keinen Antworttext, der sich
+            # retten ließe. Nur hier ist die generische Entschuldigung die
+            # einzig ehrliche Antwort.
+            logger.warning("respond_and_qualify: LLM-Aufruf fehlgeschlagen: %s", exc)
             return {**state, "reply_text": fallback_reply}
+
+        try:
+            data = _parse_llm_json(response.content)
+        except Exception as exc:
+            # Das LLM HAT geantwortet, aber nicht im geforderten JSON-Format
+            # -- z. B. reiner Fließtext oder unstrukturiertes Markdown statt
+            # {"reply": ..., "icp_score": ..., ...}. Das war der eigentliche
+            # Bug-Report: "Expecting value: line 1 column 1" ist
+            # json.loads()s Fehlermeldung für "Text beginnt nicht mit einem
+            # gültigen JSON-Token", z. B. wenn Claude direkt in Prosa
+            # antwortet statt im Prompt-vorgegebenen JSON. _parse_llm_json()
+            # hat bereits mehrere Extraktionsstufen versucht (Codefence
+            # irgendwo im Text, balanciertes {...}-Objekt irgendwo im Text --
+            # siehe deren Docstring); schlägt selbst DAS fehl, ist der
+            # Rohtext der Antwort trotzdem die beste verfügbare Information
+            # für den Besucher -- ihn wegzuwerfen und stattdessen die
+            # generische Entschuldigung zu zeigen, wäre schlechter als
+            # reiner Text ohne ICP-Zusatzdaten für DIESEN Turn. Alle
+            # übrigen Felder bleiben unverändert (monotonic, kein
+            # Rückschritt ggü. dem bisherigen Sessionstand).
+            logger.warning(
+                "respond_and_qualify: LLM-Antwort war kein valides JSON, nutze Rohtext als Antwort: %s",
+                exc,
+            )
+            raw_reply = _strip_markdown_fence(response.content) if isinstance(response.content, str) else ""
+            return {**state, "reply_text": raw_reply or fallback_reply}
+
+        new_score = int(data.get("icp_score", state["icp_score"]))
+        return {
+            **state,
+            "reply_text": data.get("reply") or fallback_reply,
+            "company_name": data.get("company_name") or state["company_name"],
+            "industry": data.get("industry") or state["industry"],
+            "pain_points": data.get("pain_points") or state["pain_points"],
+            "contact_name": data.get("contact_name") or state.get("contact_name", ""),
+            # Monotonic: ein einmal erkannter ICP-Fit soll nicht durch
+            # LLM-Rauschen in einer späteren Antwort wieder sinken --
+            # sonst könnte should_book_demo mitten im Gespräch flackern.
+            "icp_score": max(state["icp_score"], new_score),
+            "icp_rationale": data.get("icp_rationale") or state["icp_rationale"],
+            "language": data.get("language") or state["language"],
+        }
 
     # ── Node: apply_disclosure ───────────────────────────────────────────────
 
