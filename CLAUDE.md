@@ -644,6 +644,142 @@ Test-Lead dort anlegen.
 
 ---
 
+## GuardianAgent: Health-Audit + Self-Healing Middleware (18.09.2026)
+
+Neuer, siebter Agent (`agents/guardian_agent.py`) — wie `VoiceAgent` NICHT
+Teil von `_AGENT_REGISTRY` (eigener Modul-Singleton `_GUARDIAN_AGENT` in
+main.py, andere Antwortform als `AgentRequest`/`AgentResponse`). Zwei
+unabhängige Verantwortlichkeiten in einer Datei:
+
+**1. Health & Infrastructure Audit** — `GET /api/v1/health/audit`
+(main.py). `GuardianAgent.run_audit()` führt vier Prüfungen aus und
+aggregiert einen Gesamtstatus:
+
+| Check | Was geprüft wird | Wiederverwendet |
+|---|---|---|
+| `anthropic_api` | Egress/TLS/Auth gegen die Anthropic-API | `VoiceAgent.check_connectivity()` — kein Duplikat |
+| `netlify_frontend` | Echter `HTTP GET` gegen die Live-Website (Status < 500) | `settings.netlify_site_url`, Default die `*.netlify.app`-Subdomain |
+| `railway` | Env-Var-Erkennung (`RAILWAY_ENVIRONMENT_NAME` u. a.) + DNS/TCP-Egress gegen `railway.app` | Gleiche DNS/TCP-Methodik wie `GET /health/egress`, dort gegen `api.anthropic.com` |
+| `agent_graph` | Alle 5 Factory-Agenten registriert + `InboundChatGraph` exponiert exakt die 4 Nodes aus dem 4-Node-Refactor | `CompiledStateGraph.get_graph().nodes`-Introspektion (LangGraph-eigene API, keine eigene Graph-Definition dupliziert) |
+
+`netlify_frontend` zeigt bewusst auf die Netlify-eigene Subdomain, NICHT auf
+`novaraautomation.com` — die Custom-Domain-DNS ist aktuell nicht auf
+Netlify delegiert (Registrar-Nameserver ohne A/CNAME-Records, siehe
+Session-Notiz 17.09.2026), ein Audit gegen die Custom Domain würde also
+fälschlich "Netlify down" melden, obwohl nur die Registrar-DNS des Kunden
+kaputt ist.
+
+Gesamtstatus: `"healthy"` (alle vier Checks ok) · `"degraded"` (der
+Agenten-Graph ist strukturell intakt, aber mindestens eine externe
+Abhängigkeit ist gerade nicht erreichbar — Business-Logik funktioniert
+weiter) · `"unhealthy"` (der Agenten-Graph SELBST ist beschädigt — fehlender
+Agent oder fehlender Node, unabhängig vom Zustand externer Dienste). HTTP
+200 bei `healthy`/`degraded`, HTTP 503 NUR bei `unhealthy`. Bewusst
+unauthentifiziert trotz `/api/v1/`-Präfix — gleiche Begründung wie die
+bestehenden `/health/*`-Endpunkte (`/health/egress` exponiert bereits
+vergleichbar detaillierte Diagnose-Infos ohne API-Key): ein Health-Audit
+muss von externen Monitoring-/Uptime-Tools ohne Secret abrufbar sein.
+
+**2. Self-Healing Middleware** — `resilient_node()`-Decorator, angewendet
+auf alle 4 `InboundChatGraph`-Nodes (`agents/sdr_agent.py`:
+`receptionist_node`, `document_node`, `appointment_node`,
+`supervisor_node`). Zusätzliche Verteidigungsschicht ÜBER den bereits
+bestehenden, node-internen try/except-Blöcken (die bleiben unverändert —
+insbesondere `receptionist_node`s zweistufiges try/except aus dem
+JSON-Parsing-Fix, siehe unten). Reversucht bei JEDER Exception bis zu
+`max_attempts`-mal (Default 2: 1 initialer Versuch + 1 Retry) mit festem,
+kurzem Backoff (Default 0.4 s — läuft synchron im User-Antwortpfad,
+`main.py landing_chat()`, eine aufwändigere Exponential-Backoff-Strategie
+würde die Chat-Latenz unnötig verlängern). Schlagen alle Versuche fehl,
+wird NIE die Exception propagiert: ein `fallback_builder(state)` liefert
+einen garantiert gültigen Ersatz-State.
+
+`receptionist_node`/`document_node` fangen praktisch jede erwartbare
+Fehlerart bereits selbst ab (LLM-Timeout, ungültiges JSON, kaputtes
+Base64, ...) und geben IMMER einen gültigen State zurück — der Decorator
+greift dort nur im unwahrscheinlichen Fall eines Bugs außerhalb der
+bekannten Fehlerpfade. Bei `appointment_node`/`supervisor_node` ist er
+dagegen eine ECHTE zusätzliche Absicherung: deren Session-Persistenz
+(`_save_inbound_session`), Lead-Capture (`lead_capture.capture()`) und
+`customer_state.update_stage()`-Aufrufe waren vorher NICHT einzeln
+try/except-abgesichert (nur der Lead-Notification-Call selbst) — ein
+unerwarteter `ValidationError` o. ä. dort hätte ohne diesen Decorator
+unbehandelt bis zu `main.py landing_chat()` durchgeschlagen.
+
+`agents/sdr_agent.py`s `_inbound_chat_fallback()` ist der konkrete
+`fallback_builder` für alle 4 Nodes: gibt den State unverändert zurück,
+wenn `final_result` bereits gesetzt ist (Node ist nicht der letzte in der
+Kette), baut sonst über `_build_defensive_final_result()` ein MINIMALES,
+aber gültiges `final_result` — mit `state["reply_text"]` weiterverwendet,
+falls ein FRÜHERER Node (z. B. `receptionist_node`) bereits erfolgreich
+geantwortet hatte, bevor ein SPÄTERER Node (z. B. `supervisor_node`)
+ausfiel. Ohne das würde ein Ausfall von `appointment_node`/
+`supervisor_node` ein LEERES `final_result` durchreichen — kein Absturz,
+aber eine leere Antwort an den Besucher, was das eigentliche Ziel ("nie
+ein unbehandelter Fehler beim Besucher") nur zur Hälfte erfüllt hätte.
+
+**Nebenbei gefunden und behoben, beim Testen von GuardianAgent:** ein
+Logging-Aufruf in `document_node()` nutzte `"filename"` als `extra=`-Key —
+kollidiert mit `logging`s reserviertem `LogRecord`-Attribut gleichen
+Namens und wirft `KeyError` bei JEDEM Aufruf dieses Zweigs. Umbenannt zu
+`"attachment_filename"`.
+
+Regressionstest: `test_system.py` TEST 22 — `resilient_node()` (Erfolg ohne
+Retry, Retry-Erfolg nach transienten Fehlern, Fallback nach erschöpften
+Retries, reiner Passthrough ohne `fallback_builder`, ein kaputter
+`fallback_builder` selbst wird abgefangen), `check_agent_graph()`
+(vollständige vs. unvollständige Registry), `run_audit()`s
+Status-Aggregation (healthy/degraded/unhealthy, Checks gemockt, kein
+Netzwerk), und ein End-to-End-Beweis (ein simulierter Bug in
+`supervisor_node` wird abgefangen, der Besucher bekommt trotzdem eine
+gültige, nicht-leere Antwort).
+
+---
+
+## Zwei Test-Infrastruktur-Bugs behoben (18.09.2026)
+
+Beim Verifizieren von "100 % Testerfolg" für den GuardianAgent-Auftrag
+zwei ECHTE, vorbestehende Bugs gefunden und behoben (nicht Teil des
+GuardianAgent-Codes selbst, aber blockierten den sauberen Beweis):
+
+**1. `tools/live_crm_bridge.py` vergiftete `sys.path` fürs gesamte
+Testprogramm.** `_load_crm_handler()` (aktiv lokal, weil
+`SDR_CRM_LIVE_SHEET=true` in `.env` gesetzt ist) lud `la-maquina-de-
+confianza/crm_handler.py` per `sys.path.insert(0, str(repo_dir))` —
+STELLE 0, nicht ans Ende. `la-maquina-de-confianza` hat SELBST eine
+`main.py` (eigenes, unabhängiges Skript) — jeder `import main` NACH diesem
+Insert lud fälschlich JENE Datei statt `novara-agents/main.py`, sobald
+`test_sdr_routing()` (TEST 1, live) den ersten Live-CRM-Write auslöste,
+noch bevor `test_reply_classifier_and_webhook()` (TEST 16) zum ersten Mal
+`import main` ausführte. Erklärt vollständig, warum TEST 16 NUR beim
+vollständigen Suite-Lauf fehlschlug, nie isoliert (verifiziert per
+`sys.modules["main"].__file__`-Vergleich). Fix: `sys.path.append(...)`
+statt `insert(0, ...)` — `crm_handler` ist ein eindeutiger Modulname und
+wird so oder so gefunden, aber NACH novara-agents' eigenen Modulen, die
+dadurch nie mehr verdeckt werden können.
+
+**2. `test_voice_agent_dlp_gate()` (TEST 11) filterte `VOICE_AGENT_DLP_
+REVIEWED` nur aus dem an den Subprozess übergebenen `env`-Dict, nicht aus
+der Wirkung von `.env` selbst.** `core/config.py` liest `env_file=".env"`
+direkt von der Arbeitsverzeichnis-relativen Datei — unabhängig vom
+`env`-Parameter von `subprocess.run()`. Der Subprozess lief mit
+`cwd=repo_root`, fand dort das lokale `.env`
+(`VOICE_AGENT_DLP_REVIEWED=true`, Entwicklungs-Bequemlichkeit) und startete
+deshalb IMMER erfolgreich, selbst wenn die Variable aus `env` entfernt war
+— der Test prüfte dadurch nie wirklich den "Variable fehlt"-Fall. Fix: der
+"ohne Variable"-Fall läuft jetzt mit `cwd` auf einem leeren
+`tempfile.TemporaryDirectory()` (kein `.env` dort auffindbar) +
+`PYTHONPATH=repo_root` für den Import — `core/knowledge.py` löst seine
+eigenen Pfade module-relativ auf, nicht CWD-relativ, daher bleibt
+`novara_wissen.txt` trotz fremdem `cwd` ladbar.
+
+Nach beiden Fixes: `test_system.py` läuft mit 154 PASS, 2 WARN, 0 FAIL
+(Stand 18.09.2026) — beide vorher chronisch fehlschlagenden Testbereiche
+waren echte, jetzt behobene Bugs, keine Umgebungs-Unschärfe, die man hätte
+ignorieren dürfen.
+
+---
+
 ## 4-Node-Refactor: InboundChatGraph (17.09.2026)
 
 `InboundChatGraph` (Landing-Page-Chat-Widget, siehe Abschnitt weiter unten)
@@ -1319,6 +1455,7 @@ novara-agents/
 │
 ├── agents/
 │   ├── base_agent.py               # BaseAgent, AgentRequest, AgentResponse
+│   ├── guardian_agent.py           # GuardianAgent (Health-Audit) + resilient_node()-Decorator (18.09.2026)
 │   ├── onboarding_agent.py         # OnboardingGraph + OnboardingAgent
 │   ├── operations_agent.py         # OperationsGraph + OperationsAgent
 │   ├── sales_copilot_agent.py      # SalesCopilotGraph + SalesCopilotAgent

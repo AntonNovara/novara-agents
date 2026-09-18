@@ -65,8 +65,20 @@ def _load_crm_handler() -> Any:
     # (inkl. der beiden obigen Overrides) dürfen dadurch nicht verloren gehen.
     load_dotenv(dotenv_path=repo_dir / ".env", override=False)
 
+    # append, NIEMALS insert(0, ...): ein sys.path.insert(0, ...) würde
+    # la-maquina-de-confianza VOR novara-agents' eigenes Verzeichnis
+    # stellen -- jeder spätere `import main` (main.py existiert in BEIDEN
+    # Repos!) würde dann fälschlich das Schwester-Repo laden statt dieses
+    # hier, mit allen novara-agents-main.py-Routen (u. a. main.py's eigene
+    # inbound_reply_webhook()) unauffindbar. Gefunden per /code-review beim
+    # Debuggen von test_system.py TEST 16 (Webhook-Tests schlugen NUR fehl,
+    # wenn zuvor ein Live-CRM-Write via SDR_CRM_LIVE_SHEET=true gelaufen
+    # war -- reproduzierbar isoliert per sys.modules["main"].__file__). Ein
+    # append ans Ende reicht: crm_handler.py ist ein eindeutiger Modulname,
+    # der so oder so gefunden wird, sobald novara-agents' eigene Module
+    # (bereits vorne in sys.path) durchsucht sind.
     if str(repo_dir) not in sys.path:
-        sys.path.insert(0, str(repo_dir))
+        sys.path.append(str(repo_dir))
     import crm_handler  # type: ignore[import-not-found]
 
     _crm_handler_module = crm_handler

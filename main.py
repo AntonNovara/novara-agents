@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from agents.base_agent import AgentRequest, AgentResponse
+from agents.guardian_agent import GuardianAgent
 from agents.onboarding_agent import OnboardingAgent
 from agents.operations_agent import OperationsAgent
 from agents.sales_copilot_agent import SalesCopilotAgent
@@ -72,6 +73,10 @@ _AGENT_REGISTRY: dict = {}
 
 _VOICE_AGENT: Optional[VoiceAgent] = None
 _CALENDAR_TOOL: Optional[GoogleCalendarTool] = None
+# GuardianAgent (agents/guardian_agent.py) ist wie VoiceAgent NICHT Teil von
+# _AGENT_REGISTRY -- andere Antwortform (strukturierter Health-Audit statt
+# AgentRequest/AgentResponse), passt nicht ins generische BaseAgent-Interface.
+_GUARDIAN_AGENT: Optional[GuardianAgent] = None
 
 
 def _build_registry() -> dict:
@@ -88,7 +93,7 @@ def _build_registry() -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _AGENT_REGISTRY, _VOICE_AGENT, _CALENDAR_TOOL
+    global _AGENT_REGISTRY, _VOICE_AGENT, _CALENDAR_TOOL, _GUARDIAN_AGENT
     log.info("Novara Agent Factory starting", environment=settings.environment)
 
     # Aufgeloeste Modell-ID beim Start loggen, damit ein falscher ANTHROPIC_MODEL-
@@ -113,6 +118,9 @@ async def lifespan(app: FastAPI):
     _AGENT_REGISTRY = _build_registry()
     _VOICE_AGENT = VoiceAgent()
     _CALENDAR_TOOL = GoogleCalendarTool()
+    # GuardianAgent wiederverwendet _VOICE_AGENT.check_connectivity() für den
+    # Anthropic-Teil seines Audits, daher erst NACH VoiceAgent() konstruiert.
+    _GUARDIAN_AGENT = GuardianAgent(voice_agent=_VOICE_AGENT)
     log.info("Agent registry initialised", agents=list(_AGENT_REGISTRY.keys()))
 
     # Egress/Auth gegen die Anthropic-API beim Start verifizieren, damit ein
@@ -292,6 +300,40 @@ async def health_llm():
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, _VOICE_AGENT.check_connectivity)
     return JSONResponse(status_code=200 if result.get("ok") else 502, content=result)
+
+
+@app.get("/api/v1/health/audit", tags=["System"])
+async def health_audit():
+    """
+    Infrastruktur-Audit (agents/guardian_agent.py, GuardianAgent.run_audit()):
+    Anthropic-API-Erreichbarkeit, Netlify-Frontend-Erreichbarkeit, Railway-
+    Umgebung/-Egress und strukturelle Validität des Multi-Agenten-Graphen
+    (alle 5 Factory-Agenten + die 4 InboundChatGraph-Nodes) in einem Aufruf.
+
+    BEWUSST UNAUTHENTIFIZIERT trotz /api/v1/-Präfix (anders als die übrigen
+    /api/v1/agents/*-Endpunkte) -- gleiche Begründung wie die bestehenden
+    /health/*-Endpunkte oben (/health/egress exponiert bereits vergleichbar
+    detaillierte Diagnose-Infos unauthentifiziert): ein Health-Audit muss
+    von externen Monitoring-/Uptime-Tools ohne Secret abrufbar sein. Läuft
+    unter /api/v1/health/audit statt /health/audit, weil main.py bisher
+    ALLE reinen Diagnose-Endpunkte unter /health/* führt UND alle
+    Business-Endpunkte unter /api/v1/* -- dieser Audit ist explizit als
+    strukturierter API-Contract gedacht (feste JSON-Form, siehe
+    GuardianAgent.run_audit()), nicht als Ad-hoc-Diagnose wie /health/egress.
+
+    Statuscode folgt dem aggregierten "status"-Feld: 200 bei "healthy" oder
+    "degraded" (der Service selbst antwortet weiterhin normal, auch wenn
+    z. B. Netlify gerade down ist), 503 NUR bei "unhealthy" (der
+    Agenten-Graph selbst ist strukturell beschädigt -- das einzige
+    Szenario, in dem ein Monitoring-Tool wirklich alarmieren sollte).
+    """
+    if _GUARDIAN_AGENT is None:
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "error": "guardian agent not initialised"})
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, _GUARDIAN_AGENT.run_audit, _AGENT_REGISTRY)
+    return JSONResponse(status_code=200 if result["status"] != "unhealthy" else 503, content=result)
 
 
 @app.get("/api/v1/agents", tags=["Agents"], dependencies=[Depends(require_api_key)])

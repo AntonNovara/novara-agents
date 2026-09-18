@@ -115,6 +115,19 @@ class Settings(BaseSettings):
     smtp_email: SecretStr = Field(default="", alias="SMTP_EMAIL")
     smtp_password: SecretStr = Field(default="", alias="SMTP_PASSWORD")
 
+    # GuardianAgent (agents/guardian_agent.py) — Health & Infrastructure
+    # Audit (GET /api/v1/health/audit). Default = die Netlify-eigene
+    # Subdomain, NICHT die Custom Domain novaraautomation.com: deren DNS
+    # ist derzeit nicht auf Netlify delegiert (Registrar-Nameserver ohne
+    # A/CNAME-Records, siehe Session-Notiz 17.09.2026) und würde den Audit
+    # fälschlich als "Netlify down" melden, obwohl nur die Registrar-DNS
+    # des Kunden kaputt ist — die *.netlify.app-Subdomain ist von diesem
+    # DNS-Problem unabhängig und der zuverlässigere Indikator für "ist das
+    # Netlify-Deployment selbst erreichbar".
+    netlify_site_url: str = Field(
+        default="https://novara-automation.netlify.app", alias="NETLIFY_SITE_URL"
+    )
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

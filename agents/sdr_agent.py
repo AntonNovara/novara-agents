@@ -63,6 +63,7 @@ from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from agents.base_agent import AgentRequest, BaseAgent
+from agents.guardian_agent import resilient_node
 from core import consent, customer_state, lead_capture
 from core.config import settings
 from core.knowledge import load_novara_wissen
@@ -1099,6 +1100,44 @@ def _build_defensive_final_result(
     }
 
 
+_INBOUND_CHAT_FALLBACK_REPLY = (
+    "Entschuldigung, da ist gerade technisch etwas schiefgelaufen — "
+    "magst du deine Frage nochmal stellen?"
+)
+
+
+def _inbound_chat_fallback(state: dict[str, Any]) -> dict[str, Any]:
+    """
+    `fallback_builder` für `@resilient_node` (agents/guardian_agent.py) auf
+    allen 4 InboundChatGraph-Nodes -- greift NUR, wenn ein Node trotz
+    Retries endgültig fehlschlägt (siehe resilient_node()-Docstring, "Self-
+    Healing Middleware"). Reiner State-Passthrough (die Alternative ohne
+    fallback_builder) würde bei einem Ausfall von appointment_node oder
+    supervisor_node ein LEERES final_result durchreichen -- run() gäbe dann
+    `{}` an main.py landing_chat() zurück, was zwar keine Exception ist,
+    aber eine leere Antwort an den Besucher. Diese Funktion garantiert
+    stattdessen IMMER ein gültiges, nicht-leeres final_result.
+
+    Nutzt state.get("reply_text") weiter, falls ein früherer Node (z. B.
+    receptionist_node) bereits erfolgreich eine Antwort erzeugt hatte, bevor
+    ein SPÄTERER Node (z. B. supervisor_node) ausfiel -- der Besucher
+    bekommt dann trotzdem die echte Antwort, nur ohne die Zusatzschritte
+    (Offenlegung/Anhang-Hinweis/Termin-Entscheidung) des ausgefallenen Nodes.
+    """
+    if state.get("final_result"):
+        return state
+
+    reply = state.get("reply_text") or _INBOUND_CHAT_FALLBACK_REPLY
+    tier = "low"
+    for label, threshold in _ICP_TIER_THRESHOLDS.items():
+        if state.get("icp_score", 0) >= threshold:
+            tier = label
+            break
+
+    final_result = _build_defensive_final_result(state, qualified=False, tier=tier, reply=reply)
+    return {**state, "reply_text": reply, "final_result": final_result}
+
+
 # ── Inbound Chat: Graph ───────────────────────────────────────────────────────
 
 class InboundChatGraph:
@@ -1129,6 +1168,7 @@ class InboundChatGraph:
 
     # ── Node 1/4: receptionist_node ──────────────────────────────────────────
 
+    @resilient_node(fallback_builder=_inbound_chat_fallback)
     def receptionist_node(self, state: InboundChatState) -> InboundChatState:
         logger.info("Node: receptionist_node", extra={"session": state["session_id"]})
 
@@ -1204,6 +1244,7 @@ class InboundChatGraph:
 
     # ── Node 2/4: document_node ──────────────────────────────────────────────
 
+    @resilient_node(fallback_builder=_inbound_chat_fallback)
     def document_node(self, state: InboundChatState) -> InboundChatState:
         """
         Extraktion aus einem optionalen Anhang (PDF-Angebot, Planungs-
@@ -1286,6 +1327,7 @@ class InboundChatGraph:
 
     # ── Node 3/4: appointment_node ───────────────────────────────────────────
 
+    @resilient_node(fallback_builder=_inbound_chat_fallback)
     def appointment_node(self, state: InboundChatState) -> InboundChatState:
         """
         Entscheidet, ob dem Besucher JETZT aktiv ein Termin angeboten wird.
@@ -1310,6 +1352,7 @@ class InboundChatGraph:
 
     # ── Node 4/4: supervisor_node ────────────────────────────────────────────
 
+    @resilient_node(fallback_builder=_inbound_chat_fallback)
     def supervisor_node(self, state: InboundChatState) -> InboundChatState:
         """
         Qualitätskontrolle + defensive JSON-Serialisierung, letzter Schritt

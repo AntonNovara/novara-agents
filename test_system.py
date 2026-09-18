@@ -911,6 +911,7 @@ def test_voice_agent_dlp_gate() -> None:
     )
     import os
     import subprocess
+    import tempfile
 
     repo_root = os.path.dirname(os.path.abspath(__file__))
     probe = (
@@ -922,29 +923,46 @@ def test_voice_agent_dlp_gate() -> None:
     base_env = {k: v for k, v in os.environ.items() if k != "VOICE_AGENT_DLP_REVIEWED"}
 
     # 11a: ohne die Variable -- Start MUSS fehlschlagen.
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", probe],
-            cwd=repo_root,
-            env=base_env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode != 0 and "VOICE_AGENT_DLP_REVIEWED" in (result.stderr or ""):
-            ok(
-                "VoiceAgent() verweigert Start ohne VOICE_AGENT_DLP_REVIEWED",
-                f"exit={result.returncode}",
+    #
+    # cwd=repo_root wäre hier ein Bug im Test selbst, kein echter Test der
+    # Anwendung: core/config.py Settings liest env_file=".env" DIREKT von
+    # der Arbeitsverzeichnis-relativen Datei, unabhängig vom env-Dict, das
+    # subprocess.run() bekommt -- das lokale .env (Entwicklungs-Bequemlichkeit,
+    # siehe core/config.py-Kommentar zu SMTP_EMAIL etc.) hat
+    # VOICE_AGENT_DLP_REVIEWED=true gesetzt, wodurch der Subprozess die
+    # Variable IMMER sieht, egal was aus base_env herausgefiltert wurde --
+    # der Test schlug dadurch lokal fälschlich fehl (die Anwendung selbst
+    # verhält sich korrekt). Ein Subprozess-cwd OHNE .env-Datei (hier: ein
+    # leeres Temp-Verzeichnis + PYTHONPATH=repo_root für den Import) entzieht
+    # pydantic-settings diese Datei komplett -- core/knowledge.py löst seine
+    # eigenen Pfade module-relativ auf (Path(__file__).resolve().parent.parent),
+    # nicht CWD-relativ, daher bleibt novara_wissen.txt trotz fremdem cwd ladbar.
+    with tempfile.TemporaryDirectory() as tmp_cwd:
+        env_without_dotenv = dict(base_env)
+        env_without_dotenv["PYTHONPATH"] = repo_root
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", probe],
+                cwd=tmp_cwd,
+                env=env_without_dotenv,
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
-        else:
-            fail(
-                "VoiceAgent() hätte ohne VOICE_AGENT_DLP_REVIEWED nicht starten dürfen",
-                f"exit={result.returncode}, stdout={result.stdout!r}, "
-                f"stderr={result.stderr[-300:]!r}",
-            )
-    except Exception:
-        fail("Voice-Agent-Gate (ohne Variable) — Exception", "")
-        traceback.print_exc()
+            if result.returncode != 0 and "VOICE_AGENT_DLP_REVIEWED" in (result.stderr or ""):
+                ok(
+                    "VoiceAgent() verweigert Start ohne VOICE_AGENT_DLP_REVIEWED",
+                    f"exit={result.returncode}",
+                )
+            else:
+                fail(
+                    "VoiceAgent() hätte ohne VOICE_AGENT_DLP_REVIEWED nicht starten dürfen",
+                    f"exit={result.returncode}, stdout={result.stdout!r}, "
+                    f"stderr={result.stderr[-300:]!r}",
+                )
+        except Exception:
+            fail("Voice-Agent-Gate (ohne Variable) — Exception", "")
+            traceback.print_exc()
 
     # 11b: mit der Variable auf "true" -- Start MUSS normal funktionieren.
     try:
@@ -2006,6 +2024,208 @@ def test_inbound_chat(live: bool) -> None:
         traceback.print_exc()
 
 
+# ── Test 22: GuardianAgent — Health-Audit + Self-Healing Middleware ────────
+
+def test_guardian_agent() -> None:
+    section("TEST 22 — GuardianAgent: Health-Audit + Self-Healing Middleware")
+    info(
+        "resilient_node() (agents/guardian_agent.py) muss (a) bei Erfolg beim "
+        "ersten Versuch direkt durchreichen, (b) nach transienten Fehlern "
+        "retryen und bei Erfolg normal zurückgeben, (c) nach Erschöpfen aller "
+        "Versuche NIE eine Exception propagieren, sondern fallback_builder() "
+        "aufrufen (oder ohne fallback_builder den Input-State unverändert "
+        "zurückgeben), und (d) selbst einen kaputten fallback_builder "
+        "abfangen. GuardianAgent.check_agent_graph()/run_audit() müssen die "
+        "5-Agenten-Registry und die 4 InboundChatGraph-Nodes strukturell "
+        "validieren und den Gesamtstatus korrekt aggregieren -- alles ohne "
+        "LLM-Aufruf oder echten Netzwerkzugriff testbar (Checks werden gemockt)."
+    )
+    try:
+        from agents.guardian_agent import GuardianAgent, resilient_node
+        from agents.sdr_agent import InboundChatGraph
+    except Exception as exc:
+        fail("Import für GuardianAgent-Test", str(exc))
+        return
+
+    # 22a: Erfolg beim ersten Versuch -- kein Retry, kein Fallback.
+    calls = {"n": 0}
+
+    class _Dummy:
+        @resilient_node(max_attempts=3, backoff_seconds=0)
+        def ok_node(self, state):
+            calls["n"] += 1
+            return {**state, "value": "erfolg"}
+
+    result = _Dummy().ok_node({"session_id": "t22a"})
+    if result.get("value") == "erfolg" and calls["n"] == 1:
+        ok("resilient_node() reicht einen erfolgreichen Node-Aufruf ohne Retry durch")
+    else:
+        fail("resilient_node() (Erfolgsfall) unerwartetes Ergebnis", f"{result}, calls={calls['n']}")
+
+    # 22b: Erste zwei Versuche schlagen fehl, dritter gelingt -- Retry funktioniert.
+    calls2 = {"n": 0}
+
+    class _FlakyThenOk:
+        @resilient_node(max_attempts=3, backoff_seconds=0)
+        def flaky_node(self, state):
+            calls2["n"] += 1
+            if calls2["n"] < 3:
+                raise RuntimeError(f"transienter Fehler #{calls2['n']}")
+            return {**state, "value": "erfolg nach retries"}
+
+    result2 = _FlakyThenOk().flaky_node({"session_id": "t22b"})
+    if result2.get("value") == "erfolg nach retries" and calls2["n"] == 3:
+        ok("resilient_node() reversucht bei transienten Fehlern und gibt den Erfolg zurück", f"Versuche={calls2['n']}")
+    else:
+        fail("resilient_node() (Retry-Erfolg) unerwartetes Ergebnis", f"{result2}, calls={calls2['n']}")
+
+    # 22c: Alle Versuche schlagen fehl -- fallback_builder() liefert den Ersatz-State, keine Exception.
+    def _fallback(state):
+        return {**state, "value": "fallback"}
+
+    class _AlwaysBroken:
+        @resilient_node(max_attempts=2, backoff_seconds=0, fallback_builder=_fallback)
+        def broken_node(self, state):
+            raise RuntimeError("dauerhafter Fehler")
+
+    try:
+        result3 = _AlwaysBroken().broken_node({"session_id": "t22c"})
+        if result3.get("value") == "fallback":
+            ok("resilient_node() ruft fallback_builder() auf, wenn alle Versuche fehlschlagen -- keine Exception propagiert")
+        else:
+            fail("resilient_node() (Fallback) unerwartetes Ergebnis", str(result3))
+    except Exception as exc:
+        fail("resilient_node() (Fallback) hat eine Exception propagiert -- Self-Healing-Garantie verletzt", str(exc))
+
+    # 22d: Alle Versuche schlagen fehl, KEIN fallback_builder -- reiner State-Passthrough.
+    class _AlwaysBrokenNoFallback:
+        @resilient_node(max_attempts=2, backoff_seconds=0)
+        def broken_node(self, state):
+            raise RuntimeError("dauerhafter Fehler")
+
+    try:
+        original_state = {"session_id": "t22d", "value": "unveraendert"}
+        result4 = _AlwaysBrokenNoFallback().broken_node(dict(original_state))
+        if result4 == original_state:
+            ok("resilient_node() ohne fallback_builder gibt den Input-State unverändert zurück")
+        else:
+            fail("resilient_node() (Passthrough ohne Fallback) unerwartetes Ergebnis", str(result4))
+    except Exception as exc:
+        fail("resilient_node() (Passthrough ohne Fallback) hat eine Exception propagiert", str(exc))
+
+    # 22e: fallback_builder SELBST wirft -- letzte Verteidigungslinie greift (reiner Passthrough statt Absturz).
+    def _broken_fallback(state):
+        raise ValueError("fallback_builder ist selbst kaputt")
+
+    class _DoublyBroken:
+        @resilient_node(max_attempts=1, backoff_seconds=0, fallback_builder=_broken_fallback)
+        def broken_node(self, state):
+            raise RuntimeError("dauerhafter Fehler")
+
+    try:
+        original_state2 = {"session_id": "t22e", "value": "unveraendert"}
+        result5 = _DoublyBroken().broken_node(dict(original_state2))
+        if result5 == original_state2:
+            ok("resilient_node() fängt einen kaputten fallback_builder ab und bleibt beim State-Passthrough")
+        else:
+            fail("resilient_node() (kaputter Fallback) unerwartetes Ergebnis", str(result5))
+    except Exception as exc:
+        fail("resilient_node() (kaputter Fallback) hat eine Exception propagiert -- letzte Verteidigungslinie versagt", str(exc))
+
+    # 22f: check_agent_graph() -- vollständige Registry + echter InboundChatGraph erkennt alle 4 Nodes.
+    guardian = GuardianAgent(voice_agent=None)
+    fake_sdr = type("FakeSDR", (), {})()
+    fake_sdr._inbound = InboundChatGraph(llm=None)
+    complete_registry = {
+        "onboarding": object(), "operations": object(), "sales-copilot": object(),
+        "sdr": fake_sdr, "support": object(),
+    }
+    graph_result = guardian.check_agent_graph(complete_registry)
+    if (
+        graph_result["ok"] is True
+        and not graph_result["missing_agents"]
+        and not graph_result["missing_inbound_nodes"]
+        and set(GuardianAgent.EXPECTED_INBOUND_NODES) <= set(graph_result["inbound_chat_nodes"])
+    ):
+        ok("check_agent_graph() erkennt eine vollständige Registry + alle 4 InboundChatGraph-Nodes als ok")
+    else:
+        fail("check_agent_graph() (vollständig) unerwartetes Ergebnis", str(graph_result))
+
+    # 22f-ii: fehlender Agent wird als missing_agents erkannt.
+    incomplete_registry = {k: v for k, v in complete_registry.items() if k != "support"}
+    graph_result_missing = guardian.check_agent_graph(incomplete_registry)
+    if graph_result_missing["ok"] is False and graph_result_missing["missing_agents"] == ["support"]:
+        ok("check_agent_graph() erkennt einen fehlenden Agenten in der Registry")
+    else:
+        fail("check_agent_graph() (fehlender Agent) unerwartetes Ergebnis", str(graph_result_missing))
+
+    # 22g: run_audit() aggregiert den Gesamtstatus korrekt (Checks gemockt, kein Netzwerk).
+    guardian2 = GuardianAgent(voice_agent=None)
+    guardian2.check_anthropic_api = lambda: {"ok": True}
+    guardian2.check_netlify_frontend = lambda: {"ok": True}
+    guardian2.check_railway = lambda: {"ok": True}
+    guardian2.check_agent_graph = lambda registry: {"ok": True, "missing_agents": [], "missing_inbound_nodes": []}
+    audit_healthy = guardian2.run_audit({})
+    if audit_healthy["status"] == "healthy":
+        ok("run_audit() meldet 'healthy', wenn alle vier Checks ok sind")
+    else:
+        fail("run_audit() (alle ok) unerwartetes Ergebnis", str(audit_healthy))
+
+    guardian2.check_netlify_frontend = lambda: {"ok": False, "error": "simulierter Netlify-Ausfall"}
+    audit_degraded = guardian2.run_audit({})
+    if audit_degraded["status"] == "degraded":
+        ok("run_audit() meldet 'degraded', wenn eine externe Abhängigkeit ausfällt, der Graph selbst aber intakt ist")
+    else:
+        fail("run_audit() (Netlify down) unerwartetes Ergebnis", str(audit_degraded))
+
+    guardian2.check_agent_graph = lambda registry: {"ok": False, "missing_agents": ["support"], "missing_inbound_nodes": []}
+    audit_unhealthy = guardian2.run_audit({})
+    if audit_unhealthy["status"] == "unhealthy":
+        ok("run_audit() meldet 'unhealthy', wenn der Agenten-Graph selbst strukturell beschädigt ist")
+    else:
+        fail("run_audit() (Graph kaputt) unerwartetes Ergebnis", str(audit_unhealthy))
+
+    # 22h: voller Durchlauf -- ein echter Node-Ausfall in InboundChatGraph
+    # wird vom Decorator abgefangen und liefert trotzdem ein gültiges,
+    # nicht-leeres final_result (End-to-End-Beweis für "nie ein
+    # unbehandelter Fehler beim Besucher").
+    try:
+        import agents.sdr_agent as sdr_module
+
+        class _FakeLLM:
+            def invoke(self, messages):
+                class _Resp:
+                    content = (
+                        '{"reply": "Hallo!", "icp_score": 5, "company_name": "", '
+                        '"industry": "", "pain_points": [], "contact_name": "", '
+                        '"icp_rationale": "", "language": "de"}'
+                    )
+                return _Resp()
+
+        graph = InboundChatGraph(llm=_FakeLLM())
+        original_extract = sdr_module.lead_capture.extract_contact_fields
+
+        def _broken_extract(*a, **kw):
+            raise RuntimeError("simulierter Bug in supervisor_node")
+
+        sdr_module.lead_capture.extract_contact_fields = _broken_extract
+        try:
+            e2e_result = graph.run(session_id="guardian-e2e-test", message="Testnachricht", visitor_info={})
+        finally:
+            sdr_module.lead_capture.extract_contact_fields = original_extract
+
+        if e2e_result.get("reply") == "Hallo!":
+            ok(
+                "End-to-End: ein simulierter Bug in supervisor_node wird vom Guardian abgefangen, "
+                "der Besucher bekommt trotzdem eine gültige Antwort"
+            )
+        else:
+            fail("End-to-End-Self-Healing-Test unerwartetes Ergebnis", str(e2e_result))
+    except Exception:
+        fail("End-to-End-Self-Healing-Test — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -2041,6 +2261,7 @@ def main() -> int:
     test_prompt_caching()
     test_mcp_server()
     test_inbound_chat(live)
+    test_guardian_agent()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")
