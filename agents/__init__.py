@@ -1,4 +1,5 @@
 from agents.base_agent import BaseAgent, AgentRequest, AgentResponse
+from agents.field_worker_agent import FieldWorkerAgent
 from agents.onboarding_agent import OnboardingAgent
 from agents.operations_agent import OperationsAgent
 from agents.sales_copilot_agent import SalesCopilotAgent
@@ -7,5 +8,5 @@ from agents.support_agent import SupportAgent
 
 __all__ = [
     "BaseAgent", "AgentRequest", "AgentResponse",
-    "OnboardingAgent", "OperationsAgent", "SalesCopilotAgent", "SDRAgent", "SupportAgent",
+    "FieldWorkerAgent", "OnboardingAgent", "OperationsAgent", "SalesCopilotAgent", "SDRAgent", "SupportAgent",
 ]

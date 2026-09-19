@@ -128,6 +128,22 @@ class Settings(BaseSettings):
         default="https://novara-automation.netlify.app", alias="NETLIFY_SITE_URL"
     )
 
+    # Baustellen-Voice-Assistant (main.py POST /api/v1/webhook/whatsapp,
+    # agents/field_worker_agent.py): Twilio-Zugangsdaten für (a)
+    # Signaturprüfung eingehender Webhook-Requests (RequestValidator,
+    # X-Twilio-Signature) und (b) authentifizierten Download von
+    # WhatsApp-Sprachnachrichten (Twilio-Media-URLs verlangen HTTP-Basic-Auth
+    # mit genau diesen beiden Werten). Ohne twilio_auth_token wird die
+    # Signaturprüfung übersprungen (mit Warn-Log) statt den Webhook hart zu
+    # blocken -- dieselbe Fail-Safe-für-lokale-Entwicklung-Philosophie wie
+    # ANTHROPIC_API_KEY/Demo-Modus (core/llm.py), NICHT für Produktivbetrieb
+    # gedacht: dort MUSS twilio_auth_token gesetzt sein, sonst nimmt der
+    # Endpoint unauthentifizierte Requests an, die echte LLM-Calls und
+    # PDF-Generierung auslösen (Ressourcen-/Spam-Risiko, siehe
+    # CLAUDE.md-Abschnitt zum Baustellen-Voice-Assistant).
+    twilio_account_sid: SecretStr = Field(default="", alias="TWILIO_ACCOUNT_SID")
+    twilio_auth_token: SecretStr = Field(default="", alias="TWILIO_AUTH_TOKEN")
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

@@ -34,3 +34,11 @@ google-api-python-client>=2.120.0
 
 # MCP Server (tools/mcp_server.py) – exponiert Novara-Tools für Kunden-CRMs
 mcp>=1.6.0,<2.0.0
+
+# Baustellen-Voice-Assistant (agents/field_worker_agent.py, utils/pdf_generator.py,
+# main.py POST /api/v1/webhook/whatsapp): Twilio-WhatsApp-Webhook-Verarbeitung,
+# Regiebericht-PDF-Erzeugung, Audio-Format-Handling für Sprachnachrichten.
+# pydub braucht zur Laufzeit zusätzlich das externe ffmpeg-Binary (siehe Dockerfile).
+twilio==9.11.1
+fpdf2==2.8.8
+pydub==0.25.1

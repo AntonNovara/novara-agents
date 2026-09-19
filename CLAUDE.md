@@ -644,6 +644,131 @@ Test-Lead dort anlegen.
 
 ---
 
+## Baustellen-Voice-Assistant: WhatsApp-Webhook für Regieberichte (20.09.2026)
+
+Sechster (Text-)Agent + zwei neue unterstützende Module — ein Techniker auf
+einer österreichischen Baustelle schickt eine WhatsApp-Nachricht (Text oder
+Sprachnachricht) über das, was er heute gemacht hat; das System extrahiert
+daraus strukturierte Regiebericht-Daten und schickt automatisch ein fertiges
+PDF zurück. Ein Regiebericht ist das im DACH-Bauhandwerk übliche
+Standarddokument zur Verrechnung geleisteter Stunden/Material gegenüber dem
+Kunden.
+
+**`agents/field_worker_agent.py` (`FieldWorkerAgent`, `agent_type =
+"field-worker"`).** Anders als `InboundChatGraph`/`VoiceAgent` KEIN
+Sonderfall — folgt exakt demselben Muster wie `OnboardingAgent` (siehe
+dessen Abschnitt unten): ein zustandsloser Text-Request rein, ein
+strukturiertes Dict raus, Standard-`BaseAgent`-Interface, läuft daher
+automatisch durch `BaseAgent.process()`s Input-/Output-DLP — keine manuell
+nachgebaute DLP-Prüfung nötig wie bei den öffentlichen Sonderfall-Endpunkten.
+Zweistufiger Graph (`extract_entities` → `finalize`); der System-Prompt ist
+explizit auf österreichischen (Wiener) Dialekt und Handwerker-Fachjargon
+trainiert (z. B. "leiwand" = gut/erledigt, "Oida", gesprochene Zahlen wie
+"dreieinhalb Stunden" → `3.5`) und schreibt die extrahierte
+Tätigkeitsbeschreibung deterministisch in professionelles Hochdeutsch um,
+BEVOR sie im PDF landet (Dialekt/Umgangssprache gehören nicht ins
+Kundendokument). Teilt sich mit `agents/sdr_agent.py` dieselbe
+dreistufige `_parse_llm_json()`-Fallback-Logik aus dem 17.09.2026-Fix
+(Codefence irgendwo im Text, balanciertes `{...}`-Objekt irgendwo im
+Text) — hier bewusst DUPLIZIERT statt importiert, aus demselben Grund wie
+`voice_agent.py`: bleibt unabhängig von `sdr_agent.py`.
+
+**`utils/pdf_generator.py` (`generate_regiebericht()`).** Neues,
+drittes Top-Level-Paket neben `agents/`/`core`/`tools/` — bewusst NICHT unter
+`tools/`, weil es (anders als jedes bestehende Tool) reine, zustandslose
+Formatierungslogik ohne eigenen Domänenzustand ist (siehe Moduldocstring für
+die volle Begründung). Nutzt fpdf2s Core-Fonts (Helvetica, keine gebündelte
+TTF-Datei im Repo nötig) — WICHTIG, per Smoke-Test verifiziert und NICHT wie
+zunächst angenommen: fpdf2s Core-Font-Kodierung ist ECHTES ISO-8859-1
+(0-255), nicht das erweiterte Windows-1252-Repertoire. Sowohl das
+Euro-Zeichen (€) als auch "smarte" Typografiezeichen (–/—/‘’/“”/…) liegen
+AUSSERHALB dieses Bereichs und lösten beim ersten Testlauf tatsächlich eine
+`FPDFUnicodeEncodingException` aus. `_clean_text()` ersetzt diese gezielt
+und lesbar (€ → "EUR", – → "-", …) statt sie pauschal durch "?" zu ersetzen,
+mit "?" nur als letzter Ausweg für wirklich nicht darstellbare Zeichen
+(Emoji, kyrillisch/asiatisch — z. B. aus einer Spracherkennungs-Autokorrektur).
+Deutsche Umlaute/ß bleiben unverändert (liegen innerhalb von Latin-1).
+Default-Dateiname ist wörtlich `"Regiebericht.pdf"`; `suggested_filename()`
+baut daneben einen eindeutigen, dateisystemsicheren Namen aus
+Techniker+Kunde+Zeitstempel für Aufrufer mit mehreren/parallelen Berichten
+(main.py nutzt IMMER diese Variante, nie den kollisionsanfälligen
+Default-Namen direkt).
+
+**`main.py POST /api/v1/webhook/whatsapp`** (Twilio-Webhook-Format:
+`application/x-www-form-urlencoded`, NICHT JSON wie jeder andere Endpoint).
+ÖFFENTLICH, KEIN `X-API-Key` — gleiches Muster wie der Vapi-Webhook und
+`landing_chat()` (Twilio kann wie Vapi keinen benutzerdefinierten Header
+mitschicken). Die Sicherheitsgrenze ist hier NICHT der API-Key, sondern
+Twilios eigene Request-Signatur (`X-Twilio-Signature`, HMAC-SHA1 über die
+vollständige aufgerufene URL + alle POST-Parameter,
+`_verify_twilio_signature()`) — eine ECHTE kryptografische Prüfung pro
+Request. Ohne konfiguriertes `TWILIO_AUTH_TOKEN` wird NICHT geprüft
+(Warn-Log, Fail-Safe für lokale Entwicklung ohne Twilio-Zugang, analog zu
+`ANTHROPIC_API_KEY`/Demo-Modus) — **in Produktion MUSS `TWILIO_AUTH_TOKEN`
+gesetzt sein**, sonst verarbeitet der Endpoint unauthentifizierte Requests
+(echte LLM-Calls + PDF-Erzeugung, Ressourcen-/Spam-Risiko). Per Smoke-Test
+verifiziert: korrekte Signatur akzeptiert (200), manipulierte UND fehlende
+Signatur abgelehnt (401), jeweils mit einer über `python3 -c` mit
+`twilio.request_validator.RequestValidator.compute_signature()`
+tatsächlich berechneten Signatur — keine bloße Annahme.
+
+URL-Rekonstruktion für die Signaturprüfung nutzt `X-Forwarded-Proto`/
+`X-Forwarded-Host` statt `request.url` direkt: Railway terminiert TLS an
+einem vorgeschalteten Proxy, `request.url.scheme` könnte sonst fälschlich
+"http" statt der von Twilio tatsächlich aufgerufenen "https"-URL melden —
+ohne die Forwarded-Header würde JEDE Signatur fälschlich als ungültig gelten.
+
+Generierte PDFs landen unter `static/reports/<eindeutiger-Name>.pdf` (bereits
+über `app.mount("/static", ...)` ausgeliefert, siehe Abschnitt "Landing-Page-
+Chat-Widget" weiter unten) — verzeichnisiert und gitignored, siehe "Bekannte
+Einschränkungen" unten zur Konsequenz aus Railways ephemerem Dateisystem.
+Antwort ist immer TwiML (`twilio.twiml.messaging_response.MessagingResponse`,
+kein manuelles XML-String-Building — escaped den Nachrichtentext korrekt,
+relevant weil der Techniker-Text ungefiltert im Bestätigungstext landen
+kann), NIEMALS ein 5xx an Twilio (jeder interne Fehlerpfad — kein
+field-worker-Agent verfügbar, PDF-Erzeugung schlägt fehl — liefert
+stattdessen eine erklärende TwiML-Nachricht mit HTTP 200).
+
+> **Bewusst offene Lücke, NICHT stillschweigend vorgetäuscht: Sprach-zu-Text
+> für WhatsApp-Sprachnachrichten ist noch nicht angebunden.**
+> `_download_and_normalize_audio()` lädt eine WhatsApp-Sprachnachricht
+> vollständig echt herunter (Twilio-Media-URL, HTTP-Basic-Auth mit
+> Account-SID+Auth-Token) und normalisiert sie via pydub auf WAV — das ist
+> real implementiert und per Smoke-Test verifiziert (inkl. Fehlerpfad bei
+> nicht erreichbarer Media-URL). Die eigentliche Transkription
+> (`_transcribe_audio()`) gibt bewusst `None` zurück: Claude (Anthropic
+> Messages API) transkribiert kein Audio, und anders als beim Vapi-Pfad
+> (`agents/voice_agent.py`, wo Vapi selbst/extern transkribiert und
+> novara-agents nur bereits transkribierten Text sieht) gibt es für WhatsApp
+> keine vorgelagerte STT-Instanz. Der Techniker bekommt bei einer
+> Sprachnachricht eine ehrliche Antwort ("automatische Transkription ist
+> noch nicht aktiv, bitte zusätzlich als Text schicken") statt einer
+> erfundenen/leeren Zusammenfassung. `_transcribe_audio()` ist der einzige,
+> bewusst isolierte Anknüpfungspunkt für eine künftige STT-Anbindung (z. B.
+> Whisper API) — bekommt bereits fertiges WAV übergeben, keine weitere
+> Vorarbeit nötig.
+
+**Dockerfile aktualisiert:** `COPY utils/ utils/` ergänzt (das Verzeichnis
+fehlte in der expliziten COPY-Liste — ohne diesen Fix hätte main.py in der
+Railway-Produktivumgebung mit `ModuleNotFoundError: No module named 'utils'`
+abgestürzt, obwohl lokal alles funktioniert hätte) und `RUN apt-get install
+ffmpeg` ergänzt (pydub braucht das externe ffmpeg-Binary zur Laufzeit, pip
+liefert nur den Python-Wrapper).
+
+Regressionstest: `test_system.py` TEST 23 (`utils/pdf_generator.py`:
+vollständige Daten inkl. €/Halbgeviertstrich/Emoji im Text →
+textextrahierbares PDF ohne Crash, leere Daten → Platzhalter statt Absturz,
+Default-Dateiname wörtlich `"Regiebericht.pdf"`, `suggested_filename()`
+dateisystemsicher trotz Umlauten), TEST 24 (`FieldWorkerAgent`:
+valide/fehlgeschlagene/nicht-JSON-LLM-Antworten, Live-Test mit echtem
+Dialekt-Satz), TEST 25 (`_verify_twilio_signature()` akzeptiert/verwirft
+korrekt inkl. tatsächlich berechneter Signaturen, `whatsapp_webhook()` gibt
+bei ungültiger Signatur 401 zurück und bei jedem sonstigen Fehlerpfad
+IMMER TwiML statt 5xx, Live-Happy-Path erzeugt ein echtes PDF unter
+`static/reports/`).
+
+---
+
 ## GuardianAgent: Health-Audit + Self-Healing Middleware (18.09.2026)
 
 Neuer, siebter Agent (`agents/guardian_agent.py`) — wie `VoiceAgent` NICHT
@@ -1455,12 +1580,16 @@ novara-agents/
 │
 ├── agents/
 │   ├── base_agent.py               # BaseAgent, AgentRequest, AgentResponse
+│   ├── field_worker_agent.py       # FieldWorkerAgent — Baustellen-Voice-Assistant (20.09.2026)
 │   ├── guardian_agent.py           # GuardianAgent (Health-Audit) + resilient_node()-Decorator (18.09.2026)
 │   ├── onboarding_agent.py         # OnboardingGraph + OnboardingAgent
 │   ├── operations_agent.py         # OperationsGraph + OperationsAgent
 │   ├── sales_copilot_agent.py      # SalesCopilotGraph + SalesCopilotAgent
 │   ├── sdr_agent.py                # SDRGraph + SDRAgent
 │   └── support_agent.py            # SupportGraph + SupportAgent
+│
+├── utils/
+│   └── pdf_generator.py            # generate_regiebericht() — Regiebericht-PDF (20.09.2026)
 │
 └── tools/
     ├── crm_integration.py          # CRMIntegration (Rechnungen) + CRMIntegrationSDR (Leads)
@@ -1525,3 +1654,5 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | Lead-Capture (`core/lead_capture.py`) = In-Memory, kein persistenter Store | Postgres/Redis statt Prozess-Singleton, analog zu Consent-Ledger/Sequence Scheduler/Customer State |
 | Lead-Benachrichtigung (`tools/lead_notifier.py`) = einfaches SMTP-Anwendungspasswort, kein Retry/Queue bei SMTP-Ausfall | Bei Bedarf Retry-Queue oder Wechsel auf einen transaktionalen E-Mail-Dienst (SendGrid/Postmark/SES) |
 | `InboundChatGraph.document_node()` (Anhang-Extraktion) ist über die API voll funktionsfähig, aber `static/chat_widget.js` hat noch keine Upload-UI dafür | Frontend-Arbeit: Datei-Auswahl + Base64-Kodierung im Widget ergänzen, `attachment`-Feld an `/api/v1/chat/landing` mitschicken |
+| Baustellen-Voice-Assistant (`main.py` `/api/v1/webhook/whatsapp`): Sprach-zu-Text für WhatsApp-Sprachnachrichten noch nicht angebunden (`_transcribe_audio()` gibt bewusst `None` zurück) | Whisper API oder vergleichbaren STT-Provider in `_transcribe_audio()` einbinden — Audio-Download+WAV-Normalisierung sind bereits vollständig implementiert |
+| Regiebericht-PDFs (`static/reports/`) liegen auf Railways ephemerem Dateisystem — verschwinden bei jedem Redeploy/Neustart, keine Historie/Liste vergangener Berichte | Persistenter Objektspeicher (z. B. S3-kompatibel) statt lokalem Dateisystem, falls eine Berichtshistorie gebraucht wird |

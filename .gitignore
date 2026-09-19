@@ -11,3 +11,8 @@ build/
 *.log
 credentials.json
 get_token.py
+
+# Baustellen-Voice-Assistant: zur Laufzeit generierte Regieberichte
+# (main.py POST /api/v1/webhook/whatsapp, utils/pdf_generator.py) --
+# nie committen, nur auf Railways ephemerem Dateisystem relevant.
+static/reports/

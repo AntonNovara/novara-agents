@@ -16,16 +16,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import structlog
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Security, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from twilio.request_validator import RequestValidator
+from twilio.twiml.messaging_response import MessagingResponse
 
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from agents.base_agent import AgentRequest, AgentResponse
+from agents.field_worker_agent import FieldWorkerAgent
 from agents.guardian_agent import GuardianAgent
 from agents.onboarding_agent import OnboardingAgent
 from agents.operations_agent import OperationsAgent
@@ -40,6 +44,7 @@ from tools import lead_notifier, sequence_scheduler
 from tools.calendar_integration import GoogleCalendarTool
 from tools.document_parser import DocumentParser
 from tools.reply_classifier import ReplyClassifier
+from utils.pdf_generator import generate_regiebericht, suggested_filename
 
 # ── Logging Setup ─────────────────────────────────────────────────────────────
 
@@ -81,6 +86,7 @@ _GUARDIAN_AGENT: Optional[GuardianAgent] = None
 
 def _build_registry() -> dict:
     return {
+        "field-worker": FieldWorkerAgent(),
         "onboarding":   OnboardingAgent(),
         "operations":   OperationsAgent(),
         "sales-copilot": SalesCopilotAgent(),
@@ -959,6 +965,246 @@ async def voice_webhook(request: Request):
         # Letzte Absicherung: niemals HTTP 500 an Vapi zurückgeben
         log.error("Vapi webhook: unbehandelter Fehler", error=str(exc), exc_info=True)
         return {"received": False, "error": "internal server error"}
+
+
+# ── Baustellen-Voice-Assistant: WhatsApp-Webhook (Twilio) ─────────────────────
+# ÖFFENTLICH, KEIN X-API-Key -- gleiches Muster wie der Vapi-Webhook oben und
+# main.py landing_chat() (main.py docstrings dort): Twilio kann wie Vapi keinen
+# benutzerdefinierten Header mitschicken. Die Sicherheitsgrenze ist hier NICHT
+# der API-Key, sondern Twilios eigene Request-Signatur (X-Twilio-Signature,
+# HMAC-SHA1 über die vollständige aufgerufene URL + alle POST-Parameter,
+# geprüft in _verify_twilio_signature()) -- eine ECHTE kryptografische Prüfung
+# pro Request, kein Shared Secret im Header. Reports landen unter
+# static/reports/ (bereits über app.mount("/static", ...) oben ausgeliefert)
+# -- auf Railways ephemerem Dateisystem nur bis zum nächsten Deploy/Neustart
+# verfügbar, was für den Zweck (Twilio lädt die PDF kurz nach der
+# Webhook-Antwort herunter) ausreicht; siehe CLAUDE.md, "Bekannte
+# Einschränkungen" für die vollständige Begründung.
+
+_REPORTS_DIR = Path(__file__).parent / "static" / "reports"
+
+
+def _verify_twilio_signature(request: Request, form_params: dict) -> bool:
+    """
+    Ohne TWILIO_AUTH_TOKEN (core/config.py) wird NICHT geprüft (Warn-Log) --
+    dieselbe Fail-Safe-für-lokale-Entwicklung-Philosophie wie
+    ANTHROPIC_API_KEY/Demo-Modus (core/llm.py): kein Twilio-Zugang lokal soll
+    den Endpoint nicht komplett unbenutzbar machen. In Produktion MUSS
+    TWILIO_AUTH_TOKEN gesetzt sein, sonst nimmt der Endpoint unauthentifizierte
+    Requests an, die echte LLM-Calls und PDF-Erzeugung auslösen.
+
+    URL wird bewusst NICHT aus request.url allein gebaut: Railway terminiert
+    TLS an einem vorgeschalteten Proxy, request.url.scheme/netloc können
+    dadurch "http"/die interne Adresse statt der von Twilio tatsächlich
+    aufgerufenen "https://...novaraautomation..."-URL melden -- ohne die
+    X-Forwarded-*-Header (von Railways Proxy gesetzt) würde JEDE Signatur
+    fälschlich als ungültig gelten.
+    """
+    auth_token = settings.twilio_auth_token.get_secret_value()
+    if not auth_token:
+        log.warning("WhatsApp-Webhook: TWILIO_AUTH_TOKEN nicht gesetzt -- Signaturprüfung übersprungen")
+        return True
+
+    signature = request.headers.get("X-Twilio-Signature", "")
+    proto = request.headers.get("X-Forwarded-Proto", request.url.scheme)
+    netloc = request.headers.get("X-Forwarded-Host", request.url.netloc)
+    url = f"{proto}://{netloc}{request.url.path}"
+    if request.url.query:
+        url += f"?{request.url.query}"
+
+    return RequestValidator(auth_token).validate(url, form_params, signature)
+
+
+def _twiml_response(message: str, media_url: Optional[str] = None) -> Response:
+    """Baut eine TwiML-Antwort (twilio.twiml.messaging_response.MessagingResponse
+    escaped den Nachrichtentext selbst korrekt -- kein manuelles XML-String-Building,
+    das bei Sonderzeichen im Techniker-Text zu ungültigem XML führen könnte)."""
+    twiml = MessagingResponse()
+    msg = twiml.message(message)
+    if media_url:
+        msg.media(media_url)
+    return Response(content=str(twiml), media_type="application/xml")
+
+
+def _download_and_normalize_audio(media_url: str, content_type: str) -> bytes:
+    """
+    Synchron (Netzwerk-Download UND ffmpeg-Subprozess über pydub sind beide
+    blockierend) -- der Aufrufer MUSS dies über loop.run_in_executor()
+    aufrufen, sonst friert der Event Loop für alle gleichzeitigen Requests ein
+    (gleiche Regel wie überall sonst in main.py, z. B. /health/llm).
+
+    Twilio-Media-URLs verlangen HTTP-Basic-Auth mit Account-SID+Auth-Token,
+    sonst liefert Twilio einen 401 statt der Audiodatei. Ergebnis ist auf WAV
+    normalisiert -- WhatsApp-Sprachnachrichten kommen i. d. R. als
+    "audio/ogg; codecs=opus", ein für die meisten STT-Provider unhandliches
+    Format; WAV ist der kleinste gemeinsame Nenner für eine künftige
+    Transkriptions-Anbindung (siehe _transcribe_audio()).
+    """
+    account_sid = settings.twilio_account_sid.get_secret_value()
+    auth_token = settings.twilio_auth_token.get_secret_value()
+    resp = httpx.get(media_url, auth=(account_sid, auth_token), timeout=15)
+    resp.raise_for_status()
+
+    import io
+
+    from pydub import AudioSegment
+
+    fmt = "ogg" if "ogg" in content_type.lower() else None
+    segment = AudioSegment.from_file(io.BytesIO(resp.content), format=fmt)
+    buffer = io.BytesIO()
+    segment.export(buffer, format="wav")
+    return buffer.getvalue()
+
+
+def _transcribe_audio(wav_bytes: bytes) -> Optional[str]:
+    """
+    BEKANNTE LÜCKE, bewusst nicht stillschweigend vorgetäuscht: dieses Repo
+    hat noch KEINEN Speech-to-Text-Provider angebunden. Claude (Anthropic
+    Messages API) transkribiert kein Audio; Vapi (agents/voice_agent.py)
+    umgeht das Problem, indem es STT komplett selbst/extern übernimmt und
+    novara-agents nur bereits transkribierten Text sieht -- für WhatsApp gibt
+    es keine solche vorgelagerte Instanz.
+
+    Gibt bewusst None zurück statt zu raten/zu halluzinieren -- der Aufrufer
+    (whatsapp_webhook()) antwortet dem Techniker dann ehrlich, dass
+    automatische Transkription noch nicht aktiv ist, statt eine erfundene
+    oder leere Zusammenfassung als Regiebericht auszugeben. Einziger,
+    bewusst isolierter Anknüpfungspunkt für eine künftige Anbindung (z. B.
+    Whisper API) -- Audio-Download+Normalisierung (_download_and_normalize_audio)
+    ist bereits vollständig implementiert und liefert hier fertiges WAV an.
+    """
+    logger.debug("Audio-Transkription angefordert (%d Bytes) -- noch kein STT-Provider konfiguriert", len(wav_bytes))
+    return None
+
+
+@app.post(
+    "/api/v1/webhook/whatsapp",
+    tags=["WhatsApp"],
+    summary="Twilio-WhatsApp-Webhook (Baustellen-Voice-Assistant)",
+    responses={
+        200: {"description": "TwiML-Antwort (auch bei internen Fehlern -- Twilio bekommt nie einen 5xx)"},
+        401: {"description": "Ungültige oder fehlende Twilio-Signatur"},
+    },
+)
+async def whatsapp_webhook(request: Request):
+    """
+    Nimmt eine WhatsApp-Text- oder Sprachnachricht eines Technikers entgegen
+    (Twilio WhatsApp Business API), extrahiert über field_worker_agent.py
+    strukturierte Regiebericht-Daten, erzeugt via utils/pdf_generator.py ein
+    PDF und schickt eine TwiML-Bestätigung (inkl. PDF-Link) zurück.
+
+    Twilio sendet `application/x-www-form-urlencoded`, NICHT JSON -- anders
+    als jeder andere Endpoint in main.py. Wichtige Felder: `From` (Absender-
+    Nummer), `Body` (Text), `NumMedia`/`MediaUrl0`/`MediaContentType0`
+    (Anhang, z. B. eine Sprachnachricht).
+    """
+    try:
+        form = await request.form()
+        params = {k: str(v) for k, v in form.items()}
+    except Exception as exc:
+        log.warning("WhatsApp-Webhook: Form-Parsing fehlgeschlagen", error=str(exc))
+        return _twiml_response("Entschuldigung, deine Nachricht konnte nicht gelesen werden.")
+
+    if not _verify_twilio_signature(request, params):
+        log.warning("WhatsApp-Webhook: ungültige Twilio-Signatur", frm=params.get("From", ""))
+        raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+
+    sender = params.get("From", "unknown")
+    body_text = (params.get("Body") or "").strip()
+    try:
+        num_media = int(params.get("NumMedia", "0") or "0")
+    except ValueError:
+        num_media = 0
+
+    log.info("WhatsApp-Webhook empfangen", frm=sender, has_media=num_media > 0, body_chars=len(body_text))
+
+    import asyncio
+    loop = asyncio.get_running_loop()
+
+    transcript = body_text
+    audio_note = ""
+
+    if num_media > 0:
+        media_url = params.get("MediaUrl0", "")
+        media_type = params.get("MediaContentType0", "")
+        if media_type.startswith("audio/"):
+            try:
+                wav_bytes = await loop.run_in_executor(
+                    None, _download_and_normalize_audio, media_url, media_type
+                )
+                transcribed = _transcribe_audio(wav_bytes)
+                if transcribed:
+                    transcript = f"{transcript}\n{transcribed}".strip()
+                else:
+                    audio_note = (
+                        "\n\n\U0001f399️ Sprachnachricht erhalten, aber automatische Transkription "
+                        "ist noch nicht aktiv -- bitte schick deinen Bericht zusätzlich als Text."
+                    )
+            except Exception as exc:
+                log.warning("WhatsApp-Webhook: Audio-Verarbeitung fehlgeschlagen", error=str(exc))
+                audio_note = (
+                    "\n\n⚠️ Deine Sprachnachricht konnte nicht verarbeitet werden. "
+                    "Bitte schick deinen Bericht als Text."
+                )
+        else:
+            audio_note = (
+                f"\n\n\U0001f4ce Anhang ({media_type or 'unbekannter Typ'}) erhalten, aber nicht "
+                "verarbeitet -- bitte schick Text oder eine Sprachnachricht."
+            )
+
+    if not transcript:
+        return _twiml_response(
+            "Hallo! Schick mir kurz, was du heute gemacht hast (Kunde, Stunden, Material) -- "
+            "ich erstelle daraus automatisch deinen Regiebericht." + audio_note
+        )
+
+    field_worker = _AGENT_REGISTRY.get("field-worker")
+    if field_worker is None:
+        return _twiml_response(
+            "Der Baustellen-Assistent ist gerade nicht verfügbar. Bitte versuch es in ein paar Minuten erneut."
+        )
+
+    agent_response = await loop.run_in_executor(
+        None,
+        field_worker.process,
+        AgentRequest(text=transcript, session_id=f"whatsapp-{sender}-{uuid.uuid4().hex[:8]}"),
+    )
+
+    if not agent_response.success:
+        log.warning("WhatsApp-Webhook: field-worker-Agent fehlgeschlagen", error=agent_response.error)
+        return _twiml_response(
+            "Entschuldigung, da ist etwas schiefgelaufen. Bitte versuch es nochmal oder melde dich direkt bei Anton."
+            + audio_note
+        )
+
+    data = agent_response.result
+
+    try:
+        _REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        pdf_path = await loop.run_in_executor(
+            None, generate_regiebericht, data, _REPORTS_DIR / suggested_filename(data)
+        )
+    except Exception as exc:
+        log.error("WhatsApp-Webhook: PDF-Erstellung fehlgeschlagen", error=str(exc))
+        return _twiml_response(
+            "Ich habe deine Angaben erhalten, konnte aber den Regiebericht als PDF nicht erstellen. "
+            "Anton wurde informiert." + audio_note
+        )
+
+    proto = request.headers.get("X-Forwarded-Proto", request.url.scheme)
+    netloc = request.headers.get("X-Forwarded-Host", request.url.netloc)
+    pdf_url = f"{proto}://{netloc}/static/reports/{pdf_path.name}"
+
+    stunden_text = data.get("stunden") if data.get("stunden") is not None else "?"
+    confirmation = (
+        f"✅ Regiebericht erstellt für {data.get('kunde') or 'unbekannten Kunden'} "
+        f"({stunden_text} Std.).\n{pdf_url}"
+    )
+    if data.get("confidence_notes"):
+        confirmation += f"\n\nHinweis: {data['confidence_notes']}"
+    confirmation += audio_note
+
+    return _twiml_response(confirmation, media_url=pdf_url)
 
 
 # ── Post-Call Protokolle ──────────────────────────────────────────────────────

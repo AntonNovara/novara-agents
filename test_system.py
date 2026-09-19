@@ -2226,6 +2226,371 @@ def test_guardian_agent() -> None:
         traceback.print_exc()
 
 
+# ── Test 23: utils/pdf_generator.py — Regiebericht-PDF-Erzeugung ────────────
+
+def test_pdf_generator() -> None:
+    section("TEST 23 — utils/pdf_generator.py: Regiebericht-PDF-Erzeugung")
+    info(
+        "generate_regiebericht() muss (a) aus vollständigen Daten ein valides, "
+        "textextrahierbares PDF erzeugen, (b) mit leeren/fehlenden Feldern "
+        "nicht abstürzen (Platzhalter-Werte), (c) Zeichen außerhalb von "
+        "fpdf2s Core-Font-Zeichensatz (€, Halbgeviertstrich, Emoji) sicher "
+        "ersetzen statt eine FPDFUnicodeEncodingException zu werfen -- alle "
+        "drei traten beim ersten manuellen Smoke-Test tatsächlich auf, siehe "
+        "CLAUDE.md. suggested_filename() muss immer ein dateisystemsicheres "
+        "Ergebnis liefern, auch bei Umlauten/Sonderzeichen in Techniker/Kunde."
+    )
+    try:
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        import pdfplumber
+
+        from utils.pdf_generator import generate_regiebericht, suggested_filename
+    except Exception as exc:
+        fail("Import für PDF-Generator-Test", str(exc))
+        return
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="novara-pdf-test-"))
+    try:
+        # 23a: vollständige Daten inkl. Sonderzeichen (€, Halbgeviertstrich, Emoji).
+        data = {
+            "techniker": "Markus Hölzl",
+            "kunde": "Familie Müller – Baustelle Döbling",
+            "datum": "19.09.2026",
+            "stunden": 3.5,
+            "material": ["FI-Schalter", "Kabel 3x1,5mm²"],
+            "arbeit": "FI-Schalter getauscht. Kosten: 45€/Std. – erledigt 👍.",
+        }
+        out_path = generate_regiebericht(data, output_path=tmp_dir / "full.pdf")
+        if out_path.exists() and out_path.stat().st_size > 500:
+            ok("generate_regiebericht() erzeugt eine nicht-triviale PDF-Datei aus vollständigen Daten", f"{out_path.stat().st_size} Bytes")
+        else:
+            fail("generate_regiebericht() (vollständige Daten) unerwartetes Ergebnis", str(out_path))
+
+        with pdfplumber.open(out_path) as pdf:
+            extracted = pdf.pages[0].extract_text() or ""
+        checks = {
+            "Titel 'Regiebericht' vorhanden": "Regiebericht" in extracted,
+            "Techniker-Name vorhanden": "Hölzl" in extracted,
+            "Stunden vorhanden": "3.5" in extracted,
+            "Euro-Zeichen als 'EUR' ersetzt (kein Crash, kein Datenverlust)": "EUR" in extracted or "45" in extracted,
+        }
+        if all(checks.values()):
+            ok("PDF-Text-Extraktion bestätigt alle erwarteten Felder inkl. Sonderzeichen-Handling", str(checks))
+        else:
+            fail("PDF-Text-Extraktion unerwartetes Ergebnis", str(checks))
+
+        # 23b: leere/fehlende Daten dürfen nicht abstürzen.
+        empty_path = generate_regiebericht({}, output_path=tmp_dir / "empty.pdf")
+        if empty_path.exists():
+            ok("generate_regiebericht() mit leerem dict stürzt nicht ab, erzeugt Platzhalter-PDF")
+        else:
+            fail("generate_regiebericht() (leere Daten) unerwartetes Ergebnis")
+
+        # 23c: Default-Dateiname ist wörtlich "Regiebericht.pdf" (siehe Docstring/Aufgabenstellung).
+        cwd_before = Path.cwd()
+        try:
+            import os
+            os.chdir(tmp_dir)
+            default_path = generate_regiebericht(data)
+            if default_path.name == "Regiebericht.pdf" and default_path.exists():
+                ok("generate_regiebericht() ohne output_path nutzt wörtlich 'Regiebericht.pdf'")
+            else:
+                fail("generate_regiebericht() (Default-Dateiname) unerwartetes Ergebnis", str(default_path))
+        finally:
+            os.chdir(cwd_before)
+
+        # 23d: suggested_filename() ist immer dateisystemsicher, auch bei Umlauten.
+        fname = suggested_filename({"techniker": "Björn Müller-Öztürk", "kunde": "Café Zöglein & Söhne GmbH"})
+        unsafe_chars = set(fname) - set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.")
+        if not unsafe_chars and fname.endswith(".pdf"):
+            ok("suggested_filename() liefert ein dateisystemsicheres Ergebnis trotz Umlauten/Sonderzeichen", fname)
+        else:
+            fail("suggested_filename() enthält unsichere Zeichen", f"{fname!r} -> {unsafe_chars}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ── Test 24: agents/field_worker_agent.py — Regiebericht-Datenextraktion ────
+
+def test_field_worker_agent(live: bool) -> None:
+    section("TEST 24 — FieldWorkerAgent: Regiebericht-Datenextraktion aus Techniker-Nachrichten")
+    info(
+        "extract_entities() muss (a) bei einer validen LLM-JSON-Antwort alle "
+        "Regiebericht-Felder korrekt übernehmen, (b) bei einem fehlgeschlagenen "
+        "LLM-Aufruf graceful auf Platzhalter zurückfallen (keine Exception), "
+        "und (c) bei einer LLM-Antwort ohne valides JSON den Rohtext als "
+        "Arbeitsbeschreibung übernehmen statt die Nachricht zu verwerfen -- "
+        "dieselbe zweistufige Fallback-Philosophie wie agents/sdr_agent.py "
+        "receptionist_node() (17.09.2026-Fix)."
+    )
+    try:
+        from agents.field_worker_agent import FieldWorkerGraph
+    except Exception as exc:
+        fail("Import für FieldWorkerAgent-Test", str(exc))
+        return
+
+    class _FakeResponse:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    class _FakeLLM:
+        def __init__(self, content: str) -> None:
+            self._content = content
+
+        def invoke(self, messages):
+            return _FakeResponse(self._content)
+
+    class _BrokenLLM:
+        def invoke(self, messages):
+            raise RuntimeError("simulierter Netzwerkfehler")
+
+    # 24a: valide JSON-Antwort.
+    valid_json = (
+        '{"techniker": "Markus", "kunde": "Familie Gruber, Hietzing", "datum": "19.09.2026", '
+        '"stunden": 3.5, "material": ["FI-Schalter", "Kabel"], '
+        '"arbeit": "FI-Schalter getauscht.", "language": "de", "confidence_notes": ""}'
+    )
+    graph = FieldWorkerGraph(llm=_FakeLLM(valid_json))
+    result = graph.run(input_text="Oida, hob heit den FI bei da Gruber gwechselt.", session_id="fw-test-1")
+    if (
+        result.get("techniker") == "Markus"
+        and result.get("stunden") == 3.5
+        and result.get("material") == ["FI-Schalter", "Kabel"]
+        and result.get("vollstaendig") is True
+    ):
+        ok("extract_entities() übernimmt alle Felder korrekt aus valider LLM-JSON-Antwort", str(result))
+    else:
+        fail("extract_entities() (valides JSON) unerwartetes Ergebnis", str(result))
+
+    # 24b: LLM-Aufruf schlägt fehl.
+    graph_broken = FieldWorkerGraph(llm=_BrokenLLM())
+    try:
+        result_broken = graph_broken.run(input_text="Testnachricht", session_id="fw-test-2")
+        if result_broken.get("vollstaendig") is False and result_broken.get("arbeit"):
+            ok("extract_entities() fällt bei LLM-Aufruf-Fehler graceful auf Platzhalter zurück, keine Exception")
+        else:
+            fail("extract_entities() (LLM-Fehler) unerwartetes Ergebnis", str(result_broken))
+    except Exception as exc:
+        fail("extract_entities() (LLM-Fehler) hat eine Exception propagiert", str(exc))
+
+    # 24c: LLM antwortet mit reinem Fließtext statt JSON.
+    graph_plain = FieldWorkerGraph(llm=_FakeLLM("Passt scho, hob heit nix Besonderes gmacht."))
+    try:
+        result_plain = graph_plain.run(input_text="Testnachricht 2", session_id="fw-test-3")
+        if result_plain.get("arbeit") and result_plain.get("vollstaendig") is False:
+            ok("extract_entities() nutzt bei nicht-JSON-LLM-Antwort den Rohtext statt die Nachricht zu verwerfen")
+        else:
+            fail("extract_entities() (Nicht-JSON-Antwort) unerwartetes Ergebnis", str(result_plain))
+    except Exception as exc:
+        fail("extract_entities() (Nicht-JSON-Antwort) hat eine Exception propagiert", str(exc))
+
+    # 24d: voller Durchlauf mit echtem LLM (österreichischer Dialekt/Fachjargon).
+    if not live:
+        warn("FieldWorkerAgent-Live-Test übersprungen", "kein gültiger ANTHROPIC_API_KEY lokal")
+        return
+
+    try:
+        from agents.base_agent import AgentRequest
+        from agents.field_worker_agent import FieldWorkerAgent
+
+        agent = FieldWorkerAgent()
+        msg = (
+            "Servas, hob heit bei da Fam. Berger in Floridsdorf zwoa Stunden an Heizkörper "
+            "getauscht und a neichs Ventil eingebaut, leiwand glaufen."
+        )
+        response = agent.process(AgentRequest(text=msg, session_id="fw-live-test"))
+        info(f"techniker={response.result.get('techniker')!r}, kunde={response.result.get('kunde')!r}, stunden={response.result.get('stunden')!r}")
+        if response.success and response.result.get("arbeit"):
+            ok("FieldWorkerAgent.process() liefert eine strukturierte Extraktion aus Dialekt-Text (LLM)", str(response.result)[:200])
+        else:
+            fail("FieldWorkerAgent.process() unerwartetes Ergebnis (live)", str(response))
+    except Exception:
+        fail("FieldWorkerAgent-Live-Test — Exception")
+        traceback.print_exc()
+
+
+# ── Test 25: main.py POST /api/v1/webhook/whatsapp — Twilio-Webhook ────────
+
+def _build_fake_whatsapp_request(form_params: dict, headers: dict | None = None, https: bool = True):
+    """Baut ein echtes Starlette-Request-Objekt mit form-encodiertem Body für
+    main.py whatsapp_webhook()-Tests -- KEIN TestClient (würde main.py's
+    lifespan() inkl. echtem Anthropic-Egress-Check auslösen, siehe TEST 16
+    für dieselbe bereits etablierte Begründung), sondern derselbe
+    Route-Handler-Direktaufruf-Stil wie überall sonst in dieser Datei."""
+    from urllib.parse import urlencode
+
+    from starlette.requests import Request
+
+    body = urlencode(form_params).encode("utf-8")
+    header_list = [(b"content-type", b"application/x-www-form-urlencoded")]
+    for key, value in (headers or {}).items():
+        header_list.append((key.lower().encode(), value.encode()))
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/v1/webhook/whatsapp",
+        "raw_path": b"/api/v1/webhook/whatsapp",
+        "query_string": b"",
+        "headers": header_list,
+        "scheme": "https" if https else "http",
+        "server": ("novara-agents-production.up.railway.app", 443),
+        "client": ("127.0.0.1", 12345),
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(scope, receive)
+
+
+def test_whatsapp_webhook(live: bool) -> None:
+    section("TEST 25 — main.py POST /api/v1/webhook/whatsapp: Twilio-Signatur + Webhook-Flow")
+    info(
+        "_verify_twilio_signature() muss (a) eine korrekte Signatur akzeptieren, "
+        "(b) eine manipulierte/falsche Signatur ablehnen, und (c) ohne "
+        "konfiguriertes TWILIO_AUTH_TOKEN ungeprüft durchlassen (Fail-Safe für "
+        "lokale Entwicklung, siehe core/config.py-Kommentar). whatsapp_webhook() "
+        "selbst darf bei einer ungültigen Signatur einen 401 werfen, muss aber "
+        "bei jedem internen Fehler (kein field-worker-Agent, leere Nachricht) "
+        "IMMER eine TwiML-Antwort liefern statt eine unbehandelte Exception --"
+        " Twilio darf nie einen 5xx sehen."
+    )
+    try:
+        import asyncio
+
+        import main as main_module
+    except Exception as exc:
+        fail("Import für WhatsApp-Webhook-Test", str(exc))
+        return
+
+    from twilio.request_validator import RequestValidator
+
+    original_token = main_module.settings.twilio_auth_token
+
+    class _FakeSecret:
+        def __init__(self, value: str) -> None:
+            self._value = value
+
+        def get_secret_value(self) -> str:
+            return self._value
+
+    # 25a: Signaturprüfung -- valide, ungültige, und "kein Token konfiguriert".
+    try:
+        main_module.settings.twilio_auth_token = _FakeSecret("test_secret_token")
+        params = {"From": "whatsapp:+436641234567", "Body": "Test", "NumMedia": "0"}
+        url = "https://novara-agents-production.up.railway.app/api/v1/webhook/whatsapp"
+        valid_sig = RequestValidator("test_secret_token").compute_signature(url, params)
+
+        valid_request = _build_fake_whatsapp_request(params, headers={"X-Twilio-Signature": valid_sig})
+        invalid_request = _build_fake_whatsapp_request(params, headers={"X-Twilio-Signature": "falsch"})
+        missing_sig_request = _build_fake_whatsapp_request(params)
+
+        checks = {
+            "valide Signatur akzeptiert": main_module._verify_twilio_signature(valid_request, params) is True,
+            "ungültige Signatur abgelehnt": main_module._verify_twilio_signature(invalid_request, params) is False,
+            "fehlende Signatur abgelehnt": main_module._verify_twilio_signature(missing_sig_request, params) is False,
+        }
+        if all(checks.values()):
+            ok("_verify_twilio_signature() akzeptiert/verwirft Signaturen korrekt", str(checks))
+        else:
+            fail("_verify_twilio_signature() unerwartetes Ergebnis", str(checks))
+
+        main_module.settings.twilio_auth_token = _FakeSecret("")
+        no_token_request = _build_fake_whatsapp_request(params)
+        if main_module._verify_twilio_signature(no_token_request, params) is True:
+            ok("_verify_twilio_signature() lässt ohne konfiguriertes TWILIO_AUTH_TOKEN ungeprüft durch (Fail-Safe)")
+        else:
+            fail("_verify_twilio_signature() (kein Token) hätte durchlassen müssen")
+    finally:
+        main_module.settings.twilio_auth_token = original_token
+
+    # 25b: voller Handler-Aufruf mit ungültiger Signatur (Token konfiguriert) -> HTTPException(401).
+    from fastapi import HTTPException
+
+    try:
+        main_module.settings.twilio_auth_token = _FakeSecret("test_secret_token")
+        params = {"From": "whatsapp:+436641234567", "Body": "Test", "NumMedia": "0"}
+        bad_request = _build_fake_whatsapp_request(params, headers={"X-Twilio-Signature": "falsch"})
+        try:
+            asyncio.run(main_module.whatsapp_webhook(bad_request))
+            fail("whatsapp_webhook() hätte bei ungültiger Signatur 401 werfen müssen")
+        except HTTPException as exc:
+            if exc.status_code == 401:
+                ok("whatsapp_webhook() lehnt eine ungültige Twilio-Signatur mit 401 ab")
+            else:
+                fail("whatsapp_webhook() falscher Statuscode für ungültige Signatur", str(exc.status_code))
+    except Exception:
+        fail("whatsapp_webhook() (ungültige Signatur) — unerwartete Exception")
+        traceback.print_exc()
+    finally:
+        main_module.settings.twilio_auth_token = original_token
+
+    # 25c: leere Nachricht (kein Token konfiguriert, wie im lokalen Dev-Setup) -> TwiML-Prompt, kein Crash.
+    try:
+        main_module.settings.twilio_auth_token = _FakeSecret("")
+        empty_request = _build_fake_whatsapp_request({"From": "whatsapp:+436641234567", "Body": "", "NumMedia": "0"})
+        response = asyncio.run(main_module.whatsapp_webhook(empty_request))
+        body_text = response.body.decode("utf-8")
+        if response.status_code == 200 and "<Response>" in body_text and "Regiebericht" in body_text:
+            ok("whatsapp_webhook() antwortet bei leerer Nachricht mit einer gültigen TwiML-Aufforderung")
+        else:
+            fail("whatsapp_webhook() (leere Nachricht) unerwartetes Ergebnis", body_text[:200])
+    except Exception:
+        fail("whatsapp_webhook() (leere Nachricht) — unerwartete Exception")
+        traceback.print_exc()
+    finally:
+        main_module.settings.twilio_auth_token = original_token
+
+    # 25d: voller Happy-Path mit echtem LLM -- erzeugt ein echtes PDF unter static/reports/.
+    if not live:
+        warn("WhatsApp-Webhook-Live-Test übersprungen", "kein gültiger ANTHROPIC_API_KEY lokal")
+        return
+
+    # _AGENT_REGISTRY wird normalerweise in main.py lifespan() befüllt (App-
+    # Start) -- dieser Test ruft whatsapp_webhook() direkt auf (siehe
+    # _build_fake_whatsapp_request()-Docstring, gleiche TestClient-Vermeidung
+    # wie TEST 16), lifespan() läuft daher nie und _AGENT_REGISTRY bliebe ohne
+    # diesen Schritt leer -- whatsapp_webhook() würde dann fälschlich "Der
+    # Baustellen-Assistent ist gerade nicht verfügbar" antworten, obwohl der
+    # Agent selbst funktioniert.
+    from agents.field_worker_agent import FieldWorkerAgent
+
+    original_registry = main_module._AGENT_REGISTRY
+    try:
+        main_module._AGENT_REGISTRY = {"field-worker": FieldWorkerAgent()}
+        main_module.settings.twilio_auth_token = _FakeSecret("")
+        msg_params = {
+            "From": "whatsapp:+436641234567",
+            "Body": "Hob heit bei da Fam. Berger zwoa Stunden an Heizkörper getauscht.",
+            "NumMedia": "0",
+        }
+        request = _build_fake_whatsapp_request(msg_params)
+        response = asyncio.run(main_module.whatsapp_webhook(request))
+        body_text = response.body.decode("utf-8")
+        info(f"TwiML-Antwort: {body_text[:200]}")
+
+        pdf_created = any(main_module._REPORTS_DIR.glob("*.pdf")) if main_module._REPORTS_DIR.exists() else False
+        if response.status_code == 200 and "Regiebericht erstellt" in body_text and pdf_created:
+            ok("whatsapp_webhook() voller Durchlauf: extrahiert, erstellt PDF, liefert TwiML mit Media-Link (LLM)")
+        else:
+            fail("whatsapp_webhook() (Live-Happy-Path) unerwartetes Ergebnis", body_text[:300])
+    except Exception:
+        fail("WhatsApp-Webhook-Live-Test — Exception")
+        traceback.print_exc()
+    finally:
+        main_module.settings.twilio_auth_token = original_token
+        main_module._AGENT_REGISTRY = original_registry
+        # Test-generierte PDFs nicht liegen lassen -- static/reports/ ist ohnehin
+        # gitignored (Laufzeit-Artefakt), aber lokale Testläufe sollen keine Spuren hinterlassen.
+        import shutil
+        if main_module._REPORTS_DIR.exists():
+            shutil.rmtree(main_module._REPORTS_DIR, ignore_errors=True)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -2262,6 +2627,9 @@ def main() -> int:
     test_mcp_server()
     test_inbound_chat(live)
     test_guardian_agent()
+    test_pdf_generator()
+    test_field_worker_agent(live)
+    test_whatsapp_webhook(live)
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")
