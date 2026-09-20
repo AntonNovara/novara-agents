@@ -753,6 +753,46 @@ stattdessen eine erklärende TwiML-Nachricht mit HTTP 200).
 > `except Exception` in `whatsapp_webhook()` stillschweigend verschluckt
 > wurde. `_transcribe_audio()` nutzt jetzt konsistent `log.warning(...)`.
 
+> **Härtung (20.09.2026): Signaturprüfung robuster gegen Railway-Proxy-
+> Eigenheiten, globales Sicherheitsnetz + Schritt-Logging für die Diagnose in
+> Produktion.** Drei unabhängige Verbesserungen am bereits bestehenden
+> Webhook-Pfad, kein neues Feature:
+>
+> 1. `_verify_twilio_signature()` behandelt `X-Forwarded-Proto`/
+>    `X-Forwarded-Host` jetzt robust gegen zwei konkrete Proxy-Eigenheiten,
+>    statt die Prüfung deswegen abzuschwächen: mehrfach verkettete Proxies
+>    können diese Header kommagetrennt senden (nur der erste, client-nächste
+>    Wert zählt, über `_first_forwarded_value()`), und falls der erkannte
+>    `proto` nicht zur tatsächlich von Twilio aufgerufenen URL passt, wird
+>    zusätzlich die jeweils andere https/http-Variante probiert, BEVOR die
+>    Signatur als ungültig gilt. **Bewusst NICHT umgesetzt: ein bei einer
+>    Anfrage kurzzeitig diskutierter "bei Signaturfehler nur warnen statt
+>    401" -- das würde die einzige Authentifizierung dieses öffentlichen,
+>    kostenpflichtige API-Calls (Anthropic + Groq) auslösenden Endpoints
+>    abschalten (siehe Modul-Docstring, "ÖFFENTLICH, KEIN X-API-Key") und
+>    jeden unauthentifizierten Request unbegrenzt durchlassen. Mit
+>    konfiguriertem `TWILIO_AUTH_TOKEN` bleibt eine tatsächlich falsche
+>    Signatur daher weiterhin ein harter 401, wie von TEST 25 verifiziert --
+>    nur die URL-*Rekonstruktion* wurde toleranter gegenüber Proxy-Varianz,
+>    nicht die kryptografische Prüfung selbst.**
+> 2. Neuer äußerer `try/except` in `whatsapp_webhook()`, der den gesamten
+>    Verarbeitungspfad NACH der Signaturprüfung umschließt (die bestehenden,
+>    spezifischer formulierten `try/except`-Blöcke für Audio/Agent/PDF
+>    bleiben unverändert und greifen zuerst). Schließt eine reale Lücke: der
+>    `field_worker.process(...)`-Aufruf selbst war bisher NICHT abgesichert
+>    -- ein unerwarteter Bug dort hätte unbehandelt bis zu FastAPI
+>    durchgeschlagen und Twilio einen 5xx gezeigt, entgegen der im
+>    Modul-Docstring dokumentierten Garantie. Per Test verifiziert (simulierter
+>    `RuntimeError` tief im Agenten → weiterhin `200` mit valider TwiML-
+>    Fehlermeldung statt Crash).
+> 3. Fünf `[STEP N]`-Log-Marker (`log.info`, structlog) entlang des
+>    Happy-Path-Ablaufs (`[STEP 1]` Request akzeptiert, `[STEP 2]` Groq-
+>    Transkription erfolgreich, `[STEP 3]` FieldWorkerAgent fertig, `[STEP 4]`
+>    PDF erzeugt, `[STEP 5]` TwiML-Antwort verschickt -- über den neuen
+>    `_twiml_reply()`-Wrapper an JEDEM Rückgabepunkt, nicht nur beim
+>    Erfolgsfall) -- rein für die Diagnose in Railways Log-Stream, grep-bar
+>    nach `[STEP `, keine funktionale Änderung.
+
 **Dockerfile aktualisiert:** `COPY utils/ utils/` ergänzt (das Verzeichnis
 fehlte in der expliziten COPY-Liste — ohne diesen Fix hätte main.py in der
 Railway-Produktivumgebung mit `ModuleNotFoundError: No module named 'utils'`
