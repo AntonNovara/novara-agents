@@ -42,3 +42,7 @@ mcp>=1.6.0,<2.0.0
 twilio==9.11.1
 fpdf2==2.8.8
 pydub==0.25.1
+
+# Speech-to-Text für WhatsApp-Sprachnachrichten (main.py _transcribe_audio(),
+# whisper-large-v3 über die Groq API).
+groq==1.7.0

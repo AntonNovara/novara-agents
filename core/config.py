@@ -144,6 +144,17 @@ class Settings(BaseSettings):
     twilio_account_sid: SecretStr = Field(default="", alias="TWILIO_ACCOUNT_SID")
     twilio_auth_token: SecretStr = Field(default="", alias="TWILIO_AUTH_TOKEN")
 
+    # Baustellen-Voice-Assistant (main.py _transcribe_audio()): Groq-API-Key
+    # für Speech-to-Text (whisper-large-v3) von WhatsApp-Sprachnachrichten.
+    # Ohne Key liefert _transcribe_audio() None (fail-safe, kein Absturz) --
+    # derselbe Umgang mit fehlender Konfiguration wie bei twilio_auth_token.
+    groq_api_key: SecretStr = Field(default="", alias="GROQ_API_KEY")
+
+    @property
+    def groq_key_configured(self) -> bool:
+        """True, wenn ein echter GROQ_API_KEY gesetzt ist."""
+        return bool(self.groq_api_key.get_secret_value().strip())
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

@@ -22,6 +22,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Securi
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
+from groq import Groq
 from pydantic import BaseModel, Field
 from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
@@ -1058,23 +1059,35 @@ def _download_and_normalize_audio(media_url: str, content_type: str) -> bytes:
 
 def _transcribe_audio(wav_bytes: bytes) -> Optional[str]:
     """
-    BEKANNTE LÜCKE, bewusst nicht stillschweigend vorgetäuscht: dieses Repo
-    hat noch KEINEN Speech-to-Text-Provider angebunden. Claude (Anthropic
-    Messages API) transkribiert kein Audio; Vapi (agents/voice_agent.py)
-    umgeht das Problem, indem es STT komplett selbst/extern übernimmt und
-    novara-agents nur bereits transkribierten Text sieht -- für WhatsApp gibt
-    es keine solche vorgelagerte Instanz.
+    Transkribiert eine WhatsApp-Sprachnachricht über die Groq API
+    (whisper-large-v3) -- Audio-Download+Normalisierung
+    (_download_and_normalize_audio) liefert das übergebene WAV bereits
+    fertig, hier passiert nur noch der STT-Aufruf.
 
-    Gibt bewusst None zurück statt zu raten/zu halluzinieren -- der Aufrufer
-    (whatsapp_webhook()) antwortet dem Techniker dann ehrlich, dass
-    automatische Transkription noch nicht aktiv ist, statt eine erfundene
-    oder leere Zusammenfassung als Regiebericht auszugeben. Einziger,
-    bewusst isolierter Anknüpfungspunkt für eine künftige Anbindung (z. B.
-    Whisper API) -- Audio-Download+Normalisierung (_download_and_normalize_audio)
-    ist bereits vollständig implementiert und liefert hier fertiges WAV an.
+    Ohne konfigurierten GROQ_API_KEY (core/config.py) wird NICHT versucht zu
+    transkribieren -- Fail-Safe für lokale Entwicklung ohne Groq-Zugang,
+    analog zu TWILIO_AUTH_TOKEN oben. Jeder Groq-API-Fehler (Netzwerk,
+    Rate-Limit, ungültiger Key, leere Antwort) wird abgefangen und geloggt
+    statt propagiert -- der Aufrufer (whatsapp_webhook()) antwortet dem
+    Techniker dann, dass seine Sprachnachricht nicht transkribiert werden
+    konnte, statt mit einer unbehandelten Exception zu enden (Twilio bekommt
+    nie einen 5xx, siehe whatsapp_webhook()-Docstring).
     """
-    logger.debug("Audio-Transkription angefordert (%d Bytes) -- noch kein STT-Provider konfiguriert", len(wav_bytes))
-    return None
+    if not settings.groq_key_configured:
+        log.warning("Audio-Transkription übersprungen -- kein GROQ_API_KEY konfiguriert")
+        return None
+
+    try:
+        client = Groq(api_key=settings.groq_api_key.get_secret_value())
+        transcription = client.audio.transcriptions.create(
+            file=("audio.wav", wav_bytes),
+            model="whisper-large-v3",
+        )
+        text = (transcription.text or "").strip()
+        return text or None
+    except Exception as exc:
+        log.warning("Audio-Transkription (Groq) fehlgeschlagen", bytes=len(wav_bytes), error=str(exc))
+        return None
 
 
 @app.post(
@@ -1138,7 +1151,7 @@ async def whatsapp_webhook(request: Request):
                 else:
                     audio_note = (
                         "\n\n\U0001f399️ Sprachnachricht erhalten, aber automatische Transkription "
-                        "ist noch nicht aktiv -- bitte schick deinen Bericht zusätzlich als Text."
+                        "ist gerade fehlgeschlagen -- bitte schick deinen Bericht zusätzlich als Text."
                     )
             except Exception as exc:
                 log.warning("WhatsApp-Webhook: Audio-Verarbeitung fehlgeschlagen", error=str(exc))

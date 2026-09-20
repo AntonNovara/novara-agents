@@ -729,24 +729,29 @@ kann), NIEMALS ein 5xx an Twilio (jeder interne Fehlerpfad — kein
 field-worker-Agent verfügbar, PDF-Erzeugung schlägt fehl — liefert
 stattdessen eine erklärende TwiML-Nachricht mit HTTP 200).
 
-> **Bewusst offene Lücke, NICHT stillschweigend vorgetäuscht: Sprach-zu-Text
-> für WhatsApp-Sprachnachrichten ist noch nicht angebunden.**
-> `_download_and_normalize_audio()` lädt eine WhatsApp-Sprachnachricht
-> vollständig echt herunter (Twilio-Media-URL, HTTP-Basic-Auth mit
-> Account-SID+Auth-Token) und normalisiert sie via pydub auf WAV — das ist
-> real implementiert und per Smoke-Test verifiziert (inkl. Fehlerpfad bei
-> nicht erreichbarer Media-URL). Die eigentliche Transkription
-> (`_transcribe_audio()`) gibt bewusst `None` zurück: Claude (Anthropic
-> Messages API) transkribiert kein Audio, und anders als beim Vapi-Pfad
+> **Behoben (20.09.2026): Sprach-zu-Text für WhatsApp-Sprachnachrichten ist
+> jetzt angebunden.** `_download_and_normalize_audio()` lädt eine
+> WhatsApp-Sprachnachricht vollständig echt herunter (Twilio-Media-URL,
+> HTTP-Basic-Auth mit Account-SID+Auth-Token) und normalisiert sie via
+> pydub auf WAV; `_transcribe_audio()` schickt dieses WAV jetzt an die
+> **Groq API** (`whisper-large-v3`, `groq`-SDK, `GROQ_API_KEY` in
+> `core/config.py`/`.env.example`). Claude (Anthropic Messages API)
+> transkribiert weiterhin kein Audio selbst — anders als beim Vapi-Pfad
 > (`agents/voice_agent.py`, wo Vapi selbst/extern transkribiert und
-> novara-agents nur bereits transkribierten Text sieht) gibt es für WhatsApp
-> keine vorgelagerte STT-Instanz. Der Techniker bekommt bei einer
-> Sprachnachricht eine ehrliche Antwort ("automatische Transkription ist
-> noch nicht aktiv, bitte zusätzlich als Text schicken") statt einer
-> erfundenen/leeren Zusammenfassung. `_transcribe_audio()` ist der einzige,
-> bewusst isolierte Anknüpfungspunkt für eine künftige STT-Anbindung (z. B.
-> Whisper API) — bekommt bereits fertiges WAV übergeben, keine weitere
-> Vorarbeit nötig.
+> novara-agents nur bereits transkribierten Text sieht) brauchte WhatsApp
+> also eine eigene, dedizierte STT-Anbindung. Ohne `GROQ_API_KEY` (oder bei
+> jedem Groq-API-Fehler — Netzwerk, Rate-Limit, leere Antwort)
+> liefert `_transcribe_audio()` weiterhin bewusst `None` statt zu raten/zu
+> halluzinieren (Fail-Safe, gleiche Philosophie wie `TWILIO_AUTH_TOKEN`);
+> der Techniker bekommt dann eine ehrliche Fallback-Aufforderung
+> ("automatische Transkription ist gerade fehlgeschlagen, bitte zusätzlich
+> als Text schicken") statt einer erfundenen/leeren Zusammenfassung.
+> Nebenbei behoben: der alte Platzhalter-Code rief ein nirgends definiertes
+> `logger.debug(...)` auf (kein Modul-Logger namens `logger` existiert in
+> `main.py`, nur `log = structlog.get_logger(...)`) — hätte bei jedem
+> Aufruf einen `NameError` geworfen, der aber vom umgebenden
+> `except Exception` in `whatsapp_webhook()` stillschweigend verschluckt
+> wurde. `_transcribe_audio()` nutzt jetzt konsistent `log.warning(...)`.
 
 **Dockerfile aktualisiert:** `COPY utils/ utils/` ergänzt (das Verzeichnis
 fehlte in der expliziten COPY-Liste — ohne diesen Fix hätte main.py in der
@@ -1654,5 +1659,5 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | Lead-Capture (`core/lead_capture.py`) = In-Memory, kein persistenter Store | Postgres/Redis statt Prozess-Singleton, analog zu Consent-Ledger/Sequence Scheduler/Customer State |
 | Lead-Benachrichtigung (`tools/lead_notifier.py`) = einfaches SMTP-Anwendungspasswort, kein Retry/Queue bei SMTP-Ausfall | Bei Bedarf Retry-Queue oder Wechsel auf einen transaktionalen E-Mail-Dienst (SendGrid/Postmark/SES) |
 | `InboundChatGraph.document_node()` (Anhang-Extraktion) ist über die API voll funktionsfähig, aber `static/chat_widget.js` hat noch keine Upload-UI dafür | Frontend-Arbeit: Datei-Auswahl + Base64-Kodierung im Widget ergänzen, `attachment`-Feld an `/api/v1/chat/landing` mitschicken |
-| Baustellen-Voice-Assistant (`main.py` `/api/v1/webhook/whatsapp`): Sprach-zu-Text für WhatsApp-Sprachnachrichten noch nicht angebunden (`_transcribe_audio()` gibt bewusst `None` zurück) | Whisper API oder vergleichbaren STT-Provider in `_transcribe_audio()` einbinden — Audio-Download+WAV-Normalisierung sind bereits vollständig implementiert |
+| Baustellen-Voice-Assistant (`main.py` `/api/v1/webhook/whatsapp`): Speech-to-Text läuft über Groq (`whisper-large-v3`), kein Retry bei transientem Groq-Fehler — `_transcribe_audio()` gibt dann einmalig `None` zurück, der Techniker muss die Sprachnachricht erneut schicken oder auf Text ausweichen | Bei Bedarf einen einfachen Retry (1-2 Versuche) in `_transcribe_audio()` ergänzen, analog zum `resilient_node()`-Decorator des GuardianAgent |
 | Regiebericht-PDFs (`static/reports/`) liegen auf Railways ephemerem Dateisystem — verschwinden bei jedem Redeploy/Neustart, keine Historie/Liste vergangener Berichte | Persistenter Objektspeicher (z. B. S3-kompatibel) statt lokalem Dateisystem, falls eine Berichtshistorie gebraucht wird |
