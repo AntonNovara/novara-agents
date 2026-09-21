@@ -5,12 +5,13 @@ CRMIntegration (Operations-Agent, Rechnungen): weiterhin reiner In-Memory-
 Mock. TODO: vor Einsatz auf echtes ERP umstellen (_post_to_erp() durch
 httpx-Client ersetzen) — Interface bleibt identisch.
 
-CRMIntegrationSDR (SDR-Agent, Leads): Mock per Default, optional echte
-Kopplung an crm_handler.py (Repo la-maquina-de-confianza) über
-settings.sdr_crm_live_sheet (Block C1, 10.09.2026) — siehe
-_lead_record_to_sheet_row(), upsert_lead() und tools/live_crm_bridge.py.
-Nur für lokale Entwicklung: die Kopplung hängt an einem OAuth-Token, der an
-diesen Mac gebunden ist, nicht an einem Railway-Deploy verfügbar.
+CRMIntegrationSDR (SDR-Agent, Leads): Mock per Default, mit zwei möglichen
+echten Schreibpfaden zum selben Google Sheet — siehe upsert_lead():
+- settings.crm_service_account_configured (tools/production_crm_bridge.py,
+  21.09.2026): Service-Account-Auth, funktioniert auf Railway.
+- settings.sdr_crm_live_sheet (Block C1, 10.09.2026, tools/live_crm_bridge.py
+  → crm_handler.py im Repo la-maquina-de-confianza): OAuth-Token, an diesen
+  Mac gebunden, NUR für lokale Entwicklung.
 """
 from __future__ import annotations
 
@@ -161,11 +162,19 @@ class CRMIntegrationSDR(CRMIntegration):
         """
         Schreibt einen Lead-Datensatz ins CRM.
 
-        Standardmäßig In-Memory-Mock (_mock_store). Wenn
-        settings.sdr_crm_live_sheet=true ist (Block C1, nur lokale
-        Entwicklung — siehe tools/live_crm_bridge.py), wird zusätzlich echt
-        ins Produktions-Google-Sheet geschrieben; schlägt das fehl, wird das
-        bewusst als success=False gemeldet statt hinter dem Mock versteckt.
+        Standardmäßig In-Memory-Mock (_mock_store). Zwei mögliche echte
+        Schreibpfade, geprüft in dieser Reihenfolge:
+        1. settings.crm_service_account_configured (Produktion, seit
+           21.09.2026, siehe tools/production_crm_bridge.py) — Service-
+           Account-Auth, funktioniert auf Railway.
+        2. settings.sdr_crm_live_sheet (Block C1, NUR lokale Entwicklung —
+           siehe tools/live_crm_bridge.py) — OAuth-Token, an diesen Mac
+           gebunden.
+        Beide zielen auf dasselbe Google Sheet (siehe production_crm_bridge-
+        Docstring) und sind bewusst nie gleichzeitig aktiv erwartet (lokal
+        entweder das eine ODER das andere Flag setzen, nie beide). Schlägt
+        ein aktiver Live-Schreibpfad fehl, wird das bewusst als
+        success=False gemeldet statt hinter dem Mock versteckt.
         """
         payload = record.model_dump()
         self._mock_store.append(payload)
@@ -174,6 +183,37 @@ class CRMIntegrationSDR(CRMIntegration):
             "CRM upsert_lead called",
             extra={"lead_id": record.lead_id, "company": record.company_name, "score": record.lead_score},
         )
+
+        if settings.crm_service_account_configured:
+            from tools.production_crm_bridge import add_lead_to_crm
+
+            try:
+                written_row = add_lead_to_crm(_lead_record_to_sheet_row(record))
+            except Exception as exc:
+                logger.warning(
+                    "Produktions-CRM-Schreibversuch fehlgeschlagen",
+                    extra={"lead_id": record.lead_id, "error": str(exc)},
+                )
+                return LeadCRMResult(
+                    success=False,
+                    lead_id=record.lead_id,
+                    message=f"Produktions-CRM-Schreibversuch fehlgeschlagen: {exc}",
+                    crm_response={},
+                )
+
+            logger.info(
+                "Lead ins Produktions-CRM-Sheet geschrieben",
+                extra={"lead_id": record.lead_id, "sheet_row_id": written_row.get("ID")},
+            )
+            return LeadCRMResult(
+                success=True,
+                lead_id=record.lead_id,
+                message=(
+                    f"Lead '{record.contact_name}' @ '{record.company_name}' "
+                    f"erfolgreich im Live-Google-Sheet angelegt (Zeile {written_row.get('ID')})."
+                ),
+                crm_response={"sheet_row": written_row},
+            )
 
         if settings.sdr_crm_live_sheet:
             from tools.live_crm_bridge import add_lead_to_live_crm

@@ -158,6 +158,34 @@ class Settings(BaseSettings):
     # auf eine lokale SQLite-Datei zurück -- siehe dortigen Kommentar.
     database_url: str = Field(default="", alias="DATABASE_URL")
 
+    # Produktions-CRM-Kopplung (tools/production_crm_bridge.py, 21.09.2026):
+    # Service-Account-Zugriff auf dasselbe Google Sheet wie
+    # tools/live_crm_bridge.py (dort OAuth mit lokal gebundenem Token, NUR
+    # für Entwicklung -- siehe dessen Docstring). Ein Service-Account
+    # braucht keinen interaktiven Browser-Login und funktioniert daher auf
+    # Railway: das JSON-Schlüsseldokument aus der Google-Cloud-Console als
+    # kompletter String in dieser einen Env-Var, die zugehörige
+    # Service-Account-E-Mail (…@…iam.gserviceaccount.com, im JSON als
+    # "client_email") muss vorher als Editor auf das Sheet eingeladen
+    # werden. Leer = Produktions-Pfad inaktiv (tools/crm_integration.py
+    # CRMIntegrationSDR.upsert_lead() fällt dann auf sdr_crm_live_sheet
+    # [lokal] bzw. den In-Memory-Mock zurück).
+    google_sheets_service_account_json: SecretStr = Field(
+        default="", alias="GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON"
+    )
+    # Dieselbe Spreadsheet-ID/Tab, die la-maquina-de-confianza/crm_handler.py
+    # lokal beschreibt (NOVARA_CRM_SPREADSHEET_ID/NOVARA_CRM_SHEET_NAME dort)
+    # -- beide Schreibpfade zielen bewusst auf dasselbe, einzige CRM-Sheet.
+    crm_spreadsheet_id: str = Field(
+        default="1u5bUNNzpRaKMx9f4p3i8CSaRsFScCQ2rXMDR6nA4KnQ", alias="CRM_SPREADSHEET_ID"
+    )
+    crm_sheet_name: str = Field(default="CRM", alias="CRM_SHEET_NAME")
+
+    @property
+    def crm_service_account_configured(self) -> bool:
+        """True, wenn GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON gesetzt ist (Produktions-CRM-Pfad aktiv)."""
+        return bool(self.google_sheets_service_account_json.get_secret_value().strip())
+
     @property
     def groq_key_configured(self) -> bool:
         """True, wenn ein echter GROQ_API_KEY gesetzt ist."""

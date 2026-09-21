@@ -644,6 +644,73 @@ Test-Lead dort anlegen.
 
 ---
 
+## Produktions-Infrastruktur: Rate-Limiting, Persistenter Store, CRM-Produktionspfad, Uptime-Monitor (21.09.2026)
+
+Vier unabhängige Produktivbetrieb-Bausteine, alle aus der bisherigen
+"Bekannte Einschränkungen"-Tabelle:
+
+**1. Rate-Limiting auf `POST /api/v1/chat/landing`** (`main.py`,
+`requirements.txt`, `Dockerfile`) — `slowapi`, 20 Requests/Minute pro
+Besucher-IP, auf dem einzigen öffentlichen Endpoint, der pro Request einen
+echten LLM-Call auslöst. `Dockerfile`s `CMD` übergibt uvicorn jetzt
+`--proxy-headers --forwarded-allow-ips='*'`, sonst wäre `request.client.host`
+(worauf `slowapi` schlüsselt) Railways interne Proxy-IP statt der echten
+Besucher-IP.
+
+**2. Persistenter Store** (`core/db.py`, neu) — SQLAlchemy, Postgres in
+Produktion (Railway-Plugin, `DATABASE_URL`), lokale SQLite-Datei ohne
+`DATABASE_URL`. Ersetzt die In-Memory-Prozess-Singletons in `core/consent.py`,
+`core/customer_state.py`, `core/lead_capture.py` und
+`tools/sequence_scheduler.py` — siehe den ausführlichen Hinweis dazu direkt
+über der "Bekannte Einschränkungen"-Tabelle unten für Details (Schema,
+JSON-Spalten für `stages`/`steps`, das eine echte Verhaltens-Detail, das sich
+geändert hat).
+
+**3. CRM-Produktionspfad** (`tools/production_crm_bridge.py`, neu) — der
+SDR-Agent kann Leads jetzt auch von Railway aus ins echte Google-Sheet-CRM
+schreiben, nicht mehr nur lokal (`tools/live_crm_bridge.py`, OAuth-Token an
+diesen Mac gebunden). Service-Account-Auth
+(`GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON`) statt interaktivem Login, dieselbe
+Spreadsheet-ID/Tab wie `crm_handler.py` (`CRM_SPREADSHEET_ID`/
+`CRM_SHEET_NAME`, Defaults = dieselben Werte). DLP-Sanitisierung läuft über
+`core.security.SecurityLayer` statt über `utils/sanitizer.py` aus dem
+Schwester-Repo (dort ohnehin von Railway aus nicht erreichbar) — bewusst
+keine zweite, unabhängige DLP-Implementierung für denselben Zweck.
+`CRMIntegrationSDR.upsert_lead()` prüft `settings.crm_service_account_configured`
+VOR `settings.sdr_crm_live_sheet`, beide Schreibpfade bleiben unabhängig
+nutzbar, aber nie gleichzeitig aktiv erwartet.
+
+**Beim Verifizieren gefunden und behoben: `_as_cell_text()`-Bug, auch in
+`crm_handler.py` vorhanden.** Ein echter Testschreibvorgang gegen das
+Produktions-Sheet (Zeile L-0093, sofort wieder gelöscht) zeigte, dass jede
+leere Zelle statt leer zu bleiben ein einzelnes `'` bekam.
+`value[:1] in "=+@"` ist für `value=""` in Python `True` (leerer String ist
+Teilstring jedes Strings) — der exakte Wortlaut aus `crm_handler.py`, dort
+weiterhin ungefixt (Schwester-Repo, außerhalb des Scopes dieser Runde).
+`tools/production_crm_bridge.py._as_cell_text()` prüft jetzt `value and
+value[0] in "=+@"`. Per zweitem Testschreibvorgang (ebenfalls sofort wieder
+gelöscht) verifiziert: leere Felder sind jetzt tatsächlich leer.
+
+**4. Basis-Uptime-Monitor** (`.github/workflows/uptime-monitor.yml`,
+`monitoring/uptime_alert.py`, neu) — GitHub-Actions-Cron alle 5 Minuten pingt
+das produktive `/health` von außerhalb Railways (ein abgestürzter Container
+kann sich nicht selbst melden) und verschickt bei Fehlschlag eine E-Mail an
+`anton@novaraautomation.com` über dieselbe Gmail-SMTP-Route wie
+`tools/lead_notifier.py`. Kein Dedup/Cooldown zwischen Läufen — ein
+anhaltender Ausfall alarmiert alle 5 Minuten erneut, bewusst in Kauf
+genommen für einen ersten "Basis"-Monitor.
+
+Alle vier Bausteine verifiziert: vollständiger `test_system.py`-Lauf (154
+PASS, 0 FAIL) gegen eine frische lokale SQLite-DB, Rate-Limiting live gegen
+Produktion getestet (21 Requests → 429 ab dem 21.), Postgres-Schreibzugriff
+über einen echten Opt-out-Webhook-Call gegen Produktion bestätigt (Railway-
+Logs: `database_url_configured=true`), CRM-Produktionspfad über zwei echte
+Schreib-/Lösch-Zyklen gegen das reale Sheet verifiziert (siehe oben), Uptime-
+Monitor per manuellem `workflow_dispatch`-Lauf bestätigt (grüner Run, `/health`
+war zum Testzeitpunkt gesund → keine Alert-Mail ausgelöst).
+
+---
+
 ## Baustellen-Voice-Assistant: WhatsApp-Webhook für Regieberichte (20.09.2026)
 
 Sechster (Text-)Agent + zwei neue unterstützende Module — ein Techniker auf
@@ -1705,7 +1772,8 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 
 | Einschränkung | Prod-Lösung |
 |---|---|
-| CRM / ERP = In-Memory-Mock | httpx-Client gegen HubSpot / Salesforce / SAP |
+| CRM / ERP (Operations-Agent, Rechnungen) = In-Memory-Mock | httpx-Client gegen HubSpot / Salesforce / SAP |
+| CRM (SDR-Agent, Leads) hat seit 21.09.2026 einen echten Produktionspfad (`tools/production_crm_bridge.py`, Service-Account) zum selben Google Sheet wie der lokale OAuth-Pfad (`tools/live_crm_bridge.py`) — Mock bleibt Default, solange `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON`/`SDR_CRM_LIVE_SHEET` beide unkonfiguriert sind | Erledigt für den Lead-Schreibpfad; `initialize_crm_sheet()`/`migrate_old_leads()`/`check_gmail_replies()` bleiben ausschließlich lokal über `crm_handler.py` |
 | FAQ-Suche = Keyword-Stemming | Embedding-Suche gegen Weaviate / Qdrant / pgvector |
 | Lead-Datenbank = 15 Hard-coded-Kontakte | LinkedIn Sales Navigator API / CRM-Query |
 | Ticket-System = Mock | Zendesk / Freshdesk / Jira Service Management API |

@@ -1804,9 +1804,12 @@ def test_mcp_server() -> None:
         except Exception:
             ok("upsert_deal lehnt eine unbekannte deal_stage korrekt ab")
 
-        # 20e: upsert_lead NUR gegen den Mock -- niemals gegen das Live-Sheet.
-        if settings.sdr_crm_live_sheet:
-            warn("upsert_lead-Aufruf übersprungen -- SDR_CRM_LIVE_SHEET=true lokal aktiv (würde live schreiben)")
+        # 20e: upsert_lead NUR gegen den Mock -- niemals gegen das Live-Sheet
+        # (weder den lokalen OAuth-Pfad noch den seit 21.09.2026 zusätzlich
+        # möglichen Produktions-Service-Account-Pfad, siehe
+        # tools/production_crm_bridge.py).
+        if settings.sdr_crm_live_sheet or settings.crm_service_account_configured:
+            warn("upsert_lead-Aufruf übersprungen -- Live-CRM-Schreibpfad lokal aktiv (würde live schreiben)")
         else:
             _, lead_result = await mcp_server.mcp.call_tool("upsert_lead", {
                 "company_name": "MCP-Test GmbH", "contact_name": "Test Kontakt", "contact_title": "CEO",
