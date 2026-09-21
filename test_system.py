@@ -1300,7 +1300,18 @@ def test_sequence_scheduler() -> None:
     # 15b: Retry-Logik — max_retries des linkedin-Schritts ist 1: erster
     # Fehlschlag bleibt "pending" (Retry erlaubt), zweiter überschreitet die
     # Grenze -> "failed", Kadenz rückt automatisch weiter.
+    #
+    # Re-fetch nach jedem record_attempt() statt die alte `seq`-Referenz
+    # weiterzuverwenden: seit dem persistenten Store (core/db.py, 21.09.2026)
+    # gibt jeder Aufruf eine FRISCH aus der DB rekonstruierte Sequence-Instanz
+    # zurück (kein geteiltes, in-place mutiertes Objekt mehr wie beim alten
+    # In-Memory-Singleton) -- genau das Verhalten, das ein echter Multi-
+    # Worker-Betrieb braucht (der Aufrufer von Prozess B darf nie stillschwei-
+    # gend Schreibzugriffe von Prozess A auf sein bereits gehaltenes Objekt
+    # gespiegelt sehen). main.py/agents/sdr_agent.py lesen bereits immer den
+    # Rückgabewert neu (siehe deren Aufrufstellen), nie eine alte Referenz.
     scheduler.record_attempt(seq.sequence_id, 1, success=False, reason="Timeout")
+    seq = scheduler.get(seq.sequence_id)
     if seq.steps[1].status == "pending" and seq.current_step == 1:
         ok("Erster Fehlschlag bleibt 'pending' (Retry erlaubt, max_retries=1)")
     else:
@@ -1310,6 +1321,7 @@ def test_sequence_scheduler() -> None:
         )
 
     scheduler.record_attempt(seq.sequence_id, 1, success=False, reason="Timeout erneut")
+    seq = scheduler.get(seq.sequence_id)
     # current_step rückt nicht nur EINEN Schritt weiter, sondern über den
     # bereits "skipped" dritten Schritt (voice) gleich bis ans Ende --
     # _advance() überspringt jede zusammenhängende Folge von

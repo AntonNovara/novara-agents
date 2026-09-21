@@ -150,6 +150,14 @@ class Settings(BaseSettings):
     # derselbe Umgang mit fehlender Konfiguration wie bei twilio_auth_token.
     groq_api_key: SecretStr = Field(default="", alias="GROQ_API_KEY")
 
+    # Persistenter Store (core/db.py) für die vier zuvor In-Memory-Prozess-
+    # Singletons (core/consent.py, core/customer_state.py, core/lead_capture.py,
+    # tools/sequence_scheduler.py) -- Railway setzt DATABASE_URL automatisch,
+    # sobald ein Postgres-Plugin an diesen Service angehängt ist. Ohne
+    # DATABASE_URL (lokale Entwicklung ohne eigenes Postgres) fällt core/db.py
+    # auf eine lokale SQLite-Datei zurück -- siehe dortigen Kommentar.
+    database_url: str = Field(default="", alias="DATABASE_URL")
+
     @property
     def groq_key_configured(self) -> bool:
         """True, wenn ein echter GROQ_API_KEY gesetzt ist."""

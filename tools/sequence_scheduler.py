@@ -17,21 +17,36 @@ bleibt daher immer "skipped", solange kein Identifier (Telefonnummer) bekannt
 ist — was heute für jeden Lead zutrifft, da ProspectContact/LeadRecord aktuell
 keine Telefonnummer erfassen.
 
-Prozessweiter In-Memory-Singleton (`_scheduler`), gleiches Muster wie
-core/consent.py und die Mock-Stores in tools/crm_integration.py — Sequenzen
-gehen bei Neustart verloren. TODO vor Produktivbetrieb: persistenter Store
-(Postgres/Redis) + echter Worker, identische Interface-Methoden.
+Persistiert über core/db.py (Postgres in Produktion, SQLite lokal) seit
+21.09.2026 — vorher In-Memory-Prozess-Singleton (analog zu core/consent.py),
+Sequenzen gingen bei jedem Neustart verloren (der eigentliche Worker fehlt
+weiterhin, siehe Absatz oben — das war nie Teil dieser Runde). Alle
+öffentlichen Methoden (enroll, record_attempt, next_due_step, stop, get,
+find_by_identifier) sind unverändert, inklusive KeyError bei unbekannter
+sequence_id (vorher `self._sequences[sequence_id]`, jetzt explizit geprüft).
+`Sequence`/`StepRecord` bleiben dieselben Dataclasses wie vorher — eine ganze
+Sequenz (Steps + Identifiers) liegt als EIN JSON-Blob pro Zeile
+(`sequences`-Tabelle), keine eigene Tabelle pro Step: jeder Lese-/
+Schreibzugriff braucht immer die vollständige, geordnete Step-Liste (nie nur
+einzelne Steps gefiltert/sortiert), eine normalisierte Tabelle hätte hier nur
+Joins ohne echten Nutzen hinzugefügt — gleiche Abwägung wie
+core/customer_state.py's `stages`-Spalte.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import JSON, DateTime, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
 from core import consent
 from core.consent import Channel
+from core.db import Base, SessionLocal, engine
 
 logger = logging.getLogger(__name__)
 
@@ -74,12 +89,50 @@ class Sequence:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+class _SequenceRow(Base):
+    __tablename__ = "sequences"
+
+    sequence_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    lead_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    stopped_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    current_step: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    identifiers: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    # list[dict] -- StepRecord.__dict__ pro Step, siehe Moduldocstring.
+    steps: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
+
+class _SequenceIdentifierIndexRow(Base):
+    __tablename__ = "sequence_identifier_index"
+
+    identifier_norm: Mapped[str] = mapped_column(String(320), primary_key=True)
+    sequence_id: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+# Nur diese beiden Tabellen (siehe core/consent.py für die Begründung).
+Base.metadata.create_all(bind=engine, tables=[_SequenceRow.__table__, _SequenceIdentifierIndexRow.__table__])
+
+
+def _row_to_sequence(row: _SequenceRow) -> Sequence:
+    return Sequence(
+        sequence_id=row.sequence_id,
+        lead_key=row.lead_key,
+        identifiers=dict(row.identifiers),
+        steps=[StepRecord(**step) for step in row.steps],
+        current_step=row.current_step,
+        status=row.status,
+        stopped_reason=row.stopped_reason,
+        created_at=row.created_at.isoformat(),
+    )
+
+
+def _steps_to_json(steps: list[StepRecord]) -> list[dict]:
+    return [dataclasses.asdict(s) for s in steps]
+
+
 class SequenceScheduler:
     """Auditierbare Multi-Touch-Kadenz mit Retry-Logik pro Schritt."""
-
-    def __init__(self) -> None:
-        self._sequences: dict[str, Sequence] = {}
-        self._by_identifier: dict[str, str] = {}  # normalisierter Identifier -> sequence_id
 
     def enroll(
         self,
@@ -105,37 +158,61 @@ class SequenceScheduler:
             StepRecord(channel=ch, day_offset=day, max_retries=retries) for ch, day, retries in followups
         )
 
-        seq = Sequence(
-            sequence_id=f"seq-{uuid.uuid4().hex[:10]}",
-            lead_key=lead_key,
-            identifiers=dict(identifiers),
-            steps=steps,
-        )
-        self._sequences[seq.sequence_id] = seq
-        for identifier in identifiers.values():
-            if identifier:
-                self._by_identifier[_normalize(identifier)] = seq.sequence_id
+        sequence_id = f"seq-{uuid.uuid4().hex[:10]}"
+        with SessionLocal() as session:
+            session.add(
+                _SequenceRow(
+                    sequence_id=sequence_id,
+                    lead_key=lead_key,
+                    status="active",
+                    stopped_reason="",
+                    created_at=datetime.now(timezone.utc),
+                    current_step=0,
+                    identifiers=dict(identifiers),
+                    steps=_steps_to_json(steps),
+                )
+            )
+            for identifier in identifiers.values():
+                if not identifier:
+                    continue
+                norm = _normalize(identifier)
+                idx = session.get(_SequenceIdentifierIndexRow, norm)
+                if idx is None:
+                    session.add(_SequenceIdentifierIndexRow(identifier_norm=norm, sequence_id=sequence_id))
+                else:
+                    idx.sequence_id = sequence_id
+            session.commit()
 
         # Schritt 0 (first_channel) wurde bereits versucht -- Ergebnis direkt
         # verbuchen, damit ein Fehlschlag sofort in die Retry-Logik einfließt.
-        self.record_attempt(seq.sequence_id, 0, success=first_success, reason=first_reason)
+        self.record_attempt(sequence_id, 0, success=first_success, reason=first_reason)
 
         # Übrige Schritte: Identifier-/Consent-Check, bevor überhaupt versucht wird.
-        for step in seq.steps[1:]:
-            identifier = identifiers.get(step.channel)
-            if not identifier:
-                step.status = "skipped"
-                step.last_reason = "kein Identifier für diesen Kanal bekannt"
-            elif not consent.is_allowed(identifier, step.channel):
-                step.status = "skipped"
-                step.last_reason = "Opt-out für diesen Kanal hinterlegt"
-        self._advance(seq)
+        with SessionLocal() as session:
+            row = session.get(_SequenceRow, sequence_id)
+            seq = _row_to_sequence(row)
+            for step in seq.steps[1:]:
+                identifier = identifiers.get(step.channel)
+                if not identifier:
+                    step.status = "skipped"
+                    step.last_reason = "kein Identifier für diesen Kanal bekannt"
+                elif not consent.is_allowed(identifier, step.channel):
+                    step.status = "skipped"
+                    step.last_reason = "Opt-out für diesen Kanal hinterlegt"
+            self._advance(seq)
+
+            row.steps = _steps_to_json(seq.steps)
+            row.current_step = seq.current_step
+            row.status = seq.status
+            session.commit()
+            session.refresh(row)
+            result = _row_to_sequence(row)
 
         logger.info(
             "Sequence enrolled",
-            extra={"sequence_id": seq.sequence_id, "lead_key": lead_key, "first_channel": first_channel},
+            extra={"sequence_id": sequence_id, "lead_key": lead_key, "first_channel": first_channel},
         )
-        return seq
+        return result
 
     def record_attempt(self, sequence_id: str, step_index: int, success: bool, reason: str = "") -> StepRecord:
         """
@@ -144,17 +221,26 @@ class SequenceScheduler:
         "pending" (ein künftiger Worker kann erneut versuchen); danach
         "failed", und die Kadenz rückt automatisch zum nächsten Schritt vor.
         """
-        seq = self._sequences[sequence_id]
-        step = seq.steps[step_index]
-        step.attempts += 1
-        step.last_reason = reason
-        step.last_attempt_at = datetime.now(timezone.utc).isoformat()
-        if success:
-            step.status = "sent"
-        elif step.attempts > step.max_retries:
-            step.status = "failed"
-        # sonst bleibt "pending" -- Retry möglich, current_step rückt NICHT vor
-        self._advance(seq)
+        with SessionLocal() as session:
+            row = session.get(_SequenceRow, sequence_id)
+            if row is None:
+                raise KeyError(sequence_id)
+            seq = _row_to_sequence(row)
+            step = seq.steps[step_index]
+            step.attempts += 1
+            step.last_reason = reason
+            step.last_attempt_at = datetime.now(timezone.utc).isoformat()
+            if success:
+                step.status = "sent"
+            elif step.attempts > step.max_retries:
+                step.status = "failed"
+            # sonst bleibt "pending" -- Retry möglich, current_step rückt NICHT vor
+            self._advance(seq)
+
+            row.steps = _steps_to_json(seq.steps)
+            row.current_step = seq.current_step
+            row.status = seq.status
+            session.commit()
         return step
 
     def _advance(self, seq: Sequence) -> None:
@@ -167,31 +253,48 @@ class SequenceScheduler:
 
     def next_due_step(self, sequence_id: str) -> Optional[tuple[int, StepRecord]]:
         """Für einen künftigen Worker: der nächste Schritt, der noch aussteht, falls die Sequenz aktiv ist."""
-        seq = self._sequences[sequence_id]
+        with SessionLocal() as session:
+            row = session.get(_SequenceRow, sequence_id)
+            if row is None:
+                raise KeyError(sequence_id)
+            seq = _row_to_sequence(row)
         if seq.status != "active" or seq.current_step >= len(seq.steps):
             return None
         return seq.current_step, seq.steps[seq.current_step]
 
     def stop(self, sequence_id: str, reason: str) -> Sequence:
         """Wird vom Reply-Classifier aufgerufen: Interesse oder Opt-out beendet die Kadenz sofort."""
-        seq = self._sequences[sequence_id]
-        seq.status = "stopped"
-        seq.stopped_reason = reason
+        with SessionLocal() as session:
+            row = session.get(_SequenceRow, sequence_id)
+            if row is None:
+                raise KeyError(sequence_id)
+            row.status = "stopped"
+            row.stopped_reason = reason
+            session.commit()
+            session.refresh(row)
+            result = _row_to_sequence(row)
         logger.info("Sequence stopped", extra={"sequence_id": sequence_id, "reason": reason})
-        return seq
+        return result
 
     def get(self, sequence_id: str) -> Optional[Sequence]:
-        return self._sequences.get(sequence_id)
+        with SessionLocal() as session:
+            row = session.get(_SequenceRow, sequence_id)
+            return _row_to_sequence(row) if row else None
 
     def find_by_identifier(self, identifier: Optional[str]) -> Optional[Sequence]:
         if not identifier:
             return None
-        sequence_id = self._by_identifier.get(_normalize(identifier))
-        return self._sequences.get(sequence_id) if sequence_id else None
+        with SessionLocal() as session:
+            idx = session.get(_SequenceIdentifierIndexRow, _normalize(identifier))
+            if idx is None:
+                return None
+            row = session.get(_SequenceRow, idx.sequence_id)
+            return _row_to_sequence(row) if row else None
 
 
 # Prozessweiter Singleton — vom SDR-Agent (enroll) und vom Inbound-Reply-
-# Webhook (find_by_identifier, stop) gemeinsam genutzt.
+# Webhook (find_by_identifier, stop) gemeinsam genutzt. Hält selbst keine
+# Daten mehr, siehe SequenceScheduler-Docstring.
 _scheduler = SequenceScheduler()
 
 

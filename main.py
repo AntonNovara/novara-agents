@@ -106,6 +106,14 @@ async def lifespan(app: FastAPI):
     global _AGENT_REGISTRY, _VOICE_AGENT, _CALENDAR_TOOL, _GUARDIAN_AGENT
     log.info("Novara Agent Factory starting", environment=settings.environment)
 
+    # Persistenter Store (core/db.py) für consent/customer_state/lead_capture/
+    # sequence_scheduler -- legt Tabellen an, falls sie noch nicht existieren.
+    # Muss vor jedem Zugriff auf diese vier Module laufen; am Start ist der
+    # früheste garantierte Zeitpunkt dafür.
+    from core.db import init_db
+    init_db()
+    log.info("Persistenter Store initialisiert", database_url_configured=bool(settings.database_url))
+
     # Aufgeloeste Modell-ID beim Start loggen, damit ein falscher ANTHROPIC_MODEL-
     # Env-Override in Railway sofort sichtbar ist (Ursache fuer model_not_found).
     log.info("LLM-Modell konfiguriert", anthropic_model=settings.anthropic_model)

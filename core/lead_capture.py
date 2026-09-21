@@ -16,9 +16,11 @@ ICP-Schwelle seine Kontaktdaten nennen ("Ruf mich an: 0664...", noch bevor
 genug über die Firma bekannt ist). Dieses Register ist deshalb bewusst
 UNABHÄNGIG von der ICP-Qualifizierung: jede erkannte Kontaktangabe zählt.
 
-Aktuell In-Memory (Prozess-Singleton `_register`, gleiches Muster wie
-core/consent.py und core/customer_state.py) — Einträge gehen bei Neustart
-verloren. TODO vor Produktivbetrieb: persistenter Store (Postgres/Redis).
+Persistiert über core/db.py (Postgres in Produktion, SQLite lokal) seit
+21.09.2026 — vorher In-Memory-Prozess-Singleton (analog zu core/consent.py
+und core/customer_state.py), Einträge gingen bei jedem Neustart verloren.
+Alle öffentlichen Methoden (extract_contact_fields, capture, mark_notified,
+get, all) sind unverändert.
 """
 from __future__ import annotations
 
@@ -27,7 +29,10 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from pydantic import BaseModel, Field
+from sqlalchemy import Boolean, DateTime, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
 
+from core.db import Base, SessionLocal, engine
 from core.security import SecurityLayer
 
 logger = logging.getLogger(__name__)
@@ -50,6 +55,38 @@ class CapturedLead(BaseModel):
     notified: bool = False  # verhindert Mehrfach-Mails für dieselbe Session
 
 
+class _CapturedLeadRow(Base):
+    __tablename__ = "captured_leads"
+
+    source: Mapped[str] = mapped_column(String(32), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    email: Mapped[str] = mapped_column(String(320), nullable=False, default="")
+    phone: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    company: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    message_excerpt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    notified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+# Nur diese Tabelle (siehe core/consent.py für die Begründung).
+Base.metadata.create_all(bind=engine, tables=[_CapturedLeadRow.__table__])
+
+
+def _row_to_lead(row: _CapturedLeadRow) -> CapturedLead:
+    return CapturedLead(
+        session_id=row.session_id,
+        source=row.source,
+        name=row.name,
+        email=row.email,
+        phone=row.phone,
+        company=row.company,
+        message_excerpt=row.message_excerpt,
+        captured_at=row.captured_at.isoformat(),
+        notified=row.notified,
+    )
+
+
 class LeadCaptureRegister:
     """
     Erkennt und speichert Kontaktdaten aus Freitext, dedupliziert Benachrichtigungen.
@@ -63,9 +100,6 @@ class LeadCaptureRegister:
     identifier-basierte Zusammenführung über die Journey hinweg, dieses
     Register ist reine Capture+Notify-Buchhaltung pro Konversation.
     """
-
-    def __init__(self) -> None:
-        self._leads: dict[tuple[str, str], CapturedLead] = {}
 
     def extract_contact_fields(
         self, message: str, visitor_info: Optional[dict[str, str]] = None
@@ -114,43 +148,56 @@ class LeadCaptureRegister:
         if not email and not phone:
             return None
 
-        key = (source, session_id)
-        existing = self._leads.get(key)
-        if existing is not None:
-            # Additiv mergen, nie einen bekannten Wert mit leer überschreiben
-            # — gleiche Philosophie wie core/customer_state.py update_stage().
-            existing.name = name or existing.name
-            existing.email = email or existing.email
-            existing.phone = phone or existing.phone
-            existing.company = company or existing.company
-            if message:
-                existing.message_excerpt = message[:500]
-            self._leads[key] = existing
-            return None if existing.notified else existing
+        with SessionLocal() as session:
+            row = session.get(_CapturedLeadRow, (source, session_id))
+            if row is not None:
+                # Additiv mergen, nie einen bekannten Wert mit leer
+                # überschreiben — gleiche Philosophie wie
+                # core/customer_state.py update_stage().
+                row.name = name or row.name
+                row.email = email or row.email
+                row.phone = phone or row.phone
+                row.company = company or row.company
+                if message:
+                    row.message_excerpt = message[:500]
+                already_notified = row.notified
+                session.commit()
+                return None if already_notified else _row_to_lead(row)
 
-        lead = CapturedLead(
-            session_id=session_id,
-            source=source,
-            name=name,
-            email=email,
-            phone=phone,
-            company=company,
-            message_excerpt=message[:500],
-        )
-        self._leads[key] = lead
+            row = _CapturedLeadRow(
+                source=source,
+                session_id=session_id,
+                name=name,
+                email=email,
+                phone=phone,
+                company=company,
+                message_excerpt=message[:500],
+                captured_at=datetime.now(timezone.utc),
+                notified=False,
+            )
+            session.add(row)
+            session.commit()
+            lead = _row_to_lead(row)
+
         logger.info("Lead captured", extra={"source": source, "session": session_id})
         return lead
 
     def mark_notified(self, source: str, session_id: str) -> None:
-        lead = self._leads.get((source, session_id))
-        if lead is not None:
-            lead.notified = True
+        with SessionLocal() as session:
+            row = session.get(_CapturedLeadRow, (source, session_id))
+            if row is not None:
+                row.notified = True
+                session.commit()
 
     def get(self, source: str, session_id: str) -> Optional[CapturedLead]:
-        return self._leads.get((source, session_id))
+        with SessionLocal() as session:
+            row = session.get(_CapturedLeadRow, (source, session_id))
+            return _row_to_lead(row) if row else None
 
     def all(self) -> list[CapturedLead]:
-        return list(self._leads.values())
+        with SessionLocal() as session:
+            rows = session.query(_CapturedLeadRow).all()
+            return [_row_to_lead(r) for r in rows]
 
 
 # Prozessweiter Singleton — gleiches Muster wie core/consent.py._ledger.

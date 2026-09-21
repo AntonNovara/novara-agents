@@ -50,3 +50,8 @@ groq==1.7.0
 # Rate-Limiting für POST /api/v1/chat/landing (main.py) — öffentlicher,
 # unauthentifizierter Endpoint, siehe CLAUDE.md "Bekannte Einschränkungen".
 slowapi==0.1.9
+
+# Persistenter Store (core/db.py) für consent/customer_state/lead_capture/
+# sequence_scheduler — Postgres in Produktion (Railway-Plugin), SQLite lokal.
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10

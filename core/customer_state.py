@@ -12,10 +12,13 @@ kann vor seiner eigenen Logik den bisherigen Verlauf lesen (z. B. Support
 kennt den Onboarding-Plan, bevor er antwortet; Sales Copilot kennt den
 ICP-Score, den der SDR-Agent ermittelt hat).
 
-Analog zu core/consent.py (Ledger-Muster) und tools/sequence_scheduler.py:
-Prozessweiter In-Memory-Singleton (`_store`), Einträge gehen bei Neustart
-verloren. TODO vor Produktivbetrieb: persistenter Store (Postgres/Redis),
-identisches Interface.
+Persistiert über core/db.py (Postgres in Produktion, SQLite lokal) seit
+21.09.2026 — vorher In-Memory-Prozess-Singleton (analog zu core/consent.py),
+Einträge gingen bei jedem Neustart verloren. Alle öffentlichen Methoden
+(update_stage, get, get_stage, history, all_customers) sind unverändert;
+`stages` (pro Kunde) liegt als JSON-Spalte in `customer_snapshots`, der
+Audit-Trail in einer eigenen `customer_stage_events`-Tabelle, der
+Firmenname->Kunde-Index in `customer_company_index`.
 
 Identifier-Auflösung: Kunden werden über eine normalisierte E-Mail-Adresse
 identifiziert (bevorzugt), mit dem Firmennamen als Fallback, wenn keine
@@ -35,6 +38,10 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
+from sqlalchemy import JSON, DateTime, Integer, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from core.db import Base, SessionLocal, engine
 
 logger = logging.getLogger(__name__)
 
@@ -82,35 +89,75 @@ class StageEvent(BaseModel):
     recorded_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+class _CustomerRow(Base):
+    __tablename__ = "customer_snapshots"
+
+    customer_id: Mapped[str] = mapped_column(String(320), primary_key=True)
+    company_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    primary_email: Mapped[Optional[str]] = mapped_column(String(320), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # dict[Stage, dict] (StageSnapshot.model_dump()) -- ein JSON-Blob statt
+    # einer eigenen Tabelle pro Stage: `stages` wird immer als Ganzes
+    # gelesen/geschrieben (get()/get_stage() lesen aus demselben Snapshot,
+    # nie stufenübergreifend gefiltert/sortiert), eine normalisierte Tabelle
+    # hätte hier nur Joins ohne echten Nutzen hinzugefügt.
+    stages: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+
+
+class _StageEventRow(Base):
+    __tablename__ = "customer_stage_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    customer_id: Mapped[str] = mapped_column(String(320), nullable=False, index=True)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    agent_session_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class _CompanyIndexRow(Base):
+    __tablename__ = "customer_company_index"
+
+    company_name_norm: Mapped[str] = mapped_column(String(255), primary_key=True)
+    customer_id: Mapped[str] = mapped_column(String(320), nullable=False)
+
+
+# Nur diese drei Tabellen (siehe core/consent.py für die Begründung) --
+# idempotent, funktioniert auch, wenn dieses Modul isoliert importiert wird.
+Base.metadata.create_all(
+    bind=engine, tables=[_CustomerRow.__table__, _StageEventRow.__table__, _CompanyIndexRow.__table__]
+)
+
+
+def _row_to_state(row: _CustomerRow) -> CustomerState:
+    return CustomerState(
+        customer_id=row.customer_id,
+        company_name=row.company_name,
+        primary_email=row.primary_email,
+        created_at=row.created_at.isoformat(),
+        stages={stage: StageSnapshot.model_validate(snap) for stage, snap in row.stages.items()},
+    )
+
+
 class CustomerStateStore:
     """
     Geteilter Kundenzustand, indiziert über einen normalisierten Identifier.
 
-    `_snapshots` hält pro Kunde den aktuellen Stand jeder Stufe (schneller
-    Lesezugriff für nachgelagerte Agenten). `_history` ist Append-only
-    (voller Audit-Trail, gleiches Muster wie core/consent.py).
+    Jede Methode öffnet/schließt ihre eigene kurzlebige DB-Session (gleiches
+    Muster wie core/consent.py). `_resolve_identifier()` prüft zuerst den
+    Firmennamen-Index (`customer_company_index`), damit ein bereits über
+    E-Mail bekannter Kunde nicht durch einen späteren, rein
+    firmennamen-basierten Aufruf verdoppelt wird.
     """
 
-    def __init__(self) -> None:
-        self._snapshots: dict[str, CustomerState] = {}
-        self._history: list[StageEvent] = []
-        # normalisierter Firmenname -> customer_id. Nötig, weil nicht jeder
-        # Agent eine E-Mail kennt (Sales Copilot, Operations) -- ohne diesen
-        # Index würde ein firmennamen-only-Aufruf für eine Firma, die
-        # bereits unter ihrer E-Mail bekannt ist (z. B. vom SDR-Agent
-        # angelegt), einen zweiten, getrennten Kunden-Eintrag erzeugen statt
-        # in den bestehenden zu mergen.
-        self._company_index: dict[str, str] = {}
-
-    def _resolve_identifier(self, email: Optional[str], company_name: Optional[str]) -> Optional[str]:
+    def _resolve_identifier(
+        self, session, email: Optional[str], company_name: Optional[str]
+    ) -> Optional[str]:
         if email:
             return _normalize(email)
         if company_name:
             norm_company = _normalize(company_name)
-            # Ein bereits über E-Mail identifizierter Kunde mit demselben
-            # Firmennamen hat Vorrang vor einem neuen, rein
-            # firmennamen-basierten Identifier.
-            return self._company_index.get(norm_company, norm_company)
+            indexed = session.get(_CompanyIndexRow, norm_company)
+            return indexed.customer_id if indexed else norm_company
         return None
 
     def update_stage(
@@ -128,34 +175,56 @@ class CustomerStateStore:
         (kein Fehler), wenn weder E-Mail noch Firmenname bekannt sind — es
         gibt dann nichts, worüber sich State teilen ließe.
         """
-        customer_id = self._resolve_identifier(email, company_name)
-        if customer_id is None:
-            logger.debug("Customer state skipped -- no identifier", extra={"stage": stage})
-            return None
+        with SessionLocal() as session:
+            customer_id = self._resolve_identifier(session, email, company_name)
+            if customer_id is None:
+                logger.debug("Customer state skipped -- no identifier", extra={"stage": stage})
+                return None
 
-        state = self._snapshots.get(customer_id)
-        if state is None:
-            state = CustomerState(
-                customer_id=customer_id,
-                company_name=company_name,
-                primary_email=_normalize(email) if email else None,
+            row = session.get(_CustomerRow, customer_id)
+            if row is None:
+                row = _CustomerRow(
+                    customer_id=customer_id,
+                    company_name=company_name,
+                    primary_email=_normalize(email) if email else None,
+                    created_at=datetime.now(timezone.utc),
+                    stages={},
+                )
+                session.add(row)
+            else:
+                # Ergänzt bislang unbekannte Stammdaten, überschreibt nie
+                # einen bereits bekannten Wert mit None/leer.
+                if company_name and not row.company_name:
+                    row.company_name = company_name
+                if email and not row.primary_email:
+                    row.primary_email = _normalize(email)
+
+            if company_name:
+                norm_company = _normalize(company_name)
+                idx = session.get(_CompanyIndexRow, norm_company)
+                if idx is None:
+                    session.add(_CompanyIndexRow(company_name_norm=norm_company, customer_id=customer_id))
+                else:
+                    idx.customer_id = customer_id
+
+            snapshot = StageSnapshot(stage=stage, agent_session_id=agent_session_id, data=data)
+            # Neues dict zuweisen statt in-place zu mutieren -- SQLAlchemys
+            # Change-Tracking für JSON-Spalten erkennt eine Mutation des
+            # bestehenden dict-Objekts sonst nicht zuverlässig als "dirty".
+            row.stages = {**row.stages, stage: snapshot.model_dump()}
+
+            session.add(
+                _StageEventRow(
+                    customer_id=customer_id,
+                    stage=stage,
+                    agent_session_id=agent_session_id,
+                    recorded_at=datetime.now(timezone.utc),
+                )
             )
-            self._snapshots[customer_id] = state
-        else:
-            # Ergänzt bislang unbekannte Stammdaten, überschreibt nie einen
-            # bereits bekannten Wert mit None/leer.
-            if company_name and not state.company_name:
-                state.company_name = company_name
-            if email and not state.primary_email:
-                state.primary_email = _normalize(email)
+            session.commit()
+            session.refresh(row)
+            state = _row_to_state(row)
 
-        if company_name:
-            self._company_index[_normalize(company_name)] = customer_id
-
-        state.stages[stage] = StageSnapshot(stage=stage, agent_session_id=agent_session_id, data=data)
-        self._history.append(
-            StageEvent(customer_id=customer_id, stage=stage, agent_session_id=agent_session_id)
-        )
         logger.info(
             "Customer state updated",
             extra={"customer_id": customer_id, "stage": stage, "session_id": agent_session_id},
@@ -165,10 +234,12 @@ class CustomerStateStore:
     def get(
         self, *, email: Optional[str] = None, company_name: Optional[str] = None
     ) -> Optional[CustomerState]:
-        customer_id = self._resolve_identifier(email, company_name)
-        if customer_id is None:
-            return None
-        return self._snapshots.get(customer_id)
+        with SessionLocal() as session:
+            customer_id = self._resolve_identifier(session, email, company_name)
+            if customer_id is None:
+                return None
+            row = session.get(_CustomerRow, customer_id)
+            return _row_to_state(row) if row else None
 
     def get_stage(
         self,
@@ -182,20 +253,31 @@ class CustomerStateStore:
 
     def history(self, customer_id: Optional[str] = None) -> list[StageEvent]:
         """Vollständiger Audit-Trail, optional gefiltert nach normalisiertem Kunden-Identifier."""
-        entries = self._history
-        if customer_id is not None:
-            norm = _normalize(customer_id)
-            entries = [e for e in entries if e.customer_id == norm]
-        return list(entries)
+        with SessionLocal() as session:
+            query = session.query(_StageEventRow)
+            if customer_id is not None:
+                query = query.filter_by(customer_id=_normalize(customer_id))
+            rows = query.order_by(_StageEventRow.id.asc()).all()
+            return [
+                StageEvent(
+                    customer_id=r.customer_id,
+                    stage=r.stage,  # type: ignore[arg-type]
+                    agent_session_id=r.agent_session_id,
+                    recorded_at=r.recorded_at.isoformat(),
+                )
+                for r in rows
+            ]
 
     def all_customers(self) -> list[CustomerState]:
         """Nur für Tests/Dev -- alle bekannten Kunden."""
-        return list(self._snapshots.values())
+        with SessionLocal() as session:
+            rows = session.query(_CustomerRow).all()
+            return [_row_to_state(r) for r in rows]
 
 
 # Prozessweiter Singleton -- von allen 5 Agenten geteilt (analog zu
-# core.consent._ledger), damit ein Snapshot, den ein Agent schreibt, für
-# einen später aufgerufenen Agenten in derselben Kunden-Journey sichtbar ist.
+# core.consent._ledger). Hält selbst keine Daten mehr, siehe
+# CustomerStateStore-Docstring.
 _store = CustomerStateStore()
 
 

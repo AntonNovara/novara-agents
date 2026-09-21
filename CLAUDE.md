@@ -1674,12 +1674,34 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | **Churn-Detection** | Analysiert Nutzungsdaten und eskaliert an CSM wenn Aktivierungsgrad unter Schwellwert fällt |
 | **Multi-Tenant Auth** | OAuth2 / JWT statt einfachem API-Key für SaaS-Mandantenfähigkeit |
 | **Embedding-FAQ** | Vektor-Suche (Weaviate / pgvector) statt Keyword-Stemming für bessere FAQ-Treffer |
-| **Persistenter Store für Consent/Sequence/Customer State** | Postgres/Redis statt der drei In-Memory-Singletons (`core/consent.py`, `tools/sequence_scheduler.py`, `core/customer_state.py`) |
 | **MCP-Server-Auth** | Auth für den `--http`-Transport von `tools/mcp_server.py` (siehe Abschnitt oben) |
 
 ---
 
 ## Bekannte Einschränkungen (Development-Modus)
+
+> **21.09.2026: Persistenter Store für Consent/Customer State/Lead Capture/
+> Sequence Scheduler.** Die vier Module, die zuvor alle denselben
+> "In-Memory-Prozess-Singleton, TODO vor Produktivbetrieb: persistenter
+> Store"-Vermerk trugen (`core/consent.py`, `core/customer_state.py`,
+> `core/lead_capture.py`, `tools/sequence_scheduler.py`), persistieren jetzt
+> über `core/db.py` (SQLAlchemy; Postgres in Produktion via Railway-Plugin,
+> lokale SQLite-Datei ohne `DATABASE_URL`). Alle öffentlichen Methoden
+> unverändert — jede Methode öffnet/schließt jetzt eine kurzlebige
+> DB-Session statt ein Dict zu lesen/schreiben. EIN reales Verhaltens-Detail
+> hat sich dabei geändert, nicht nur die Speicherung: eine von `enroll()`/
+> `record_attempt()` zurückgegebene `Sequence`- bzw. `CustomerState`-Instanz
+> ist jetzt ein frischer, aus der DB rekonstruierter Snapshot — KEIN
+> geteiltes Objekt mehr, dessen spätere Mutation ein Aufrufer über seine
+> alte Referenz automatisch mitbekäme (relevant für Multi-Worker-Deployments
+> ohnehin die korrekte Semantik). `main.py`/`agents/sdr_agent.py` lasen
+> bereits immer den Rückgabewert neu, kein Code dort musste angepasst
+> werden; `test_system.py` TEST 15 hatte sich auf die alte
+> Referenz-Mutation verlassen und wurde entsprechend
+> korrigiert (re-fetch nach jedem `record_attempt()`). `tools/mcp_server.py`
+> bleibt bewusst unverändert bei seinem eigenen, separaten In-Memory-Store
+> (siehe dessen Abschnitt oben) — dieser läuft als eigener Prozess außerhalb
+> von `main.py`s Lifespan und war nicht Teil dieser Runde.
 
 | Einschränkung | Prod-Lösung |
 |---|---|
@@ -1687,15 +1709,13 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | FAQ-Suche = Keyword-Stemming | Embedding-Suche gegen Weaviate / Qdrant / pgvector |
 | Lead-Datenbank = 15 Hard-coded-Kontakte | LinkedIn Sales Navigator API / CRM-Query |
 | Ticket-System = Mock | Zendesk / Freshdesk / Jira Service Management API |
-| Consent-Ledger (`core/consent.py`) = In-Memory | Persistenter Store (Postgres/Redis), identische Interface-Methoden |
-| Sequence Scheduler (`tools/sequence_scheduler.py`) = In-Memory, kein Worker | Persistenter Store + Cron/Celery-Beat-Worker, der `next_due_step()` periodisch abfragt |
+| Sequence Scheduler (`tools/sequence_scheduler.py`) hat weiterhin keinen echten Worker | Persistenz ist seit 21.09.2026 erledigt (siehe Hinweis oben) — es fehlt weiterhin ein Cron/Celery-Beat-Prozess, der `next_due_step()` periodisch abfragt und fällige Schritte tatsächlich auslöst |
 | Kein Telefonnummer-Feld in `ProspectContact`/`LeadRecord` | "voice"-Kadenzschritt bleibt dadurch immer `skipped` — Datenmodell um Telefonnummer erweitern |
 | Kein Auth außer API-Key (`main.py`) bzw. gar keine (`tools/mcp_server.py --http`) | OAuth2 / JWT für Multi-Tenant-Szenarien; MCP-HTTP-Transport hinter Reverse-Proxy-Auth oder FastMCPs `auth_server_provider` |
-| Customer State (`core/customer_state.py`) = In-Memory, kein echter CRM-Primärschlüssel | Persistenter Store; Identifier-Auflösung über E-Mail/Firmenname ist eine Mock-Vereinfachung — kann bei wirklich unterschiedlichen, aber zur selben Firma gehörenden E-Mails (verschiedene Ansprechpartner je Stufe) getrennte Einträge erzeugen, siehe Sprint-3-Abschnitt oben |
+| Customer State (`core/customer_state.py`) hat weiterhin keinen echten CRM-Primärschlüssel | Identifier-Auflösung über E-Mail/Firmenname bleibt eine Mock-Vereinfachung (Persistenz selbst ist seit 21.09.2026 erledigt) — kann bei wirklich unterschiedlichen, aber zur selben Firma gehörenden E-Mails (verschiedene Ansprechpartner je Stufe) getrennte Einträge erzeugen, siehe Sprint-3-Abschnitt oben |
 | MCP-Server (`tools/mcp_server.py`) läuft als eigener Prozess mit eigenem In-Memory-Store | Teilt sich nichts mit `main.py`'s Agenten-Prozess (weder Mock-CRM-Daten noch `customer_state`) — vor Produktivbetrieb gemeinsamen persistenten Store einführen |
 | `InboundChatSession`-Store (`agents/sdr_agent.py`) = In-Memory mit nur einer groben `_MAX_INBOUND_SESSIONS`-Obergrenze | Persistenter Session-Store (Redis) vor echtem Produktiv-Traffic — das Rate-Limiting selbst ist seit 21.09.2026 erledigt (`slowapi`, 20/Minute pro IP, siehe `main.py landing_chat()`) |
 | `static/chat_widget.js` nutzt kein Shadow DOM — CSS-Kollisionen mit sehr aggressiven globalen Host-Seiten-Styles theoretisch möglich | Bei Bedarf auf Shadow-DOM-Kapselung umstellen |
-| Lead-Capture (`core/lead_capture.py`) = In-Memory, kein persistenter Store | Postgres/Redis statt Prozess-Singleton, analog zu Consent-Ledger/Sequence Scheduler/Customer State |
 | Lead-Benachrichtigung (`tools/lead_notifier.py`) = einfaches SMTP-Anwendungspasswort, kein Retry/Queue bei SMTP-Ausfall | Bei Bedarf Retry-Queue oder Wechsel auf einen transaktionalen E-Mail-Dienst (SendGrid/Postmark/SES) |
 | `InboundChatGraph.document_node()` (Anhang-Extraktion) ist über die API voll funktionsfähig, aber `static/chat_widget.js` hat noch keine Upload-UI dafür | Frontend-Arbeit: Datei-Auswahl + Base64-Kodierung im Widget ergänzen, `attachment`-Feld an `/api/v1/chat/landing` mitschicken |
 | Baustellen-Voice-Assistant (`main.py` `/api/v1/webhook/whatsapp`): Speech-to-Text läuft über Groq (`whisper-large-v3`), kein Retry bei transientem Groq-Fehler — `_transcribe_audio()` gibt dann einmalig `None` zurück, der Techniker muss die Sprachnachricht erneut schicken oder auf Text ausweichen | Bei Bedarf einen einfachen Retry (1-2 Versuche) in `_transcribe_audio()` ergänzen, analog zum `resilient_node()`-Decorator des GuardianAgent |

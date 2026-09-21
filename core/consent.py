@@ -12,10 +12,13 @@ Analog zu core/security.py: die Prüfung ist deterministisch, kein LLM ist an
 der Entscheidung beteiligt. Ein Opt-out blockt IMMER — unabhängig davon, was
 ein Agent sonst "denkt" oder generiert.
 
-Aktuell In-Memory (Prozess-Singleton `_ledger`, gleiches Muster wie die
-Mock-Stores in tools/crm_integration.py) — Einträge gehen bei Neustart
-verloren. TODO vor Produktivbetrieb mit echten Kunden: persistenter Store
-(Postgres/Redis), identische Interface-Methoden.
+Persistiert über core/db.py (Postgres in Produktion, SQLite lokal) seit
+21.09.2026 — vorher In-Memory-Prozess-Singleton, Einträge gingen bei jedem
+Neustart verloren. `ConsentLedger`s öffentliche Methoden (is_allowed,
+record_opt_out, record_opt_in, status, history) sind unverändert; nur die
+Speicherung dahinter wechselte von zwei Dicts auf eine `consent_records`-
+Tabelle, damit kein Aufrufer (core/consent.py hat einige, siehe
+agents/sdr_agent.py check_consent) angepasst werden musste.
 """
 from __future__ import annotations
 
@@ -24,6 +27,10 @@ from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+from sqlalchemy import DateTime, Index, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from core.db import Base, SessionLocal, engine
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +49,41 @@ class ConsentRecord(BaseModel):
     recorded_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+class _ConsentRow(Base):
+    """DB-Zeile hinter einem ConsentRecord — append-only, siehe ConsentLedger."""
+
+    __tablename__ = "consent_records"
+    __table_args__ = (Index("ix_consent_identifier_channel", "identifier", "channel"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    identifier: Mapped[str] = mapped_column(String(320), nullable=False)
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    recorded_by: Mapped[str] = mapped_column(String(64), nullable=False, default="system")
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+# Erzeugt NUR diese Tabelle (tables=[...], nicht Base.metadata.create_all()
+# ohne Filter) -- ein Aufrufer, der nur core.consent importiert (z. B.
+# test_system.py, das die App-Lifespan von main.py nie durchläuft), braucht
+# nicht zusätzlich core.db.init_db() aufzurufen. Idempotent (CREATE TABLE IF
+# NOT EXISTS-Semantik), main.py's init_db() beim Start ist dadurch redundant,
+# aber als expliziter, zentraler Schritt bewusst beibehalten.
+Base.metadata.create_all(bind=engine, tables=[_ConsentRow.__table__])
+
+
+def _row_to_record(row: _ConsentRow) -> ConsentRecord:
+    return ConsentRecord(
+        identifier=row.identifier,
+        channel=row.channel,  # type: ignore[arg-type]
+        status=row.status,  # type: ignore[arg-type]
+        reason=row.reason,
+        recorded_by=row.recorded_by,
+        recorded_at=row.recorded_at.isoformat(),
+    )
+
+
 def _normalize(identifier: str) -> str:
     return identifier.strip().lower()
 
@@ -50,24 +92,33 @@ class ConsentLedger:
     """
     Auditierbares Opt-in/Opt-out-Register.
 
-    `_history` ist Append-only (voller Audit-Trail, DSGVO Art. 30). `_latest`
-    ist ein Index auf den jeweils neuesten Status pro (Identifier, Kanal) für
-    schnelle is_allowed()-Abfragen vor jeder Outreach-Aktion.
+    Jede Methode öffnet/schließt ihre eigene kurzlebige DB-Session (gleiches
+    Muster in allen vier core/db.py-Nutzern) — kein Zustand wird zwischen
+    Aufrufen im Prozess gehalten, ausschließlich in der `consent_records`-
+    Tabelle. `status()`/`is_allowed()` lesen die jeweils NEUESTE Zeile pro
+    (Identifier, Kanal) über `ORDER BY id DESC LIMIT 1` — die aufsteigende,
+    autoincrementierte `id` ist dabei zuverlässiger als `recorded_at` als
+    Sortierschlüssel (zwei Einträge in derselben Millisekunde wären sonst
+    nicht eindeutig ordbar).
     """
-
-    def __init__(self) -> None:
-        self._history: list[ConsentRecord] = []
-        self._latest: dict[tuple[str, Channel], ConsentRecord] = {}
 
     def _record(
         self, identifier: str, channel: Channel, status: ConsentStatus, reason: str, recorded_by: str
     ) -> ConsentRecord:
         key_id = _normalize(identifier)
-        entry = ConsentRecord(
-            identifier=key_id, channel=channel, status=status, reason=reason, recorded_by=recorded_by
-        )
-        self._history.append(entry)
-        self._latest[(key_id, channel)] = entry
+        with SessionLocal() as session:
+            row = _ConsentRow(
+                identifier=key_id,
+                channel=channel,
+                status=status,
+                reason=reason,
+                recorded_by=recorded_by,
+                recorded_at=datetime.now(timezone.utc),
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            entry = _row_to_record(row)
         logger.info(
             "Consent recorded",
             extra={"channel": channel, "status": status, "reason": reason, "recorded_by": recorded_by},
@@ -86,8 +137,15 @@ class ConsentLedger:
 
     def status(self, identifier: str, channel: Channel) -> Optional[ConsentStatus]:
         """None = kein Eintrag vorhanden (weder Opt-in noch Opt-out bekannt)."""
-        entry = self._latest.get((_normalize(identifier), channel))
-        return entry.status if entry else None
+        key_id = _normalize(identifier)
+        with SessionLocal() as session:
+            row = (
+                session.query(_ConsentRow)
+                .filter_by(identifier=key_id, channel=channel)
+                .order_by(_ConsentRow.id.desc())
+                .first()
+            )
+            return row.status if row else None  # type: ignore[return-value]
 
     def is_allowed(self, identifier: Optional[str], channel: Channel) -> bool:
         """
@@ -109,18 +167,20 @@ class ConsentLedger:
         self, identifier: Optional[str] = None, channel: Optional[Channel] = None
     ) -> list[ConsentRecord]:
         """Vollständiger Audit-Trail, optional gefiltert nach Kontakt und/oder Kanal."""
-        entries = self._history
-        if identifier is not None:
-            norm = _normalize(identifier)
-            entries = [e for e in entries if e.identifier == norm]
-        if channel is not None:
-            entries = [e for e in entries if e.channel == channel]
-        return list(entries)
+        with SessionLocal() as session:
+            query = session.query(_ConsentRow)
+            if identifier is not None:
+                query = query.filter_by(identifier=_normalize(identifier))
+            if channel is not None:
+                query = query.filter_by(channel=channel)
+            rows = query.order_by(_ConsentRow.id.asc()).all()
+            return [_row_to_record(r) for r in rows]
 
 
 # Prozessweiter Singleton — von allen Agenten geteilt (analog zu
-# core.config.settings), damit ein über einen Kanal erfasster Opt-out auch
-# für spätere Anfragen über andere Agenten sichtbar ist.
+# core.config.settings). Hält selbst keine Daten mehr (siehe ConsentLedger-
+# Docstring), bleibt aber als Modul-Singleton bestehen, damit ein künftiges
+# In-Process-Caching (falls je gebraucht) an einer Stelle ansetzen könnte.
 _ledger = ConsentLedger()
 
 

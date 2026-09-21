@@ -16,3 +16,7 @@ get_token.py
 # (main.py POST /api/v1/webhook/whatsapp, utils/pdf_generator.py) --
 # nie committen, nur auf Railways ephemerem Dateisystem relevant.
 static/reports/
+
+# core/db.py -- lokaler SQLite-Fallback ohne DATABASE_URL (Dev/Tests).
+# Produktion nutzt Railways Postgres-Plugin (DATABASE_URL-Env-Var).
+novara_dev.db
