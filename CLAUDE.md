@@ -1687,14 +1687,13 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | FAQ-Suche = Keyword-Stemming | Embedding-Suche gegen Weaviate / Qdrant / pgvector |
 | Lead-Datenbank = 15 Hard-coded-Kontakte | LinkedIn Sales Navigator API / CRM-Query |
 | Ticket-System = Mock | Zendesk / Freshdesk / Jira Service Management API |
-| Kein Rate-Limiting | FastAPI `slowapi` Middleware ergänzen |
 | Consent-Ledger (`core/consent.py`) = In-Memory | Persistenter Store (Postgres/Redis), identische Interface-Methoden |
 | Sequence Scheduler (`tools/sequence_scheduler.py`) = In-Memory, kein Worker | Persistenter Store + Cron/Celery-Beat-Worker, der `next_due_step()` periodisch abfragt |
 | Kein Telefonnummer-Feld in `ProspectContact`/`LeadRecord` | "voice"-Kadenzschritt bleibt dadurch immer `skipped` — Datenmodell um Telefonnummer erweitern |
 | Kein Auth außer API-Key (`main.py`) bzw. gar keine (`tools/mcp_server.py --http`) | OAuth2 / JWT für Multi-Tenant-Szenarien; MCP-HTTP-Transport hinter Reverse-Proxy-Auth oder FastMCPs `auth_server_provider` |
 | Customer State (`core/customer_state.py`) = In-Memory, kein echter CRM-Primärschlüssel | Persistenter Store; Identifier-Auflösung über E-Mail/Firmenname ist eine Mock-Vereinfachung — kann bei wirklich unterschiedlichen, aber zur selben Firma gehörenden E-Mails (verschiedene Ansprechpartner je Stufe) getrennte Einträge erzeugen, siehe Sprint-3-Abschnitt oben |
 | MCP-Server (`tools/mcp_server.py`) läuft als eigener Prozess mit eigenem In-Memory-Store | Teilt sich nichts mit `main.py`'s Agenten-Prozess (weder Mock-CRM-Daten noch `customer_state`) — vor Produktivbetrieb gemeinsamen persistenten Store einführen |
-| `POST /api/v1/chat/landing` ist öffentlich/unauthentifiziert, `InboundChatSession`-Store (`agents/sdr_agent.py`) = In-Memory mit nur einer groben `_MAX_INBOUND_SESSIONS`-Obergrenze statt echtem Rate-Limiting | FastAPI `slowapi` Middleware speziell für diesen Endpoint + persistenter Session-Store (Redis) vor echtem Produktiv-Traffic |
+| `InboundChatSession`-Store (`agents/sdr_agent.py`) = In-Memory mit nur einer groben `_MAX_INBOUND_SESSIONS`-Obergrenze | Persistenter Session-Store (Redis) vor echtem Produktiv-Traffic — das Rate-Limiting selbst ist seit 21.09.2026 erledigt (`slowapi`, 20/Minute pro IP, siehe `main.py landing_chat()`) |
 | `static/chat_widget.js` nutzt kein Shadow DOM — CSS-Kollisionen mit sehr aggressiven globalen Host-Seiten-Styles theoretisch möglich | Bei Bedarf auf Shadow-DOM-Kapselung umstellen |
 | Lead-Capture (`core/lead_capture.py`) = In-Memory, kein persistenter Store | Postgres/Redis statt Prozess-Singleton, analog zu Consent-Ledger/Sequence Scheduler/Customer State |
 | Lead-Benachrichtigung (`tools/lead_notifier.py`) = einfaches SMTP-Anwendungspasswort, kein Retry/Queue bei SMTP-Ausfall | Bei Bedarf Retry-Queue oder Wechsel auf einen transaktionalen E-Mail-Dienst (SendGrid/Postmark/SES) |

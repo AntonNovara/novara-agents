@@ -28,6 +28,9 @@ from twilio.request_validator import RequestValidator
 from twilio.twiml.messaging_response import MessagingResponse
 
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from agents.base_agent import AgentRequest, AgentResponse
 from agents.field_worker_agent import FieldWorkerAgent
@@ -161,6 +164,21 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# ── Rate Limiting ─────────────────────────────────────────────────────────────
+# Bisher nur auf POST /api/v1/chat/landing angewendet (siehe dort) -- der
+# einzige öffentliche, unauthentifizierte Endpoint, der einen echten LLM-Call
+# pro Request auslöst (Kosten-/Missbrauchsrisiko). Schlüssel ist die
+# Besucher-IP (get_remote_address liest request.client.host, das dank
+# --proxy-headers im Dockerfile-CMD die echte, von Railway weitergereichte
+# IP trägt, nicht die interne Proxy-IP). Die anderen öffentlichen Endpunkte
+# (Vapi-/Twilio-Webhooks) haben bereits eine eigene kryptografische
+# Absicherung (Twilio-Signatur) bzw. sind an eine registrierte Vapi-
+# Server-URL gebunden -- kein zusätzliches IP-Rate-Limiting dort in dieser
+# Runde.
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # static/chat_widget.js wird von hier ausgeliefert, damit eine Landing Page
 # ihn mit EINER Zeile einbinden kann, ohne die Datei selbst zu hosten:
@@ -604,10 +622,12 @@ class LandingChatResponse(BaseModel):
     responses={
         200: {"description": "Antwort generiert (auch bei DLP-Block: success=false, kein 4xx/5xx)"},
         422: {"description": "Validierungsfehler im Request-Body"},
+        429: {"description": "Rate limit überschritten (20 Requests/Minute pro IP)"},
         503: {"description": "SDR-Agent noch nicht initialisiert (Server startet gerade)"},
     },
 )
-async def landing_chat(payload: LandingChatRequest) -> LandingChatResponse:
+@limiter.limit("20/minute")
+async def landing_chat(request: Request, payload: LandingChatRequest) -> LandingChatResponse:
     """
     ÖFFENTLICH, KEIN API-Key (anders als /api/v1/agents/*) -- static/
     chat_widget.js läuft im Browser jedes anonymen Landing-Page-Besuchers,
@@ -617,8 +637,12 @@ async def landing_chat(payload: LandingChatRequest) -> LandingChatResponse:
     CORSMiddleware oben). Die Sicherheitsgrenze ist hier NICHT der API-Key,
     sondern: (a) Input-DLP-Check auf jede Nachricht, (b) ein striktes
     visitor_info-Schema statt eines freien dict, (c) eine Obergrenze im
-    Session-Store (agents/sdr_agent.py, _MAX_INBOUND_SESSIONS). Echtes
-    Rate-Limiting fehlt noch -- siehe CLAUDE.md, "Bekannte Einschränkungen".
+    Session-Store (agents/sdr_agent.py, _MAX_INBOUND_SESSIONS), (d) seit
+    21.09.2026 echtes IP-basiertes Rate-Limiting (20/Minute, `limiter` oben,
+    slowapi) -- schließt die zuvor hier dokumentierte Lücke (siehe
+    CLAUDE.md, "Bekannte Einschränkungen"). `request: Request` ist ein von
+    slowapi geforderter Parameter (liest die Besucher-IP für den Zähler),
+    keine funktionale Änderung am restlichen Handler.
     """
     sdr = _AGENT_REGISTRY.get("sdr")
     if sdr is None:

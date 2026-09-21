@@ -29,4 +29,10 @@ ENV PORT=8000
 
 EXPOSE $PORT
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
+# --proxy-headers/--forwarded-allow-ips=*: Railway terminiert TLS an einem
+# vorgeschalteten Proxy -- ohne das trüge request.client.host überall (u. a.
+# im neuen Rate-Limiting auf POST /api/v1/chat/landing, main.py) die interne
+# Proxy-IP statt der echten Besucher-IP. Railway ist der einzige Hop vor
+# diesem Container, daher ist ein pauschales "*" hier vertretbar (kein
+# öffentlich erreichbarer Multi-Tenant-Proxy dazwischen).
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'"]
