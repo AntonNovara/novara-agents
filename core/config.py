@@ -181,6 +181,22 @@ class Settings(BaseSettings):
     )
     crm_sheet_name: str = Field(default="CRM", alias="CRM_SHEET_NAME")
 
+    # Baustellen-Voice-Assistant Demo-Sandbox (tools/demo_sandbox.py,
+    # main.py POST /api/v1/webhook/whatsapp): eine WhatsApp-Nachricht gilt
+    # als Demo, wenn der Absender (Twilio-"From", z. B.
+    # "whatsapp:+4366412345678") in dieser kommagetrennten Liste steht ODER
+    # der Nachrichtentext "[DEMO]" enthält. Demo-Nachrichten schreiben NIE
+    # ins echte CRM_SHEET_NAME-Tab, sondern in demo_sheet_tab_name (eigenes
+    # Sheet-Tab, per Service-Account angelegt, falls es noch nicht
+    # existiert) und bekommen einen sichtbaren "DEMO TEST"-Vermerk im PDF.
+    whatsapp_demo_test_numbers: str = Field(default="", alias="WHATSAPP_DEMO_TEST_NUMBERS")
+    demo_sheet_tab_name: str = Field(default="Leads_Demo", alias="DEMO_SHEET_TAB_NAME")
+
+    @property
+    def whatsapp_demo_test_numbers_set(self) -> set[str]:
+        """Normalisierte Menge der Test-Rufnummern aus WHATSAPP_DEMO_TEST_NUMBERS."""
+        return {n.strip() for n in self.whatsapp_demo_test_numbers.split(",") if n.strip()}
+
     @property
     def crm_service_account_configured(self) -> bool:
         """True, wenn GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON gesetzt ist (Produktions-CRM-Pfad aktiv)."""

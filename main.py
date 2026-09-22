@@ -46,6 +46,7 @@ from core.config import settings
 from core.security import OutputBlockedError, SecurityLayer
 from tools import lead_notifier, sequence_scheduler
 from tools.calendar_integration import GoogleCalendarTool
+from tools.demo_sandbox import is_demo_message, log_demo_lead, strip_demo_marker
 from tools.document_parser import DocumentParser
 from tools.reply_classifier import ReplyClassifier
 from utils.pdf_generator import generate_regiebericht, suggested_filename
@@ -1228,7 +1229,18 @@ async def whatsapp_webhook(request: Request):
     except ValueError:
         num_media = 0
 
-    log.info("[STEP 1] Webhook recibido de Twilio", frm=sender, has_media=num_media > 0, body_chars=len(body_text))
+    # Demo-Sandbox (tools/demo_sandbox.py): Testnummer ODER "[DEMO]" im Text
+    # aktiviert den Sandbox-Pfad -- eigenes Sheet-Tab statt CRM, sichtbarer
+    # PDF-Vermerk. Marker wird VOR der Weitergabe an den Agenten entfernt,
+    # damit er nicht als Teil der Tätigkeitsbeschreibung im Bericht landet.
+    is_demo = is_demo_message(sender, body_text)
+    if is_demo:
+        body_text = strip_demo_marker(body_text)
+
+    log.info(
+        "[STEP 1] Webhook recibido de Twilio",
+        frm=sender, has_media=num_media > 0, body_chars=len(body_text), is_demo=is_demo,
+    )
 
     import asyncio
     loop = asyncio.get_running_loop()
@@ -1308,7 +1320,11 @@ async def whatsapp_webhook(request: Request):
         try:
             _REPORTS_DIR.mkdir(parents=True, exist_ok=True)
             pdf_path = await loop.run_in_executor(
-                None, generate_regiebericht, data, _REPORTS_DIR / suggested_filename(data)
+                None,
+                generate_regiebericht,
+                data,
+                _REPORTS_DIR / suggested_filename(data, is_demo=is_demo),
+                is_demo,
             )
         except Exception as exc:
             log.error("WhatsApp-Webhook: PDF-Erstellung fehlgeschlagen", error=str(exc))
@@ -1318,7 +1334,11 @@ async def whatsapp_webhook(request: Request):
                 frm=sender,
             )
 
-        log.info("[STEP 4] PDF generado con éxito", filename=pdf_path.name)
+        log.info("[STEP 4] PDF generado con éxito", filename=pdf_path.name, is_demo=is_demo)
+
+        if is_demo:
+            logged = await loop.run_in_executor(None, log_demo_lead, data, sender)
+            log.info("[STEP 4b] Demo-Sandbox: Sheet-Log", logged=logged)
 
         proto = _first_forwarded_value(request.headers.get("X-Forwarded-Proto", ""), request.url.scheme)
         netloc = _first_forwarded_value(request.headers.get("X-Forwarded-Host", ""), request.url.netloc)
@@ -1329,6 +1349,8 @@ async def whatsapp_webhook(request: Request):
             f"✅ Regiebericht erstellt für {data.get('kunde') or 'unbekannten Kunden'} "
             f"({stunden_text} Std.).\n{pdf_url}"
         )
+        if is_demo:
+            confirmation = "🧪 [DEMO-MODUS -- keine echten Daten]\n" + confirmation
         if data.get("confidence_notes"):
             confirmation += f"\n\nHinweis: {data['confidence_notes']}"
         confirmation += audio_note

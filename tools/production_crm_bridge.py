@@ -105,6 +105,18 @@ def _get_service() -> Any:
     return _service
 
 
+def get_sheets_service() -> Any:
+    """Öffentlicher Zugriff auf den gecachten Sheets-API-Client -- genutzt von
+    tools/demo_sandbox.py, damit die Service-Account-Auth (inkl. Caching und
+    Fehlerbehandlung oben) nicht ein zweites Mal implementiert werden muss."""
+    return _get_service()
+
+
+def execute_with_retry(request: Any, description: str) -> dict:
+    """Öffentlicher Zugriff auf _execute() -- gleiche Begründung wie get_sheets_service()."""
+    return _execute(request, description)
+
+
 def _execute(request: Any, description: str) -> dict:
     """Request mit Exponential-Backoff bei Quota-/Server-Fehlern -- gleiche Logik wie crm_handler.py._execute()."""
     delay = 1.0

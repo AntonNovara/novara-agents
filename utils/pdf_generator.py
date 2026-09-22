@@ -41,10 +41,22 @@ _TITLE = "Regiebericht"
 _BRAND_BLUE = (0, 102, 255)   # Novara-Blau, siehe website/css/style.css --blue
 _MUTED_GREY = (110, 110, 110)
 _TEXT_DARK = (20, 20, 20)
+_DEMO_RED = (200, 0, 0)
+_DEMO_WATERMARK_TEXT = "Novara Automation - DEMO TEST"
 
 
 class _RegieberichtPDF(FPDF):
-    """Eigene Kopf-/Fußzeile — sonst identisch zu FPDF."""
+    """Eigene Kopf-/Fußzeile — sonst identisch zu FPDF.
+
+    is_demo=True (Demo-Sandbox, tools/demo_sandbox.py) fügt einen deutlich
+    sichtbaren "DEMO TEST"-Vermerk in Kopf-, Fuß- und als diagonalen
+    Wasserzeichen-Text auf jeder Seite hinzu — ein Demo-Regiebericht darf mit
+    einem echten NIE verwechselbar sein.
+    """
+
+    def __init__(self, *args: Any, is_demo: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._is_demo = is_demo
 
     def header(self) -> None:  # noqa: D102 -- fpdf2-Hook, keine eigene Doku nötig
         self.set_font("helvetica", "B", 18)
@@ -57,16 +69,34 @@ class _RegieberichtPDF(FPDF):
         # Windows-1252-Repertoire, das den Halbgeviertstrich enthält. Traf
         # genau diese Zeile beim ersten Smoke-Test (FPDFUnicodeEncodingException).
         self.cell(0, 6, "Novara Automation - Baustellen-Voice-Assistant", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        if self._is_demo:
+            self.set_font("helvetica", "B", 11)
+            self.set_text_color(*_DEMO_RED)
+            self.cell(0, 7, _clean_text(_DEMO_WATERMARK_TEXT), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="C")
+            self._draw_demo_diagonal_watermark()
         self.set_draw_color(200, 200, 200)
         self.set_line_width(0.3)
         self.line(self.l_margin, self.get_y() + 2, self.w - self.r_margin, self.get_y() + 2)
         self.ln(10)
 
+    def _draw_demo_diagonal_watermark(self) -> None:
+        """Blasser, diagonaler Wasserzeichen-Text über der Seitenmitte --
+        rein optisch, wird von rotation() automatisch nach dem with-Block
+        zurückgesetzt, beeinflusst also die restliche Seitenlogik nicht."""
+        self.set_font("helvetica", "B", 46)
+        self.set_text_color(235, 210, 210)
+        with self.rotation(45, x=self.w / 2, y=self.h / 2):
+            self.text(self.w / 2 - 95, self.h / 2, _clean_text(_DEMO_WATERMARK_TEXT))
+        self.set_text_color(*_MUTED_GREY)
+
     def footer(self) -> None:  # noqa: D102
         self.set_y(-15)
         self.set_font("helvetica", "I", 8)
         self.set_text_color(*_MUTED_GREY)
-        self.cell(0, 10, f"Seite {self.page_no()}/{{nb}}", align="C")
+        footer_text = f"Seite {self.page_no()}/{{nb}}"
+        if self._is_demo:
+            footer_text += "  |  " + _clean_text(_DEMO_WATERMARK_TEXT) + " - keine echten Daten"
+        self.cell(0, 10, footer_text, align="C")
 
 
 # fpdf2s Core-Fonts kodieren mit ECHTEM ISO-8859-1 (0-255), NICHT dem
@@ -129,7 +159,7 @@ def _write_field(pdf: FPDF, label: str, value: str) -> None:
     pdf.cell(0, 7, _clean_text(value), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
 
-def suggested_filename(data: dict[str, Any]) -> str:
+def suggested_filename(data: dict[str, Any], is_demo: bool = False) -> str:
     """
     Baut einen eindeutigen, sicheren Dateinamen aus Techniker+Kunde+Zeitstempel
     -- reiner Vorschlag für Aufrufer, die mehrere Regieberichte parallel/
@@ -141,12 +171,14 @@ def suggested_filename(data: dict[str, Any]) -> str:
     technician = _safe_filename_component(str(data.get("techniker") or "Techniker"))
     customer = _safe_filename_component(str(data.get("kunde") or "Kunde"))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return f"Regiebericht_{technician}_{customer}_{stamp}.pdf"
+    prefix = "DEMO_" if is_demo else ""
+    return f"{prefix}Regiebericht_{technician}_{customer}_{stamp}.pdf"
 
 
 def generate_regiebericht(
     data: dict[str, Any],
     output_path: Union[str, Path] = "Regiebericht.pdf",
+    is_demo: bool = False,
 ) -> Path:
     """
     Erzeugt einen professionellen, deutschsprachigen Regiebericht als PDF.
@@ -158,6 +190,11 @@ def generate_regiebericht(
       - stunden: float | int | str -- geleistete Stunden
       - material: str | list[str] -- verwendetes Material (Liste wird mit ", " verbunden)
       - arbeit: str                -- Beschreibung der durchgeführten Tätigkeit
+
+    `is_demo=True` (Demo-Sandbox, tools/demo_sandbox.py) blendet einen
+    deutlich sichtbaren "Novara Automation - DEMO TEST"-Vermerk in Kopf-,
+    Fuß- und als diagonales Wasserzeichen ein, damit ein Demo-Regiebericht
+    nie mit einem echten verwechselt werden kann.
 
     `output_path` ist die vollständige Zieldatei (Ordner werden bei Bedarf
     angelegt) -- Default ist wörtlich "Regiebericht.pdf" im aktuellen
@@ -171,7 +208,7 @@ def generate_regiebericht(
     fehlgeschlagener PDF-Export dem WhatsApp-Nutzer gegenüber kommuniziert
     wird, ein stiller Fallback hier würde das verschleiern.
     """
-    pdf = _RegieberichtPDF(format="A4", unit="mm")
+    pdf = _RegieberichtPDF(format="A4", unit="mm", is_demo=is_demo)
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=22)
     pdf.set_margins(left=20, top=20, right=20)
