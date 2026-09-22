@@ -9,7 +9,7 @@ dist/
 build/
 .pytest_cache/
 *.log
-credentials.json
+*.json
 get_token.py
 
 # Baustellen-Voice-Assistant: zur Laufzeit generierte Regieberichte
