@@ -1172,17 +1172,28 @@ def _transcribe_audio(wav_bytes: bytes) -> Optional[str]:
         log.warning("Audio-Transkription übersprungen -- kein GROQ_API_KEY konfiguriert")
         return None
 
-    try:
-        client = Groq(api_key=settings.groq_api_key.get_secret_value())
-        transcription = client.audio.transcriptions.create(
-            file=("audio.wav", wav_bytes),
-            model="whisper-large-v3",
-        )
-        text = (transcription.text or "").strip()
-        return text or None
-    except Exception as exc:
-        log.warning("Audio-Transkription (Groq) fehlgeschlagen", bytes=len(wav_bytes), error=str(exc))
-        return None
+    client = Groq(api_key=settings.groq_api_key.get_secret_value())
+    # Ein Retry bei transienten Groq-Fehlern (Netzwerk, Rate-Limit): der
+    # Techniker soll seine Sprachnachricht nicht wegen eines einmaligen
+    # Aussetzers erneut schicken müssen. Bewusst nur 2 Versuche mit kurzem
+    # Backoff -- läuft synchron im Twilio-Antwortpfad.
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            transcription = client.audio.transcriptions.create(
+                file=("audio.wav", wav_bytes),
+                model="whisper-large-v3",
+            )
+            text = (transcription.text or "").strip()
+            return text or None
+        except Exception as exc:
+            log.warning(
+                "Audio-Transkription (Groq) fehlgeschlagen",
+                bytes=len(wav_bytes), error=str(exc), attempt=attempt, max_attempts=max_attempts,
+            )
+            if attempt < max_attempts:
+                time.sleep(0.6)
+    return None
 
 
 @app.post(

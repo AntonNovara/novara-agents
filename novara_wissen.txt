@@ -2,49 +2,74 @@ PAKETE
 ================================================================================
 
 ANGEBOTSPRINZIP:
-Immer mit dem Starter-Paket beginnen. Retainer erst nach bewiesenem Wert anbieten.
-Preise verstehen sich exkl. gesetzlicher Abgaben (Kleinunternehmer).
+Immer mit dem Anfragen-Starter beginnen. Upgrade auf "Der Autonome Betrieb" erst
+nach bewiesenem Wert anbieten. Alle Preise netto. Novara Automation ist
+Kleinunternehmer (§ 6 Abs. 1 Z 27 UStG) — es wird keine Umsatzsteuer verrechnet.
+(Stand der Preise: 19.09.2026, identisch mit der Website novaraautomation.com)
 
 ------------------------------------------------------------
-PAKET 1: STARTER — €990 (einmalig)
+PAKET 1: ANFRAGEN-STARTER — €390/Monat + €990 einmaliges Setup
 ------------------------------------------------------------
-Für wen: Betriebe, die einen klar definierten Engpass haben
-Was: 1 Kernprozess wird automatisiert
-Typische Umsetzungszeit: 5 Werktage
-Beispielanwendungen:
-  - Automatische Antwort bei verpassten Anrufen (SMS + Terminbuchungs-Link)
-  - Automatische Bestätigung nach Kontaktformular-Einsendung
-  - Erinnerung an vereinbarte Termine (SMS/E-Mail, 24h vorher)
-  - Strukturierte Angebotsvorlagen mit automatischem Versand
+Für wen: Einzelunternehmer & kleine Betriebe, die ihre Erreichbarkeit sofort
+verbessern wollen — ohne großen Aufwand und ohne IT-Vorkenntnisse
+Was: Ein digitaler Rezeptionist beantwortet Anfragen und vergibt Termine
+automatisch, rund um die Uhr.
+Umsetzungszeit: unter 48 Stunden
+Enthalten:
+  - Rezeptionist-Agent (beantwortet Anfragen 24/7)
+  - Termin-Agent (Terminvergabe direkt in Ihren Kalender)
+  - Integration in bestehende Tools (Google, Outlook, CRM)
+  - Vollständige Einrichtung & Testing
+  - 30 Tage E-Mail-Support nach Übergabe
+Beispiel-Workflows:
+  - Verpasster Anruf -> automatische SMS an den Kunden
+  - Anfrage -> automatischer Terminvorschlag
+  - Neuer Termin -> automatische Bestätigung & Kalender-Eintrag
+  - Erinnerungs-SMS vor dem Termin
 
 ------------------------------------------------------------
-PAKET 2: GROWTH — €2.490 (einmalig)
+PAKET 2: DER AUTONOME BETRIEB (empfohlen) — €890/Monat + €1.990 einmaliges Setup
 ------------------------------------------------------------
-Für wen: Betriebe mit 2–3 manuellen Engpässen oder komplexerer Integration
-Was: 2–3 Prozesse, tiefere Systemintegration
-Typische Umsetzungszeit: 2–3 Wochen
-Beispielanwendungen:
-  - Verpasster Anruf → automatische Antwort + Lead-Erfassung + CRM-Update
-  - Angebotsanfrage → automatische Eingangsbestätigung + Angebotserstellung + Follow-up
-  - Kundenkommunikation + Terminbuchung + Erinnerung in einem System
+Für wen: KMU mit 1-20 Mitarbeitern, die strukturiert wachsen wollen
+Was: Komplette Suite aus 5 KI-Agenten — Rezeption, Dokumentenanalyse,
+Qualifizierung, Terminvergabe und Support. Liest PDF-Angebote und Fotos
+automatisch aus und überwacht sich selbst rund um die Uhr.
+Umsetzungszeit: unter 48 Stunden
+Enthalten:
+  - Komplette Suite aus 5 KI-Agenten
+  - PDF-Regieberichte direkt per WhatsApp (Techniker schickt Text oder
+    Sprachnachricht von der Baustelle, das fertige PDF kommt automatisch zurück)
+  - Automatische Qualifizierung & Angebotsservice
+  - Läuft rund um die Uhr zuverlässig, ohne dass der Kunde nachschauen muss
+  - Anbindung an Branchensoftware (Novara-CRM oder bestehendes System)
+  - Automatische Follow-up-E-Mail-Sequenzen
+  - Integration in Google Workspace, Outlook, WhatsApp Business
+  - 30 Tage Prioritäts-Support
+Typische Ergebnisse: 5-10 Stunden pro Woche eingespart, keine verpassten
+Anfragen mehr, höhere Konversionsrate durch automatisches Follow-up,
+professionellerer Auftritt, skalierbar ohne Mehraufwand.
 
 ------------------------------------------------------------
-PAKET 3: RETAINER — €590/Monat (laufend)
+PAKET 3: MASSGESCHNEIDERTES KOMPLETTSYSTEM (Enterprise) — ab €1.490/Monat
 ------------------------------------------------------------
-Für wen: Bestandskunden, die das System optimiert und betreut haben wollen
-Was: Laufende Betreuung, Optimierung, Support, monatliche Anpassungen
-Voraussetzung: Erst nach erfolgreichem Starter oder Growth Projekt anbieten
-Inhalt: 1 monatlicher Review-Call, Fehlerbehebung, kleine Erweiterungen
+Für wen: Betriebe mit bestehender Branchensoftware, mehreren Standorten/Teams
+oder vertraglich geforderten Reaktionszeiten
+Enthalten: alle Leistungen aus "Der Autonome Betrieb" plus Anbindung an
+Branchensoftware (ERP/CRM: Moser, Hero, Lexoffice u. a.), garantierte
+Reaktionszeit (schriftlich vereinbart), individuelle Anpassung, persönlicher
+Ansprechpartner.
+Start: nach individuellem Onboarding-Gespräch. Mindestlaufzeit individuell.
 
 ------------------------------------------------------------
 ZAHLUNGSMODELL:
-  - Einmalprojekte: 50% Anzahlung bei Auftragsbestätigung, 50% bei Übergabe
-  - Retainer: Monatlich im Voraus
+  - Setup: 50% Anzahlung bei Auftragserteilung, 50% nach erfolgreicher Übergabe
+  - Monatliche Gebühr: danach monatlich im Voraus
+  - Zahlungsziel: jeweils 14 Tage netto
 
 ------------------------------------------------------------
 GARANTIE (Standard-Formulierung):
-"Wenn das System in den ersten 14 Tagen nicht wie vereinbart funktioniert,
-zahlen Sie nichts."
+"Wir gewährleisten, dass das System bei Übergabe vollständig funktionsfähig
+ist. In den ersten 30 Tagen beheben wir auftretende Probleme kostenlos."
 
 ================================================================================
 3. UNSERE ZIELGRUPPE — IDEAL CUSTOMER PROFILE (ICP)
@@ -155,8 +180,9 @@ will ob wir das gleiche Problem lösen oder ein anderes."
 
 EINWAND: "Ich vertrau sowas nicht"
 ANTWORT:
-"Das ist berechtigt. Deshalb starten wir immer mit zwei Wochen kostenlosem Test —
-Sie sehen ob es funktioniert, bevor Sie irgendetwas bezahlen. Wenn nicht, einfach stoppen."
+"Das ist berechtigt. Deshalb bekommen Sie 30 Tage kostenlose Fehlerbehebung nach der
+Übergabe — und das System ist bei Übergabe vollständig funktionsfähig, sonst
+bessern wir nach, bis es das ist."
 
 ------------------------------------------------------------
 KEIN BEDARF
@@ -213,7 +239,7 @@ Anruf-Struktur (Kurzversion):
 2. Kernfrage: "Was ist die eine Verwaltungsaufgabe die Sie am meisten Zeit kostet?"
 3. Tiefer bohren: Genaue Worte des Kunden notieren
 4. Übergang: "Wenn es ein System gäbe das [Problem] automatisch löst..."
-5. Nächster Schritt: 10-Min Videocall oder 2-Wochen-Test anbieten
+5. Nächster Schritt: 10-Min Videocall oder kostenloses Erstgespräch anbieten
 
 ------------------------------------------------------------
 PHASE 2: ADVICE-CALL / DISCOVERY (10–20 Minuten)
@@ -230,7 +256,7 @@ Schlüsselfragen:
 ------------------------------------------------------------
 PHASE 3: ANGEBOTSERSTELLUNG & VERSAND
 ------------------------------------------------------------
-Format: 1-seitiges Angebot (Starter oder Growth Paket)
+Format: 1-seitiges Angebot (Anfragen-Starter oder Der Autonome Betrieb)
 Versand: Als PDF per E-Mail, spätestens 24h nach Gespräch
 Struktur des Angebots:
   1. Titel (Outcome-orientiert, kein Technikjargon)
@@ -238,7 +264,7 @@ Struktur des Angebots:
   3. Problem (in Worten des Kunden)
   4. Lösung (was passiert — kein "KI", kein "Make.com")
   5. Ergebnis (messbar: "Keine verpassten Anrufe mehr")
-  6. Preis + Umsetzungszeit + Garantie
+  6. Preis (Setup + Monatsgebühr) + Umsetzungszeit + Garantie
 
 ------------------------------------------------------------
 PHASE 4: DEAL-ABSCHLUSS
@@ -299,7 +325,7 @@ PHASE 7: TEST & ÜBERGABE (Woche 2)
 - Feintuning basierend auf Feedback
 - Übergabe-Call (15 Min): System zeigen, Fragen klären
 - Kurze Dokumentation für den Kunden
-- Restbetrag in Rechnung stellen
+- Restbetrag des Setups (50%) in Rechnung stellen
 
 Übergabe-Nachricht:
 "Hallo [Vorname], das System ist bereit! Ich würde Ihnen kurz zeigen wie alles
@@ -308,7 +334,7 @@ läuft — passt Ihnen [Tag] um [Uhrzeit] für 15 Minuten?"
 ------------------------------------------------------------
 PHASE 8: NACH-PROJEKT (ab Woche 3)
 ------------------------------------------------------------
-- Retainer-Angebot stellen (€590/Monat) wenn Wert sichtbar
+- Upgrade auf "Der Autonome Betrieb" anbieten, wenn der Wert sichtbar ist
 - Case Study anfragen: "Darf ich Ihre Ergebnisse als Referenz nutzen?"
 - Empfehlungsfrage: "Kennen Sie jemanden aus Ihrem Netzwerk mit ähnlichen Herausforderungen?"
 - Check-In nach 30 Tagen
@@ -402,7 +428,7 @@ Passt es Ihnen für 10 Minuten nächste Woche?
 LG, Anton"
 
 ------------------------------------------------------------
-ANGEBOT — STARTER-BEISPIEL (Elektriker)
+ANGEBOT — ANFRAGEN-STARTER-BEISPIEL (Elektriker)
 ------------------------------------------------------------
 Titel: Kein verpasster Anruf mehr – Automatisches Anfragen-System für [Firmename]
 
@@ -426,9 +452,9 @@ Ergebnis:
 Schätzung: 2–5 zusätzliche Anfragen pro Woche, die sonst verloren gegangen wären."
 
 Investition:
-Starter-Paket: €990 (einmalig, exkl. gesetzlicher Abgaben)
-Live in 5 Werktagen.
-Garantie: Wenn das System in den ersten 14 Tagen nicht funktioniert, zahlen Sie nichts.
+Anfragen-Starter: €390/Monat + €990 einmaliges Setup (netto, keine USt.)
+Live in unter 48 Stunden.
+Garantie: System bei Übergabe voll funktionsfähig, 30 Tage kostenlose Fehlerbehebung.
 
 ================================================================================
 ENDE DER WISSENSDATENBANK
