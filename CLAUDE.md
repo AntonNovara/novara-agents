@@ -860,6 +860,8 @@ stattdessen eine erklärende TwiML-Nachricht mit HTTP 200).
 >    Erfolgsfall) -- rein für die Diagnose in Railways Log-Stream, grep-bar
 >    nach `[STEP `, keine funktionale Änderung.
 
+**Demo-Sandbox (22./23.09.2026, `tools/demo_sandbox.py`).** Eine WhatsApp-Nachricht gilt als Demo, wenn sie `[DEMO]` enthält (case-insensitive, wird vor dem Agenten entfernt) ODER der Absender in `WHATSAPP_DEMO_TEST_NUMBERS` steht (kommagetrennt; Vergleich über `core.config.normalize_whatsapp_number()`, also mit oder ohne `whatsapp:`-Präfix). Ablauf identisch zum Normalpfad (Groq-Transkription, FieldWorkerAgent, TwiML mit PDF als Media), aber: (1) das PDF trägt in Kopf-, Fußzeile und diagonal die Marke "Novara Automation - DEMO" und der Dateiname beginnt mit `DEMO_`, (2) `log_demo_lead()` hängt Timestamp, Absendernummer, Techniker, Kunde, Stunden, Material, Tätigkeit, Datum an das Tab `Leads_Demo` (`DEMO_SHEET_TAB_NAME`) desselben Spreadsheets an -- legt das Tab samt Kopfzeile selbst an, schreibt nie ins echte CRM-Tab, wirft nie (Fehler → nur `False` + Log), (3) die Bestätigung beginnt mit "[DEMO-MODUS -- keine echten Daten]". Braucht `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON` für den Sheet-Log (ohne: PDF-Antwort funktioniert trotzdem). Für reine Sprachnachrichten (kein Text, kein Tag) muss die Absendernummer in `WHATSAPP_DEMO_TEST_NUMBERS` stehen. Regressionstest: `test_system.py` TEST 26 (komplett gemockt, schreibt nie ins echte Sheet).
+
 **Dockerfile aktualisiert:** `COPY utils/ utils/` ergänzt (das Verzeichnis
 fehlte in der expliziten COPY-Liste — ohne diesen Fix hätte main.py in der
 Railway-Produktivumgebung mit `ModuleNotFoundError: No module named 'utils'`

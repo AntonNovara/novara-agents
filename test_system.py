@@ -2606,6 +2606,158 @@ def test_whatsapp_webhook(live: bool) -> None:
             shutil.rmtree(main_module._REPORTS_DIR, ignore_errors=True)
 
 
+def test_demo_sandbox() -> None:
+    section("TEST 26 — Demo-Sandbox: [DEMO]-Marker/Testnummer, PDF-Marke, Leads_Demo-Tab, WhatsApp-Rückgabe")
+    info(
+        "Alles offline: Sheets-Service ist gemockt (der Test darf NIE ins echte Sheet "
+        "schreiben), der field-worker-Agent ist ein Stub (kein LLM), Twilio-Token leer."
+    )
+    import asyncio
+    import shutil
+    from types import SimpleNamespace
+    from unittest import mock
+
+    try:
+        import main as main_module
+        from core.config import settings
+        from tools import demo_sandbox
+        from utils.pdf_generator import generate_regiebericht
+    except Exception as exc:
+        fail("Import für Demo-Sandbox-Test", str(exc))
+        return
+
+    # 26a: Erkennung -- Marker (case-insensitive) ODER Testnummer (mit/ohne "whatsapp:"-Präfix).
+    original_numbers = settings.whatsapp_demo_test_numbers
+    try:
+        settings.whatsapp_demo_test_numbers = "+436601112233, whatsapp:+436604445566"
+        checks = {
+            "[DEMO] im Text": demo_sandbox.is_demo_message("whatsapp:+43999", "[DEMO] 2h Heizung"),
+            "[demo] klein geschrieben": demo_sandbox.is_demo_message("whatsapp:+43999", "test [demo]"),
+            "Testnummer (Twilio-Präfix, Config ohne Präfix)": demo_sandbox.is_demo_message("whatsapp:+436601112233", "2h"),
+            "Testnummer (Config mit Präfix)": demo_sandbox.is_demo_message("whatsapp:+436604445566", "2h"),
+            "Fremde Nummer ohne Marker = KEIN Demo": not demo_sandbox.is_demo_message("whatsapp:+436607778899", "2h"),
+            "Leere Testnummern-Liste + kein Marker = KEIN Demo": True,
+            "strip_demo_marker": demo_sandbox.strip_demo_marker("[DEMO] Hab 2h gearbeitet") == "Hab 2h gearbeitet",
+        }
+        settings.whatsapp_demo_test_numbers = ""
+        checks["Leere Testnummern-Liste + kein Marker = KEIN Demo"] = not demo_sandbox.is_demo_message("whatsapp:+436601112233", "2h")
+        if all(checks.values()):
+            ok("is_demo_message()/strip_demo_marker(): Marker, Testnummer, Normalisierung, Negativfälle", str(len(checks)) + " Checks")
+        else:
+            fail("Demo-Erkennung unerwartet", str({k: v for k, v in checks.items() if not v}))
+    finally:
+        settings.whatsapp_demo_test_numbers = original_numbers
+
+    # 26b: PDF trägt die Marke "Novara Automation - DEMO" nur im Demo-Modus.
+    import tempfile
+
+    import pdfplumber
+
+    sample = {"techniker": "Max", "kunde": "Familie Berger", "stunden": 2, "material": "Heizkörper", "arbeit": "Heizkörper getauscht", "datum": "23.09.2026"}
+    with tempfile.TemporaryDirectory() as tmp:
+        demo_pdf = generate_regiebericht(sample, __import__("pathlib").Path(tmp) / "d.pdf", True)
+        real_pdf = generate_regiebericht(sample, __import__("pathlib").Path(tmp) / "r.pdf", False)
+        with pdfplumber.open(demo_pdf) as a, pdfplumber.open(real_pdf) as b:
+            demo_text = " ".join((pg.extract_text() or "") for pg in a.pages)
+            real_text = " ".join((pg.extract_text() or "") for pg in b.pages)
+    if "Novara Automation - DEMO" in demo_text and "DEMO" not in real_text:
+        ok("PDF: Demo trägt \"Novara Automation - DEMO\", Echt-Bericht bleibt ohne Vermerk")
+    else:
+        fail("PDF-Demo-Marke unerwartet", f"demo={demo_text[:120]!r} real_has_demo={'DEMO' in real_text}")
+
+    # 26c: log_demo_lead() gegen gemockten Sheets-Service.
+    def _run_log(existing_tabs: list[str], configured: bool = True, boom: bool = False):
+        service = mock.MagicMock()
+        descs: list[str] = []
+
+        def fake_exec(request, description):
+            descs.append(description)
+            if boom:
+                raise RuntimeError("sheets down")
+            if "Metadaten" in description:
+                return {"sheets": [{"properties": {"title": t}} for t in existing_tabs]}
+            return {}
+
+        with mock.patch.object(type(settings), "crm_service_account_configured", new_callable=mock.PropertyMock, return_value=configured), \
+             mock.patch.object(demo_sandbox.production_crm_bridge, "get_sheets_service", return_value=service), \
+             mock.patch.object(demo_sandbox.production_crm_bridge, "execute_with_retry", side_effect=fake_exec):
+            result = demo_sandbox.log_demo_lead(sample, "whatsapp:+436601112233")
+        return result, descs, service
+
+    result, descs, service = _run_log(["CRM"])
+    append_kwargs = service.spreadsheets.return_value.values.return_value.append.call_args.kwargs
+    row = append_kwargs["body"]["values"][0]
+    if (
+        result is True
+        and "Demo-Tab anlegen" in descs
+        and append_kwargs["range"].startswith("'Leads_Demo'")
+        and row[1] == "whatsapp:+436601112233"
+        and row[3] == "Familie Berger"
+    ):
+        ok("log_demo_lead(): legt fehlendes Tab \"Leads_Demo\" an und schreibt Nummer + Daten dorthin (nicht ins CRM-Tab)")
+    else:
+        fail("log_demo_lead() (Tab fehlt) unerwartet", f"result={result} descs={descs} range={append_kwargs.get('range')}")
+
+    result, descs, _ = _run_log(["CRM", "Leads_Demo"])
+    if result is True and "Demo-Tab anlegen" not in descs:
+        ok("log_demo_lead(): vorhandenes Tab wird wiederverwendet (kein zweites angelegt)")
+    else:
+        fail("log_demo_lead() (Tab vorhanden) unerwartet", f"result={result} descs={descs}")
+
+    if _run_log(["CRM"], configured=False)[0] is False and _run_log(["CRM"], boom=True)[0] is False:
+        ok("log_demo_lead(): ohne Service-Account bzw. bei Sheets-Fehler -> False, nie eine Exception")
+    else:
+        fail("log_demo_lead() Fail-Safe verletzt")
+
+    # 26d: voller Webhook-Durchlauf (Stub-Agent, kein LLM) -- Demo vs. normale Nachricht.
+    class _FakeSecret:
+        def get_secret_value(self) -> str:
+            return ""
+
+    class _StubAgent:
+        def process(self, request):
+            return SimpleNamespace(success=True, result=dict(sample), error=None)
+
+    original_token = main_module.settings.twilio_auth_token
+    original_registry = main_module._AGENT_REGISTRY
+    original_log_fn = main_module.log_demo_lead
+    calls: list[tuple] = []
+    try:
+        main_module.settings.twilio_auth_token = _FakeSecret()
+        main_module._AGENT_REGISTRY = {"field-worker": _StubAgent()}
+        main_module.log_demo_lead = lambda data, sender: calls.append((data, sender)) or True
+
+        demo_req = _build_fake_whatsapp_request({"From": "whatsapp:+436607778899", "Body": "[DEMO] 2h Heizkörper getauscht bei Berger", "NumMedia": "0"})
+        demo_body = asyncio.run(main_module.whatsapp_webhook(demo_req)).body.decode("utf-8")
+        real_req = _build_fake_whatsapp_request({"From": "whatsapp:+436607778899", "Body": "2h Heizkörper getauscht bei Berger", "NumMedia": "0"})
+        real_body = asyncio.run(main_module.whatsapp_webhook(real_req)).body.decode("utf-8")
+
+        if (
+            "DEMO-MODUS" in demo_body
+            and "<Media>" in demo_body
+            and "DEMO_" in demo_body
+            and len(calls) == 1
+            and calls[0][1] == "whatsapp:+436607778899"
+        ):
+            ok("Webhook mit [DEMO]: PDF (DEMO_-Dateiname) per WhatsApp-Media zurück, Nummer in Leads_Demo geloggt")
+        else:
+            fail("Webhook [DEMO]-Pfad unerwartet", f"calls={len(calls)} body={demo_body[:250]}")
+
+        if "DEMO" not in real_body and len(calls) == 1 and "<Media>" in real_body:
+            ok("Webhook ohne [DEMO]: normaler Bericht, KEIN Demo-Log, kein Demo-Vermerk")
+        else:
+            fail("Webhook Normalpfad unerwartet", f"calls={len(calls)} body={real_body[:250]}")
+    except Exception:
+        fail("Demo-Sandbox-Webhook-Test — Exception")
+        traceback.print_exc()
+    finally:
+        main_module.settings.twilio_auth_token = original_token
+        main_module._AGENT_REGISTRY = original_registry
+        main_module.log_demo_lead = original_log_fn
+        if main_module._REPORTS_DIR.exists():
+            shutil.rmtree(main_module._REPORTS_DIR, ignore_errors=True)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -2645,6 +2797,7 @@ def main() -> int:
     test_pdf_generator()
     test_field_worker_agent(live)
     test_whatsapp_webhook(live)
+    test_demo_sandbox()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

@@ -3,6 +3,15 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def normalize_whatsapp_number(number: str) -> str:
+    """Vereinheitlicht eine WhatsApp-Rufnummer: Twilio sendet "whatsapp:+43...",
+    in der Konfiguration steht oft nur "+43..." (oder mit Leerzeichen)."""
+    n = (number or "").strip()
+    if n.lower().startswith("whatsapp:"):
+        n = n[len("whatsapp:"):]
+    return n.replace(" ", "")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -195,7 +204,11 @@ class Settings(BaseSettings):
     @property
     def whatsapp_demo_test_numbers_set(self) -> set[str]:
         """Normalisierte Menge der Test-Rufnummern aus WHATSAPP_DEMO_TEST_NUMBERS."""
-        return {n.strip() for n in self.whatsapp_demo_test_numbers.split(",") if n.strip()}
+        return {
+            normalize_whatsapp_number(n)
+            for n in self.whatsapp_demo_test_numbers.split(",")
+            if n.strip()
+        }
 
     @property
     def crm_service_account_configured(self) -> bool:

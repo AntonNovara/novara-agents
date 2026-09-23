@@ -42,7 +42,7 @@ _BRAND_BLUE = (0, 102, 255)   # Novara-Blau, siehe website/css/style.css --blue
 _MUTED_GREY = (110, 110, 110)
 _TEXT_DARK = (20, 20, 20)
 _DEMO_RED = (200, 0, 0)
-_DEMO_WATERMARK_TEXT = "Novara Automation - DEMO TEST"
+_DEMO_WATERMARK_TEXT = "Novara Automation - DEMO"
 
 
 class _RegieberichtPDF(FPDF):
