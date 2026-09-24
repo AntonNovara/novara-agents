@@ -2789,6 +2789,103 @@ def test_demo_sandbox() -> None:
             shutil.rmtree(main_module._REPORTS_DIR, ignore_errors=True)
 
 
+def test_followup_digest() -> None:
+    section("TEST 27 — Follow-up-Digest: fällige Sequenz-Schritte, Digest-Mail, Endpoints")
+    info(
+        "list_due() liefert nur AKTIVE Sequenzen, deren aktueller Schritt 'pending' und laut "
+        "Kadenz (created_at + day_offset) fällig ist; gestoppte/zu frühe nicht. Der Digest "
+        "verschickt nichts an Leads, nur eine Mail an Anton (hier gemockt)."
+    )
+    import asyncio
+    import uuid
+    from datetime import datetime, timedelta, timezone
+    from unittest import mock
+
+    try:
+        import main as main_module
+        from tools import lead_notifier, sequence_scheduler
+    except Exception as exc:
+        fail("Import für Follow-up-Digest-Test", str(exc))
+        return
+
+    tag = uuid.uuid4().hex[:8]
+    try:
+        seq = sequence_scheduler.enroll(
+            f"digest-{tag}@example.com",
+            {"email": f"digest-{tag}@example.com", "linkedin": None, "voice": None},
+            "email", True,
+        )
+        now = datetime.now(timezone.utc)
+        early = [d for d in sequence_scheduler.list_due(now) if d["sequence_id"] == seq.sequence_id]
+        # Nächster Schritt (LinkedIn) hat keinen Identifier -> beim Enrollment "skipped"; deshalb fällig ist ggf. gar nichts.
+        later = [d for d in sequence_scheduler.list_due(now + timedelta(days=30)) if d["sequence_id"] == seq.sequence_id]
+        seq2 = sequence_scheduler.enroll(
+            f"digest2-{tag}@example.com",
+            {"email": f"digest2-{tag}@example.com", "linkedin": f"https://linkedin.com/in/x{tag}", "voice": None},
+            "email", True,
+        )
+        due_now = [d for d in sequence_scheduler.list_due(now) if d["sequence_id"] == seq2.sequence_id]
+        due_day6 = [d for d in sequence_scheduler.list_due(now + timedelta(days=6)) if d["sequence_id"] == seq2.sequence_id]
+        sequence_scheduler.stop(seq2.sequence_id, "test")
+        due_stopped = [d for d in sequence_scheduler.list_due(now + timedelta(days=6)) if d["sequence_id"] == seq2.sequence_id]
+
+        if not due_now and len(due_day6) == 1 and due_day6[0]["channel"] == "linkedin" and not due_stopped and not early and not later:
+            ok("list_due(): zu frühe, übersprungene und gestoppte Sequenzen fehlen; fälliger LinkedIn-Schritt (Tag 5) erscheint")
+        else:
+            fail("list_due() unerwartet", str((early, later, due_now, due_day6, due_stopped)))
+    except Exception:
+        fail("list_due() — Exception")
+        traceback.print_exc()
+
+    # Digest-Mail: leer -> keine Mail; ohne SMTP -> False; mit Daten -> Body enthält den Lead.
+    sent_msgs: list[str] = []
+
+    class _FakeSMTP:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def starttls(self): pass
+        def login(self, *a): pass
+        def sendmail(self, frm, to, body): sent_msgs.append(body)
+
+    item = {"lead_key": "elektro-huber", "channel": "linkedin", "day_offset": 5, "due_since": "2026-09-24T00:00:00+00:00", "identifier": "x"}
+    orig_email, orig_pw = lead_notifier.settings.smtp_email, lead_notifier.settings.smtp_password
+    try:
+        empty_ok = lead_notifier.send_followup_digest([]) is True
+        lead_notifier.settings.smtp_email = _FakeSecret("")
+        lead_notifier.settings.smtp_password = _FakeSecret("")
+        no_smtp = lead_notifier.send_followup_digest([item]) is False
+        lead_notifier.settings.smtp_email = _FakeSecret("a@b.c")
+        lead_notifier.settings.smtp_password = _FakeSecret("pw")
+        with mock.patch.object(lead_notifier.smtplib, "SMTP", _FakeSMTP):
+            sent_ok = lead_notifier.send_followup_digest([item]) is True
+        if empty_ok and no_smtp and sent_ok and len(sent_msgs) == 1 and "elektro-huber" in __import__("email").message_from_string(sent_msgs[0]).get_payload(decode=True).decode("utf-8"):
+            ok("send_followup_digest(): leer -> keine Mail, ohne SMTP -> False, sonst Mail mit Lead-Liste")
+        else:
+            fail("send_followup_digest() unerwartet", str((empty_ok, no_smtp, sent_ok, len(sent_msgs))))
+    finally:
+        lead_notifier.settings.smtp_email, lead_notifier.settings.smtp_password = orig_email, orig_pw
+
+    # Endpoints (Handler direkt; Auth ist Sache von require_api_key, siehe TEST der Agent-Endpoints).
+    try:
+        with mock.patch.object(main_module.sequence_scheduler, "list_due", return_value=[item]), \
+             mock.patch.object(main_module.lead_notifier, "send_followup_digest", return_value=True):
+            r1 = asyncio.run(main_module.sequences_due())
+            r2 = asyncio.run(main_module.sequences_notify_due())
+        if r1["count"] == 1 and r2 == {"count": 1, "email_sent": True}:
+            ok("Endpoints /internal/sequences/due und /notify-due liefern Liste bzw. lösen den Digest aus")
+        else:
+            fail("Follow-up-Endpoints unerwartet", str((r1, r2)))
+        deps = [r for r in main_module.app.routes if getattr(r, "path", "").startswith("/api/v1/internal/sequences")]
+        if deps and all(r.dependant.dependencies for r in deps):
+            ok("Alle /internal/sequences-Endpoints hängen an require_api_key (nicht öffentlich)")
+        else:
+            fail("/internal/sequences-Endpoints ohne Auth-Dependency")
+    except Exception:
+        fail("Follow-up-Endpoint-Test — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -2829,6 +2926,7 @@ def main() -> int:
     test_field_worker_agent(live)
     test_whatsapp_webhook(live)
     test_demo_sandbox()
+    test_followup_digest()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

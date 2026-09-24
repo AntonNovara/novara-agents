@@ -154,3 +154,39 @@ def notify_lead_async(lead: "CapturedLead") -> None:
             )
 
     threading.Thread(target=_run, name=f"lead-notify-{lead.session_id}", daemon=True).start()
+
+
+def send_followup_digest(due: list[dict]) -> bool:
+    """
+    Schickt Anton die Liste der fälligen Follow-ups (tools/sequence_scheduler.
+    list_due()) per SMTP. Leere Liste -> keine Mail (True). Wirft NIE.
+    """
+    if not due:
+        return True
+    smtp_email = settings.smtp_email.get_secret_value().strip()
+    smtp_password = settings.smtp_password.get_secret_value().strip()
+    if not smtp_email or not smtp_password:
+        logger.warning("Follow-up-Digest übersprungen: SMTP_EMAIL/SMTP_PASSWORD nicht konfiguriert")
+        return False
+
+    lines = [f"Heute stehen {len(due)} Follow-up(s) an -- bitte prüfen und selbst versenden:", ""]
+    for d in due:
+        lines.append(
+            f"- {d['lead_key']}: Kanal {d['channel']} (Tag {d['day_offset']}), "
+            f"Kontakt: {d.get('identifier') or 'unbekannt'}, fällig seit {d['due_since'][:10]}"
+        )
+    lines += ["", "Novara verschickt Follow-ups nicht automatisch. Nach dem Versand den Schritt in der Sequenz als erledigt markieren."]
+
+    msg = MIMEText("\n".join(lines))
+    msg["From"] = smtp_email
+    msg["To"] = _NOTIFY_RECIPIENT
+    msg["Subject"] = f"Novara: {len(due)} Follow-up(s) fällig"
+    try:
+        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=_SMTP_TIMEOUT_SECONDS) as server:
+            server.starttls()
+            server.login(smtp_email, smtp_password)
+            server.sendmail(smtp_email, [_NOTIFY_RECIPIENT], msg.as_string())
+        return True
+    except Exception:
+        logger.warning("Follow-up-Digest: SMTP-Versand fehlgeschlagen", exc_info=True)
+        return False

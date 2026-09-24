@@ -1,0 +1,21 @@
+name: Follow-up Digest - novara-agents
+
+# Täglich 07:30 Wiener Zeit (Sommerzeit: 05:30 UTC, Winterzeit: 06:30 UTC -> 05:45 UTC als Kompromiss
+# reicht, GitHub-Cron kennt keine Zeitzonen). Schickt Anton eine Mail mit den fälligen Follow-ups.
+# Versendet NICHTS an Leads.
+on:
+  schedule:
+    - cron: "45 5 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger follow-up digest
+        env:
+          API_SECRET_KEY: ${{ secrets.API_SECRET_KEY }}
+        run: |
+          curl --fail-with-body --silent --show-error --max-time 60 -X POST \
+            -H "X-API-Key: ${API_SECRET_KEY}" \
+            https://novara-agents-production.up.railway.app/api/v1/internal/sequences/notify-due

@@ -513,6 +513,12 @@ echten Anthropic-Egress-Check macht).
 
 ---
 
+## Follow-up-Digest statt Auto-Versand (24.09.2026)
+
+Der Sequence Scheduler hatte keinen Worker. Bewusst KEIN automatischer Versand von Follow-ups an Leads (unbeaufsichtigte Kaltakquise-Nachrichten: Reputations- und Rechtsrisiko, u. a. § 174 TKG für E-Mail-Werbung): stattdessen `SequenceScheduler.list_due()` (aktive Sequenzen, aktueller Schritt `pending` und `created_at + day_offset` erreicht) und ein täglicher Digest an Anton. Endpoints (alle hinter `X-API-Key`): `GET /api/v1/internal/sequences/due`, `POST /api/v1/internal/sequences/notify-due` (schickt `lead_notifier.send_followup_digest()` per SMTP, nur bei fälligen Schritten), `POST /api/v1/internal/sequences/{id}/steps/{idx}/result` (Schritt als erledigt markieren). Auslöser: `.github/workflows/sequence-digest.yml`, täglich 05:45 UTC, braucht das GitHub-Secret `API_SECRET_KEY` (= Railway-Variable gleichen Namens). Regressionstest: TEST 27.
+
+---
+
 ## Sprint 3: Architektur & Skalierbarkeit (16.09.2026)
 
 Drei Infrastruktur-Bausteine, alle aus der bisherigen Roadmap/"Bekannte

@@ -38,7 +38,7 @@ import dataclasses
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import JSON, DateTime, Integer, String, Text
@@ -262,6 +262,41 @@ class SequenceScheduler:
             return None
         return seq.current_step, seq.steps[seq.current_step]
 
+    def list_due(self, now: Optional[datetime] = None) -> list[dict]:
+        """
+        Alle aktiven Sequenzen, deren AKTUELLER Schritt noch aussteht UND laut
+        Kadenz fällig ist (created_at + day_offset Tage <= now). Für den
+        täglichen Follow-up-Digest (main.py /api/v1/internal/sequences/*):
+        Novara verschickt Follow-ups bewusst NICHT automatisch -- der Digest
+        zeigt Anton, was ansteht, und er sendet mit Augenmaß selbst.
+        """
+        now = now or datetime.now(timezone.utc)
+        with SessionLocal() as session:
+            rows = session.query(_SequenceRow).filter(_SequenceRow.status == "active").all()
+            sequences = [_row_to_sequence(r) for r in rows]
+        due: list[dict] = []
+        for seq in sequences:
+            if seq.current_step >= len(seq.steps):
+                continue
+            step = seq.steps[seq.current_step]
+            if step.status != "pending":
+                continue
+            due_at = datetime.fromisoformat(seq.created_at) + timedelta(days=step.day_offset)
+            if due_at.tzinfo is None:
+                due_at = due_at.replace(tzinfo=timezone.utc)
+            if due_at <= now:
+                due.append({
+                    "sequence_id": seq.sequence_id,
+                    "lead_key": seq.lead_key,
+                    "channel": step.channel,
+                    "step_index": seq.current_step,
+                    "day_offset": step.day_offset,
+                    "due_since": due_at.isoformat(),
+                    "identifier": seq.identifiers.get(step.channel),
+                    "attempts": step.attempts,
+                })
+        return sorted(due, key=lambda d: d["due_since"])
+
     def stop(self, sequence_id: str, reason: str) -> Sequence:
         """Wird vom Reply-Classifier aufgerufen: Interesse oder Opt-out beendet die Kadenz sofort."""
         with SessionLocal() as session:
@@ -310,6 +345,10 @@ def enroll(
 
 def record_attempt(sequence_id: str, step_index: int, success: bool, reason: str = "") -> StepRecord:
     return _scheduler.record_attempt(sequence_id, step_index, success, reason)
+
+
+def list_due(now: Optional[datetime] = None) -> list[dict]:
+    return _scheduler.list_due(now)
 
 
 def next_due_step(sequence_id: str) -> Optional[tuple[int, StepRecord]]:

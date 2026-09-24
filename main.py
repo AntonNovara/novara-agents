@@ -1327,6 +1327,47 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
 
 # ── Post-Call Protokolle ──────────────────────────────────────────────────────
 
+@app.get("/api/v1/internal/sequences/due", tags=["Sequences"], dependencies=[Depends(require_api_key)])
+async def sequences_due():
+    """Fällige Follow-up-Schritte aller aktiven Sequenzen (siehe SequenceScheduler.list_due)."""
+    import asyncio
+
+    due = await asyncio.get_running_loop().run_in_executor(None, sequence_scheduler.list_due)
+    return {"count": len(due), "due": due}
+
+
+@app.post("/api/v1/internal/sequences/notify-due", tags=["Sequences"], dependencies=[Depends(require_api_key)])
+async def sequences_notify_due():
+    """Schickt Anton den Follow-up-Digest per E-Mail. Wird täglich von
+    .github/workflows/sequence-digest.yml aufgerufen. Sendet KEINE Nachrichten
+    an Leads -- nur die Erinnerung an Anton."""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    due = await loop.run_in_executor(None, sequence_scheduler.list_due)
+    sent = await loop.run_in_executor(None, lead_notifier.send_followup_digest, due)
+    log.info("Follow-up-Digest", due=len(due), sent=sent)
+    return {"count": len(due), "email_sent": sent}
+
+
+class SequenceStepResult(BaseModel):
+    success: bool = True
+    reason: str = "manuell erledigt"
+
+
+@app.post(
+    "/api/v1/internal/sequences/{sequence_id}/steps/{step_index}/result",
+    tags=["Sequences"], dependencies=[Depends(require_api_key)],
+)
+async def sequence_step_result(sequence_id: str, step_index: int, body: SequenceStepResult):
+    """Markiert einen Schritt als erledigt (success=true) oder fehlgeschlagen."""
+    try:
+        step = sequence_scheduler.record_attempt(sequence_id, step_index, body.success, body.reason)
+    except (KeyError, IndexError):
+        raise HTTPException(status_code=404, detail="Sequence or step not found")
+    return {"status": step.status, "attempts": step.attempts}
+
+
 @app.get("/api/v1/calls", tags=["Calls"], dependencies=[Depends(require_api_key)])
 async def list_calls():
     """Listet alle gespeicherten Anruf-Protokolle (für Claude Cowork / Railway-Zugriff)."""
