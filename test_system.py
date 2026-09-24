@@ -2886,6 +2886,65 @@ def test_followup_digest() -> None:
         traceback.print_exc()
 
 
+def test_mcp_http_auth() -> None:
+    section("TEST 28 — MCP-Server HTTP-Transport: Bearer-Auth, fail-closed")
+    info("Ohne/mit falschem Bearer-Token 401, mit richtigem durchgelassen; ohne MCP_API_KEY startet --http nicht.")
+    import asyncio
+    import subprocess
+
+    try:
+        from tools import mcp_server
+    except Exception as exc:
+        fail("Import tools.mcp_server", str(exc))
+        return
+
+    async def inner(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    def call(headers):
+        sent: list[dict] = []
+
+        async def send(msg):
+            sent.append(msg)
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        app = mcp_server.BearerAuthMiddleware(inner, "s3cret-key")
+        asyncio.run(app({"type": "http", "headers": headers}, receive, send))
+        return sent[0]["status"]
+
+    results = {
+        "kein Header -> 401": call([]) == 401,
+        "falscher Token -> 401": call([(b"authorization", b"Bearer falsch")]) == 401,
+        "Basic statt Bearer -> 401": call([(b"authorization", b"Basic s3cret-key")]) == 401,
+        "richtiger Token -> 200": call([(b"authorization", b"Bearer s3cret-key")]) == 200,
+    }
+    if all(results.values()):
+        ok("BearerAuthMiddleware: nur der richtige Token kommt durch", str(len(results)) + " Checks")
+    else:
+        fail("BearerAuthMiddleware unerwartet", str({k: v for k, v in results.items() if not v}))
+
+    try:
+        mcp_server.build_http_app("")
+        fail("build_http_app('') hätte ValueError werfen müssen")
+    except ValueError:
+        app = mcp_server.build_http_app("abc")
+        if any("BearerAuthMiddleware" in str(m) for m in app.user_middleware):
+            ok("build_http_app(): leerer Schlüssel abgelehnt, echte App hat die Auth-Middleware eingehängt")
+        else:
+            fail("build_http_app(): Middleware nicht eingehängt")
+
+    env = {k: v for k, v in __import__("os").environ.items() if k != "MCP_API_KEY"}
+    proc = subprocess.run([sys.executable, "-m", "tools.mcp_server", "--http"], env=env, capture_output=True, timeout=60,
+                          cwd=str(__import__("pathlib").Path(__file__).parent))
+    if proc.returncode == 2:
+        ok("`--http` ohne MCP_API_KEY beendet sich mit Exit-Code 2 (fail-closed)")
+    else:
+        fail("`--http` ohne MCP_API_KEY startete trotzdem", f"rc={proc.returncode}")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -2927,6 +2986,7 @@ def main() -> int:
     test_whatsapp_webhook(live)
     test_demo_sandbox()
     test_followup_digest()
+    test_mcp_http_auth()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

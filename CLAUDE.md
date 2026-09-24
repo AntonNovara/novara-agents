@@ -614,22 +614,10 @@ Startet über stdio (Default, für lokale/Desktop-MCP-Clients) oder `--http`
 (streamable-http, Port 8001 Default, für entfernte Kunden-CRMs):
 ```bash
 python3 -m tools.mcp_server            # stdio
-python3 -m tools.mcp_server --http     # HTTP auf Port 8001
+MCP_API_KEY=... python3 -m tools.mcp_server --http     # HTTP auf Port 8001 (Bearer-Auth)
 ```
 
-> **Bekannte Lücke, analog zum Voice-Agent-Muster oben: HTTP-Transport hat
-> KEINE eigene Auth.** Anders als `main.py`'s `X-API-Key`-Header ist das
-> kein MCP-Primitive, das FastMCP von sich aus mitbringt. MUSS vor dem
-> ersten entfernten Kunden-CRM-Zugriff hinter denselben Schutz wie
-> `main.py` gestellt werden (Reverse-Proxy mit eigenem Auth, oder FastMCPs
-> `auth_server_provider` für OAuth). Für lokale/stdio-Nutzung (Claude
-> Desktop) ist das kein Thema — der Prozess läuft dann im Vertrauensbereich
-> des aufrufenden Clients selbst. Anders als beim Voice-Agent gibt es hier
-> noch KEIN Start-Gate, weil `tools/mcp_server.py` (noch) kein eigener
-> Teil von `main.py`s Lifespan ist, sondern ein separat gestarteter
-> Prozess — ein versehentlicher `--http`-Start ist daher ein bewusster
-> Operator-Schritt, kein stillschweigender Nebeneffekt eines
-> `main.py`-Deployments.
+> **Behoben (24.09.2026): HTTP-Transport hat jetzt Bearer-Auth.** Jeder Request an `--http` braucht `Authorization: Bearer <MCP_API_KEY>` (`BearerAuthMiddleware`, `hmac.compare_digest`, sonst 401). Ohne gesetzte Umgebungsvariable `MCP_API_KEY` startet `--http` gar nicht (Exit-Code 2, fail-closed). stdio (Claude Desktop) braucht keine Auth. Regressionstest: TEST 28. Der Schlüssel wird pro Kunden-CRM vergeben -- für mehrere Kunden mit getrennten Schlüsseln wäre FastMCPs OAuth (`auth_server_provider`) der nächste Schritt.
 >
 > **Technische Randnotiz:** Anders als der Rest des Repos nutzt diese Datei
 > bewusst KEIN `from __future__ import annotations` — FastMCPs
@@ -1656,7 +1644,7 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | **Churn-Detection** | Analysiert Nutzungsdaten und eskaliert an CSM wenn Aktivierungsgrad unter Schwellwert fällt |
 | **Multi-Tenant Auth** | OAuth2 / JWT statt einfachem API-Key für SaaS-Mandantenfähigkeit |
 | **Embedding-FAQ** | Vektor-Suche (Weaviate / pgvector) statt Keyword-Stemming für bessere FAQ-Treffer |
-| **MCP-Server-Auth** | Auth für den `--http`-Transport von `tools/mcp_server.py` (siehe Abschnitt oben) |
+| **MCP-Server-Auth pro Kunde** | Bearer-Auth mit EINEM Schlüssel ist seit 24.09.2026 da; getrennte Schlüssel/OAuth pro Kunden-CRM sind der nächste Schritt |
 
 ---
 

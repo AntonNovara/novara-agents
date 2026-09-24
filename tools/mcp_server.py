@@ -34,14 +34,12 @@ CLAUDE.md).
 Transport: stdio (Default -- für lokale/Desktop-MCP-Clients wie Claude
 Desktop) oder optional HTTP (streamable-http, für entfernte Kunden-CRMs).
 
-TODO vor Produktivbetrieb mit einem entfernten Kunden-CRM: Der
-HTTP-Transport hat hier KEINE eigene Auth -- anders als main.py's
-X-API-Key-Header ist das kein MCP-Primitive, das FastMCP von sich aus
-mitbringt. Muss vor dem ersten Kunden-CRM-Zugriff hinter denselben Schutz
-wie main.py (Reverse-Proxy mit eigenem Auth, oder FastMCP's
-auth_server_provider für OAuth) gestellt werden. Für lokale/stdio-Nutzung
-(Claude Desktop) ist das kein Thema -- der Prozess läuft dann im
-Vertrauensbereich des aufrufenden Clients selbst.
+Auth (HTTP-Transport, seit 24.09.2026): jeder Request braucht
+`Authorization: Bearer <MCP_API_KEY>` (Vergleich per hmac.compare_digest).
+Ohne gesetzte Umgebungsvariable MCP_API_KEY verweigert `--http` den Start
+(fail-closed) -- ein versehentlich offen exponierter Tool-Server ist damit
+nicht mehr möglich. Für stdio (Claude Desktop) ist keine Auth nötig: der
+Prozess läuft im Vertrauensbereich des aufrufenden Clients selbst.
 
 Starten:
   python3 -m tools.mcp_server            # stdio (Default)
@@ -58,6 +56,9 @@ neueren `X | None`-Syntax, damit die Datei ohne den Future-Import auch unter
 Python 3.9/3.10 (falls je nötig) syntaktisch gültig bleibt.
 """
 import argparse
+import hmac
+import os
+import sys
 import logging
 from typing import Any, Optional
 
@@ -237,20 +238,65 @@ def upsert_deal(
     return result.model_dump()
 
 
+class BearerAuthMiddleware:
+    """Reine ASGI-Middleware: verlangt `Authorization: Bearer <api_key>` auf jedem
+    HTTP-Request, sonst 401. Bewusst ohne Framework-Abhängigkeit, damit sie
+    auch für die von FastMCP erzeugte Starlette-App unverändert funktioniert."""
+
+    def __init__(self, app, api_key: str):
+        self.app = app
+        self._api_key = api_key.encode("utf-8")
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        supplied = b""
+        for name, value in scope.get("headers", []):
+            if name == b"authorization" and value.lower().startswith(b"bearer "):
+                supplied = value[7:].strip()
+                break
+        if not supplied or not hmac.compare_digest(supplied, self._api_key):
+            body = b'{"error":"unauthorized"}'
+            await send({
+                "type": "http.response.start", "status": 401,
+                "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
+                            (b"www-authenticate", b"Bearer")],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.app(scope, receive, send)
+
+
+def build_http_app(api_key: str):
+    """Streamable-HTTP-App des MCP-Servers, hinter Bearer-Auth. Verweigert einen
+    leeren Schlüssel (fail-closed)."""
+    if not api_key or not api_key.strip():
+        raise ValueError("MCP_API_KEY ist leer -- HTTP-Transport ohne Auth wird nicht gestartet")
+    app = mcp.streamable_http_app()
+    app.add_middleware(BearerAuthMiddleware, api_key=api_key.strip())
+    return app
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Novara MCP-Tool-Server")
     parser.add_argument(
         "--http",
         action="store_true",
-        help="Über HTTP (streamable-http) statt stdio laufen lassen -- für entfernte Kunden-CRMs.",
+        help="Über HTTP (streamable-http, Bearer-Auth via MCP_API_KEY) statt stdio laufen lassen -- für entfernte Kunden-CRMs.",
     )
     parser.add_argument("--port", type=int, default=8001, help="Port für --http (Default 8001).")
     args = parser.parse_args()
 
     if args.http:
-        mcp.settings.port = args.port
-        logger.info("MCP-Server startet über HTTP (streamable-http) auf Port %d", args.port)
-        mcp.run(transport="streamable-http")
+        api_key = os.environ.get("MCP_API_KEY", "")
+        if not api_key.strip():
+            logger.error("MCP_API_KEY nicht gesetzt -- HTTP-Transport wird aus Sicherheitsgründen NICHT gestartet")
+            sys.exit(2)
+        import uvicorn
+
+        logger.info("MCP-Server startet über HTTP (streamable-http, Bearer-Auth) auf Port %d", args.port)
+        uvicorn.run(build_http_app(api_key), host="0.0.0.0", port=args.port)
     else:
         logger.info("MCP-Server startet über stdio")
         mcp.run(transport="stdio")
