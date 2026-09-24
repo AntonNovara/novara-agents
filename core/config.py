@@ -3,13 +3,11 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-def normalize_whatsapp_number(number: str) -> str:
-    """Vereinheitlicht eine WhatsApp-Rufnummer: Twilio sendet "whatsapp:+43...",
-    in der Konfiguration steht oft nur "+43..." (oder mit Leerzeichen)."""
-    n = (number or "").strip()
-    if n.lower().startswith("whatsapp:"):
-        n = n[len("whatsapp:"):]
-    return n.replace(" ", "")
+def normalize_number(number: str) -> str:
+    """Vereinheitlicht eine Rufnummer auf E.164 mit führendem "+": Meta liefert
+    reine Ziffern ("4917632320243"), in der Konfiguration steht meist "+49 176 ..."."""
+    digits = "".join(ch for ch in (number or "") if ch.isdigit())
+    return f"+{digits}" if digits else ""
 
 
 class Settings(BaseSettings):
@@ -137,26 +135,32 @@ class Settings(BaseSettings):
         default="https://novara-automation.netlify.app", alias="NETLIFY_SITE_URL"
     )
 
-    # Baustellen-Voice-Assistant (main.py POST /api/v1/webhook/whatsapp,
-    # agents/field_worker_agent.py): Twilio-Zugangsdaten für (a)
-    # Signaturprüfung eingehender Webhook-Requests (RequestValidator,
-    # X-Twilio-Signature) und (b) authentifizierten Download von
-    # WhatsApp-Sprachnachrichten (Twilio-Media-URLs verlangen HTTP-Basic-Auth
-    # mit genau diesen beiden Werten). Ohne twilio_auth_token wird die
-    # Signaturprüfung übersprungen (mit Warn-Log) statt den Webhook hart zu
-    # blocken -- dieselbe Fail-Safe-für-lokale-Entwicklung-Philosophie wie
-    # ANTHROPIC_API_KEY/Demo-Modus (core/llm.py), NICHT für Produktivbetrieb
-    # gedacht: dort MUSS twilio_auth_token gesetzt sein, sonst nimmt der
-    # Endpoint unauthentifizierte Requests an, die echte LLM-Calls und
-    # PDF-Generierung auslösen (Ressourcen-/Spam-Risiko, siehe
-    # CLAUDE.md-Abschnitt zum Baustellen-Voice-Assistant).
-    twilio_account_sid: SecretStr = Field(default="", alias="TWILIO_ACCOUNT_SID")
-    twilio_auth_token: SecretStr = Field(default="", alias="TWILIO_AUTH_TOKEN")
+    # Baustellen-Voice-Assistant (main.py /api/v1/webhook/whatsapp,
+    # tools/whatsapp_cloud.py): WhatsApp Cloud API von Meta -- der EINZIGE
+    # WhatsApp-Provider von Novara.
+    #  - whatsapp_access_token: Bearer-Token der Graph API (System-User-Token
+    #    mit whatsapp_business_messaging/-management), für Senden + Media.
+    #  - whatsapp_phone_number_id: ID der Absender-Nummer (Meta for Developers
+    #    > WhatsApp > API Setup), NICHT die Telefonnummer selbst.
+    #  - whatsapp_verify_token: frei gewählter String, den man im Meta-Dashboard
+    #    beim Webhook-Setup eingibt (GET-Verifizierung).
+    #  - whatsapp_app_secret: App Secret der Meta-App, prüft X-Hub-Signature-256.
+    #    Ohne Secret lehnt der Webhook in Produktion JEDEN Request ab (fail-closed).
+    whatsapp_access_token: SecretStr = Field(default="", alias="WHATSAPP_ACCESS_TOKEN")
+    whatsapp_phone_number_id: str = Field(default="", alias="WHATSAPP_PHONE_NUMBER_ID")
+    whatsapp_verify_token: SecretStr = Field(default="", alias="WHATSAPP_VERIFY_TOKEN")
+    whatsapp_app_secret: SecretStr = Field(default="", alias="WHATSAPP_APP_SECRET")
+    whatsapp_graph_api_version: str = Field(default="v21.0", alias="WHATSAPP_GRAPH_API_VERSION")
+
+    @property
+    def whatsapp_configured(self) -> bool:
+        """True, wenn Senden über die WhatsApp Cloud API möglich ist."""
+        return bool(self.whatsapp_access_token.get_secret_value() and self.whatsapp_phone_number_id)
 
     # Baustellen-Voice-Assistant (main.py _transcribe_audio()): Groq-API-Key
     # für Speech-to-Text (whisper-large-v3) von WhatsApp-Sprachnachrichten.
     # Ohne Key liefert _transcribe_audio() None (fail-safe, kein Absturz) --
-    # derselbe Umgang mit fehlender Konfiguration wie bei twilio_auth_token.
+    # derselbe Umgang mit fehlender Konfiguration wie bei whatsapp_app_secret.
     groq_api_key: SecretStr = Field(default="", alias="GROQ_API_KEY")
 
     # Persistenter Store (core/db.py) für die vier zuvor In-Memory-Prozess-
@@ -192,12 +196,12 @@ class Settings(BaseSettings):
 
     # Baustellen-Voice-Assistant Demo-Sandbox (tools/demo_sandbox.py,
     # main.py POST /api/v1/webhook/whatsapp): eine WhatsApp-Nachricht gilt
-    # als Demo, wenn der Absender (Twilio-"From", z. B.
-    # "whatsapp:+4366412345678") in dieser kommagetrennten Liste steht ODER
+    # als Demo, wenn der Absender (E.164, z. B. "+4917632320243"; mit oder ohne
+    # Leerzeichen konfigurierbar) in dieser kommagetrennten Liste steht ODER
     # der Nachrichtentext "[DEMO]" enthält. Demo-Nachrichten schreiben NIE
     # ins echte CRM_SHEET_NAME-Tab, sondern in demo_sheet_tab_name (eigenes
     # Sheet-Tab, per Service-Account angelegt, falls es noch nicht
-    # existiert) und bekommen einen sichtbaren "DEMO TEST"-Vermerk im PDF.
+    # existiert) und bekommen einen sichtbaren "Novara Automation - DEMO"-Vermerk im PDF.
     whatsapp_demo_test_numbers: str = Field(default="", alias="WHATSAPP_DEMO_TEST_NUMBERS")
     demo_sheet_tab_name: str = Field(default="Leads_Demo", alias="DEMO_SHEET_TAB_NAME")
 
@@ -205,7 +209,7 @@ class Settings(BaseSettings):
     def whatsapp_demo_test_numbers_set(self) -> set[str]:
         """Normalisierte Menge der Test-Rufnummern aus WHATSAPP_DEMO_TEST_NUMBERS."""
         return {
-            normalize_whatsapp_number(n)
+            normalize_number(n)
             for n in self.whatsapp_demo_test_numbers.split(",")
             if n.strip()
         }

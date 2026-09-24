@@ -36,10 +36,9 @@ google-api-python-client>=2.120.0
 mcp>=1.6.0,<2.0.0
 
 # Baustellen-Voice-Assistant (agents/field_worker_agent.py, utils/pdf_generator.py,
-# main.py POST /api/v1/webhook/whatsapp): Twilio-WhatsApp-Webhook-Verarbeitung,
+# main.py POST /api/v1/webhook/whatsapp): WhatsApp-Cloud-API-Webhook-Verarbeitung (Meta, über httpx),
 # Regiebericht-PDF-Erzeugung, Audio-Format-Handling für Sprachnachrichten.
 # pydub braucht zur Laufzeit zusätzlich das externe ffmpeg-Binary (siehe Dockerfile).
-twilio==9.11.1
 fpdf2==2.8.8
 pydub==0.25.1
 

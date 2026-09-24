@@ -2429,21 +2429,17 @@ def test_field_worker_agent(live: bool) -> None:
 
 # ── Test 25: main.py POST /api/v1/webhook/whatsapp — Twilio-Webhook ────────
 
-def _build_fake_whatsapp_request(form_params: dict, headers: dict | None = None, https: bool = True):
-    """Baut ein echtes Starlette-Request-Objekt mit form-encodiertem Body für
-    main.py whatsapp_webhook()-Tests -- KEIN TestClient (würde main.py's
-    lifespan() inkl. echtem Anthropic-Egress-Check auslösen, siehe TEST 16
-    für dieselbe bereits etablierte Begründung), sondern derselbe
-    Route-Handler-Direktaufruf-Stil wie überall sonst in dieser Datei."""
-    from urllib.parse import urlencode
-
+def _build_meta_webhook_request(payload: dict, signature: str | None = None):
+    """Baut ein echtes Starlette-Request-Objekt mit JSON-Body für main.py
+    whatsapp_webhook()-Tests -- KEIN TestClient (würde main.py's lifespan()
+    inkl. echtem Anthropic-Egress-Check auslösen, siehe TEST 16), sondern
+    derselbe Route-Handler-Direktaufruf-Stil wie überall sonst in dieser Datei."""
     from starlette.requests import Request
 
-    body = urlencode(form_params).encode("utf-8")
-    header_list = [(b"content-type", b"application/x-www-form-urlencoded")]
-    for key, value in (headers or {}).items():
-        header_list.append((key.lower().encode(), value.encode()))
-
+    body = json.dumps(payload).encode("utf-8")
+    header_list = [(b"content-type", b"application/json")]
+    if signature is not None:
+        header_list.append((b"x-hub-signature-256", signature.encode()))
     scope = {
         "type": "http",
         "method": "POST",
@@ -2451,7 +2447,7 @@ def _build_fake_whatsapp_request(form_params: dict, headers: dict | None = None,
         "raw_path": b"/api/v1/webhook/whatsapp",
         "query_string": b"",
         "headers": header_list,
-        "scheme": "https" if https else "http",
+        "scheme": "https",
         "server": ("novara-agents-production.up.railway.app", 443),
         "client": ("127.0.0.1", 12345),
     }
@@ -2459,204 +2455,214 @@ def _build_fake_whatsapp_request(form_params: dict, headers: dict | None = None,
     async def receive():
         return {"type": "http.request", "body": body, "more_body": False}
 
-    return Request(scope, receive)
+    return Request(scope, receive), body
+
+
+def _meta_payload(message: dict, msg_id: str = "wamid.TEST1", phone_id: str = "1234567890") -> dict:
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [{
+            "id": "WABA",
+            "changes": [{
+                "field": "messages",
+                "value": {
+                    "messaging_product": "whatsapp",
+                    "metadata": {"display_phone_number": "43123", "phone_number_id": phone_id},
+                    "messages": [{"id": msg_id, "from": "4917632320243", "timestamp": "1", **message}],
+                },
+            }],
+        }],
+    }
+
+
+class _FakeSecret:
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def get_secret_value(self) -> str:
+        return self._value
 
 
 def test_whatsapp_webhook(live: bool) -> None:
-    section("TEST 25 — main.py POST /api/v1/webhook/whatsapp: Twilio-Signatur + Webhook-Flow")
+    section("TEST 25 — WhatsApp Cloud API (Meta): Signatur, Verifizierung, Parsing, Webhook-Handler")
     info(
-        "_verify_twilio_signature() muss (a) eine korrekte Signatur akzeptieren, "
-        "(b) eine manipulierte/falsche Signatur ablehnen, und (c) ohne "
-        "konfiguriertes TWILIO_AUTH_TOKEN ungeprüft durchlassen (Fail-Safe für "
-        "lokale Entwicklung, siehe core/config.py-Kommentar). whatsapp_webhook() "
-        "selbst darf bei einer ungültigen Signatur einen 401 werfen, muss aber "
-        "bei jedem internen Fehler (kein field-worker-Agent, leere Nachricht) "
-        "IMMER eine TwiML-Antwort liefern statt eine unbehandelte Exception --"
-        " Twilio darf nie einen 5xx sehen."
+        "verify_signature() muss X-Hub-Signature-256 (HMAC-SHA256 über den rohen Body) "
+        "korrekt prüfen, in Produktion OHNE App Secret fail-closed ablehnen; "
+        "verify_challenge() den GET-Handshake; parse_incoming() Text/Audio lesen und "
+        "Status-Events ignorieren; whatsapp_webhook() bei falscher Signatur 401 werfen, "
+        "sonst sofort bestätigen, Duplikate verwerfen und die Verarbeitung als Background-Task einreihen."
     )
-    try:
-        import asyncio
+    import asyncio
+    import hashlib
+    import hmac
 
+    from fastapi import BackgroundTasks, HTTPException
+
+    try:
         import main as main_module
+        from tools import whatsapp_cloud
     except Exception as exc:
         fail("Import für WhatsApp-Webhook-Test", str(exc))
         return
 
-    from twilio.request_validator import RequestValidator
+    cfg = main_module.settings
+    orig = (cfg.whatsapp_app_secret, cfg.whatsapp_verify_token, cfg.environment)
 
-    original_token = main_module.settings.twilio_auth_token
+    def sign(secret: str, body: bytes) -> str:
+        return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
-    class _FakeSecret:
-        def __init__(self, value: str) -> None:
-            self._value = value
-
-        def get_secret_value(self) -> str:
-            return self._value
-
-    # 25a: Signaturprüfung -- valide, ungültige, und "kein Token konfiguriert".
     try:
-        main_module.settings.twilio_auth_token = _FakeSecret("test_secret_token")
-        params = {"From": "whatsapp:+436641234567", "Body": "Test", "NumMedia": "0"}
-        url = "https://novara-agents-production.up.railway.app/api/v1/webhook/whatsapp"
-        valid_sig = RequestValidator("test_secret_token").compute_signature(url, params)
-
-        valid_request = _build_fake_whatsapp_request(params, headers={"X-Twilio-Signature": valid_sig})
-        invalid_request = _build_fake_whatsapp_request(params, headers={"X-Twilio-Signature": "falsch"})
-        missing_sig_request = _build_fake_whatsapp_request(params)
-
+        # 25a: Signaturprüfung
+        cfg.whatsapp_app_secret = _FakeSecret("app_secret_test")
+        body = b'{"a":1}'
         checks = {
-            "valide Signatur akzeptiert": main_module._verify_twilio_signature(valid_request, params) is True,
-            "ungültige Signatur abgelehnt": main_module._verify_twilio_signature(invalid_request, params) is False,
-            "fehlende Signatur abgelehnt": main_module._verify_twilio_signature(missing_sig_request, params) is False,
+            "valide Signatur akzeptiert": whatsapp_cloud.verify_signature(body, sign("app_secret_test", body)) is True,
+            "falsche Signatur abgelehnt": whatsapp_cloud.verify_signature(body, sign("anderes_secret", body)) is False,
+            "manipulierter Body abgelehnt": whatsapp_cloud.verify_signature(b'{"a":2}', sign("app_secret_test", body)) is False,
+            "fehlender Header abgelehnt": whatsapp_cloud.verify_signature(body, "") is False,
+            "Header ohne sha256=-Präfix abgelehnt": whatsapp_cloud.verify_signature(body, "abc") is False,
         }
+        cfg.whatsapp_app_secret = _FakeSecret("")
+        cfg.environment = "production"
+        checks["Produktion ohne App Secret: fail-closed"] = whatsapp_cloud.verify_signature(body, "") is False
+        cfg.environment = "development"
+        checks["Entwicklung ohne App Secret: durchgelassen"] = whatsapp_cloud.verify_signature(body, "") is True
         if all(checks.values()):
-            ok("_verify_twilio_signature() akzeptiert/verwirft Signaturen korrekt", str(checks))
+            ok("verify_signature(): HMAC-SHA256 korrekt, Produktion ohne Secret fail-closed", f"{len(checks)} Checks")
         else:
-            fail("_verify_twilio_signature() unerwartetes Ergebnis", str(checks))
+            fail("verify_signature() unerwartet", str({k: v for k, v in checks.items() if not v}))
 
-        main_module.settings.twilio_auth_token = _FakeSecret("")
-        no_token_request = _build_fake_whatsapp_request(params)
-        if main_module._verify_twilio_signature(no_token_request, params) is True:
-            ok("_verify_twilio_signature() lässt ohne konfiguriertes TWILIO_AUTH_TOKEN ungeprüft durch (Fail-Safe)")
+        # 25b: GET-Handshake
+        cfg.whatsapp_verify_token = _FakeSecret("mein_verify_token")
+        c1 = whatsapp_cloud.verify_challenge("subscribe", "mein_verify_token", "CH123")
+        c2 = whatsapp_cloud.verify_challenge("subscribe", "falsch", "CH123")
+        c3 = whatsapp_cloud.verify_challenge("unsubscribe", "mein_verify_token", "CH123")
+        cfg.whatsapp_verify_token = _FakeSecret("")
+        c4 = whatsapp_cloud.verify_challenge("subscribe", "", "CH123")
+        if c1 == "CH123" and c2 is None and c3 is None and c4 is None:
+            ok("verify_challenge(): richtiger Token -> Challenge, falscher/leerer Token/Modus -> abgelehnt")
         else:
-            fail("_verify_twilio_signature() (kein Token) hätte durchlassen müssen")
-    finally:
-        main_module.settings.twilio_auth_token = original_token
+            fail("verify_challenge() unerwartet", str((c1, c2, c3, c4)))
 
-    # 25b: voller Handler-Aufruf mit ungültiger Signatur (Token konfiguriert) -> HTTPException(401).
-    from fastapi import HTTPException
+        # 25c: Payload-Parsing
+        text_msgs = whatsapp_cloud.parse_incoming(_meta_payload({"type": "text", "text": {"body": "2h Heizung"}}))
+        audio_msgs = whatsapp_cloud.parse_incoming(
+            _meta_payload({"type": "audio", "audio": {"id": "MEDIA1", "mime_type": "audio/ogg; codecs=opus"}})
+        )
+        status_only = {"entry": [{"changes": [{"value": {"statuses": [{"id": "x", "status": "delivered"}]}}]}]}
+        if (
+            len(text_msgs) == 1 and text_msgs[0].text == "2h Heizung" and text_msgs[0].sender == "+4917632320243"
+            and text_msgs[0].phone_number_id == "1234567890"
+            and len(audio_msgs) == 1 and audio_msgs[0].media_id == "MEDIA1" and audio_msgs[0].msg_type == "audio"
+            and whatsapp_cloud.parse_incoming(status_only) == [] and whatsapp_cloud.parse_incoming({}) == []
+        ):
+            ok("parse_incoming(): Text + Sprachnachricht gelesen (Nummer als +E.164), Status-Events ignoriert")
+        else:
+            fail("parse_incoming() unerwartet", str((text_msgs, audio_msgs)))
 
-    try:
-        main_module.settings.twilio_auth_token = _FakeSecret("test_secret_token")
-        params = {"From": "whatsapp:+436641234567", "Body": "Test", "NumMedia": "0"}
-        bad_request = _build_fake_whatsapp_request(params, headers={"X-Twilio-Signature": "falsch"})
+        # 25d: Webhook-Handler
+        cfg.whatsapp_app_secret = _FakeSecret("app_secret_test")
+        payload = _meta_payload({"type": "text", "text": {"body": "2h Heizung"}}, msg_id="wamid.UNIQUE-25D")
+        bad_req, _ = _build_meta_webhook_request(payload, signature="sha256=00")
         try:
-            asyncio.run(main_module.whatsapp_webhook(bad_request))
+            asyncio.run(main_module.whatsapp_webhook(bad_req, BackgroundTasks()))
             fail("whatsapp_webhook() hätte bei ungültiger Signatur 401 werfen müssen")
         except HTTPException as exc:
             if exc.status_code == 401:
-                ok("whatsapp_webhook() lehnt eine ungültige Twilio-Signatur mit 401 ab")
+                ok("whatsapp_webhook() lehnt eine ungültige Signatur mit 401 ab")
             else:
-                fail("whatsapp_webhook() falscher Statuscode für ungültige Signatur", str(exc.status_code))
-    except Exception:
-        fail("whatsapp_webhook() (ungültige Signatur) — unerwartete Exception")
-        traceback.print_exc()
-    finally:
-        main_module.settings.twilio_auth_token = original_token
+                fail("whatsapp_webhook() falscher Statuscode", str(exc.status_code))
 
-    # 25c: leere Nachricht (kein Token konfiguriert, wie im lokalen Dev-Setup) -> TwiML-Prompt, kein Crash.
-    try:
-        main_module.settings.twilio_auth_token = _FakeSecret("")
-        empty_request = _build_fake_whatsapp_request({"From": "whatsapp:+436641234567", "Body": "", "NumMedia": "0"})
-        response = asyncio.run(main_module.whatsapp_webhook(empty_request))
-        body_text = response.body.decode("utf-8")
-        if response.status_code == 200 and "<Response>" in body_text and "Regiebericht" in body_text:
-            ok("whatsapp_webhook() antwortet bei leerer Nachricht mit einer gültigen TwiML-Aufforderung")
+        req, raw = _build_meta_webhook_request(payload, signature=sign("app_secret_test", json.dumps(payload).encode()))
+        tasks = BackgroundTasks()
+        result = asyncio.run(main_module.whatsapp_webhook(req, tasks))
+        req2, _ = _build_meta_webhook_request(payload, signature=sign("app_secret_test", json.dumps(payload).encode()))
+        tasks2 = BackgroundTasks()
+        result2 = asyncio.run(main_module.whatsapp_webhook(req2, tasks2))
+        if result.get("messages") == 1 and len(tasks.tasks) == 1 and result2.get("messages") == 0 and len(tasks2.tasks) == 0:
+            ok("whatsapp_webhook(): valide Nachricht sofort bestätigt + eingereiht, doppelte Zustellung verworfen")
         else:
-            fail("whatsapp_webhook() (leere Nachricht) unerwartetes Ergebnis", body_text[:200])
-    except Exception:
-        fail("whatsapp_webhook() (leere Nachricht) — unerwartete Exception")
-        traceback.print_exc()
-    finally:
-        main_module.settings.twilio_auth_token = original_token
+            fail("whatsapp_webhook() Handler unerwartet", str((result, result2)))
 
-    # 25d: voller Happy-Path mit echtem LLM -- erzeugt ein echtes PDF unter static/reports/.
-    if not live:
-        warn("WhatsApp-Webhook-Live-Test übersprungen", "kein gültiger ANTHROPIC_API_KEY lokal")
-        return
-
-    # _AGENT_REGISTRY wird normalerweise in main.py lifespan() befüllt (App-
-    # Start) -- dieser Test ruft whatsapp_webhook() direkt auf (siehe
-    # _build_fake_whatsapp_request()-Docstring, gleiche TestClient-Vermeidung
-    # wie TEST 16), lifespan() läuft daher nie und _AGENT_REGISTRY bliebe ohne
-    # diesen Schritt leer -- whatsapp_webhook() würde dann fälschlich "Der
-    # Baustellen-Assistent ist gerade nicht verfügbar" antworten, obwohl der
-    # Agent selbst funktioniert.
-    from agents.field_worker_agent import FieldWorkerAgent
-
-    original_registry = main_module._AGENT_REGISTRY
-    try:
-        main_module._AGENT_REGISTRY = {"field-worker": FieldWorkerAgent()}
-        main_module.settings.twilio_auth_token = _FakeSecret("")
-        msg_params = {
-            "From": "whatsapp:+436641234567",
-            "Body": "Hob heit bei da Fam. Berger zwoa Stunden an Heizkörper getauscht.",
-            "NumMedia": "0",
-        }
-        request = _build_fake_whatsapp_request(msg_params)
-        response = asyncio.run(main_module.whatsapp_webhook(request))
-        body_text = response.body.decode("utf-8")
-        info(f"TwiML-Antwort: {body_text[:200]}")
-
-        pdf_created = any(main_module._REPORTS_DIR.glob("*.pdf")) if main_module._REPORTS_DIR.exists() else False
-        if response.status_code == 200 and "Regiebericht erstellt" in body_text and pdf_created:
-            ok("whatsapp_webhook() voller Durchlauf: extrahiert, erstellt PDF, liefert TwiML mit Media-Link (LLM)")
+        status_req, _ = _build_meta_webhook_request(status_only, signature=sign("app_secret_test", json.dumps(status_only).encode()))
+        status_result = asyncio.run(main_module.whatsapp_webhook(status_req, BackgroundTasks()))
+        if status_result.get("messages") == 0:
+            ok("whatsapp_webhook(): Zustellstatus-Event wird bestätigt, nichts verarbeitet")
         else:
-            fail("whatsapp_webhook() (Live-Happy-Path) unerwartetes Ergebnis", body_text[:300])
+            fail("whatsapp_webhook() Status-Event unerwartet", str(status_result))
     except Exception:
-        fail("WhatsApp-Webhook-Live-Test — Exception")
+        fail("WhatsApp-Webhook-Test — unerwartete Exception")
         traceback.print_exc()
     finally:
-        main_module.settings.twilio_auth_token = original_token
-        main_module._AGENT_REGISTRY = original_registry
-        # Test-generierte PDFs nicht liegen lassen -- static/reports/ ist ohnehin
-        # gitignored (Laufzeit-Artefakt), aber lokale Testläufe sollen keine Spuren hinterlassen.
-        import shutil
-        if main_module._REPORTS_DIR.exists():
-            shutil.rmtree(main_module._REPORTS_DIR, ignore_errors=True)
+        cfg.whatsapp_app_secret, cfg.whatsapp_verify_token, cfg.environment = orig
+
+    # 25e: leere Nachricht -> freundliche Aufforderung per send_text, kein Crash
+    from unittest import mock
+
+    sent: list[tuple] = []
+    try:
+        empty = whatsapp_cloud.IncomingMessage("wamid.E", "+4917632320243", "text", text="", phone_number_id="1")
+        with mock.patch.object(whatsapp_cloud, "send_text", side_effect=lambda to, text, pid="": sent.append((to, text)) or True):
+            asyncio.run(main_module._process_whatsapp_message(empty))
+        if len(sent) == 1 and sent[0][0] == "+4917632320243" and "Regiebericht" in sent[0][1]:
+            ok("_process_whatsapp_message(): leere Nachricht -> Aufforderung per WhatsApp, kein Crash")
+        else:
+            fail("_process_whatsapp_message() (leer) unerwartet", str(sent))
+    except Exception:
+        fail("_process_whatsapp_message() (leer) — Exception")
+        traceback.print_exc()
 
 
 def test_demo_sandbox() -> None:
     section("TEST 26 — Demo-Sandbox: [DEMO]-Marker/Testnummer, PDF-Marke, Leads_Demo-Tab, WhatsApp-Rückgabe")
     info(
-        "Alles offline: Sheets-Service ist gemockt (der Test darf NIE ins echte Sheet "
-        "schreiben), der field-worker-Agent ist ein Stub (kein LLM), Twilio-Token leer."
+        "Alles offline: Sheets-Service und WhatsApp-Versand sind gemockt (der Test darf NIE ins echte "
+        "Sheet schreiben oder echte Nachrichten senden), der field-worker-Agent ist ein Stub (kein LLM)."
     )
     import asyncio
     import shutil
+    import tempfile
+    from pathlib import Path
     from types import SimpleNamespace
     from unittest import mock
 
     try:
         import main as main_module
         from core.config import settings
-        from tools import demo_sandbox
+        from tools import demo_sandbox, whatsapp_cloud
         from utils.pdf_generator import generate_regiebericht
     except Exception as exc:
         fail("Import für Demo-Sandbox-Test", str(exc))
         return
 
-    # 26a: Erkennung -- Marker (case-insensitive) ODER Testnummer (mit/ohne "whatsapp:"-Präfix).
+    # 26a: Erkennung -- Marker (case-insensitive) ODER Testnummer (Format-tolerant).
     original_numbers = settings.whatsapp_demo_test_numbers
     try:
-        settings.whatsapp_demo_test_numbers = "+436601112233, whatsapp:+436604445566"
+        settings.whatsapp_demo_test_numbers = "+436601112233, +49 176 3232 0243"
         checks = {
-            "[DEMO] im Text": demo_sandbox.is_demo_message("whatsapp:+43999", "[DEMO] 2h Heizung"),
-            "[demo] klein geschrieben": demo_sandbox.is_demo_message("whatsapp:+43999", "test [demo]"),
-            "Testnummer (Twilio-Präfix, Config ohne Präfix)": demo_sandbox.is_demo_message("whatsapp:+436601112233", "2h"),
-            "Testnummer (Config mit Präfix)": demo_sandbox.is_demo_message("whatsapp:+436604445566", "2h"),
-            "Fremde Nummer ohne Marker = KEIN Demo": not demo_sandbox.is_demo_message("whatsapp:+436607778899", "2h"),
-            "Leere Testnummern-Liste + kein Marker = KEIN Demo": True,
+            "[DEMO] im Text": demo_sandbox.is_demo_message("+43999", "[DEMO] 2h Heizung"),
+            "[demo] klein geschrieben": demo_sandbox.is_demo_message("+43999", "test [demo]"),
+            "Testnummer (Meta-Format ohne +)": demo_sandbox.is_demo_message("436601112233", "2h"),
+            "Testnummer (Config mit Leerzeichen)": demo_sandbox.is_demo_message("+4917632320243", "2h"),
+            "Fremde Nummer ohne Marker = KEIN Demo": not demo_sandbox.is_demo_message("+436607778899", "2h"),
             "strip_demo_marker": demo_sandbox.strip_demo_marker("[DEMO] Hab 2h gearbeitet") == "Hab 2h gearbeitet",
         }
         settings.whatsapp_demo_test_numbers = ""
-        checks["Leere Testnummern-Liste + kein Marker = KEIN Demo"] = not demo_sandbox.is_demo_message("whatsapp:+436601112233", "2h")
+        checks["Leere Liste + kein Marker = KEIN Demo"] = not demo_sandbox.is_demo_message("+436601112233", "2h")
         if all(checks.values()):
-            ok("is_demo_message()/strip_demo_marker(): Marker, Testnummer, Normalisierung, Negativfälle", str(len(checks)) + " Checks")
+            ok("is_demo_message()/strip_demo_marker(): Marker, Testnummer, Normalisierung, Negativfälle", f"{len(checks)} Checks")
         else:
             fail("Demo-Erkennung unerwartet", str({k: v for k, v in checks.items() if not v}))
     finally:
         settings.whatsapp_demo_test_numbers = original_numbers
 
     # 26b: PDF trägt die Marke "Novara Automation - DEMO" nur im Demo-Modus.
-    import tempfile
-
     import pdfplumber
 
     sample = {"techniker": "Max", "kunde": "Familie Berger", "stunden": 2, "material": "Heizkörper", "arbeit": "Heizkörper getauscht", "datum": "23.09.2026"}
     with tempfile.TemporaryDirectory() as tmp:
-        demo_pdf = generate_regiebericht(sample, __import__("pathlib").Path(tmp) / "d.pdf", True)
-        real_pdf = generate_regiebericht(sample, __import__("pathlib").Path(tmp) / "r.pdf", False)
+        demo_pdf = generate_regiebericht(sample, Path(tmp) / "d.pdf", True)
+        real_pdf = generate_regiebericht(sample, Path(tmp) / "r.pdf", False)
         with pdfplumber.open(demo_pdf) as a, pdfplumber.open(real_pdf) as b:
             demo_text = " ".join((pg.extract_text() or "") for pg in a.pages)
             real_text = " ".join((pg.extract_text() or "") for pg in b.pages)
@@ -2681,7 +2687,7 @@ def test_demo_sandbox() -> None:
         with mock.patch.object(type(settings), "crm_service_account_configured", new_callable=mock.PropertyMock, return_value=configured), \
              mock.patch.object(demo_sandbox.production_crm_bridge, "get_sheets_service", return_value=service), \
              mock.patch.object(demo_sandbox.production_crm_bridge, "execute_with_retry", side_effect=fake_exec):
-            result = demo_sandbox.log_demo_lead(sample, "whatsapp:+436601112233")
+            result = demo_sandbox.log_demo_lead(sample, "+4917632320243")
         return result, descs, service
 
     result, descs, service = _run_log(["CRM"])
@@ -2691,12 +2697,13 @@ def test_demo_sandbox() -> None:
         result is True
         and "Demo-Tab anlegen" in descs
         and append_kwargs["range"].startswith("'Leads_Demo'")
-        and row[1] == "whatsapp:+436601112233"
+        and row[1] == "+4917632320243"
         and row[3] == "Familie Berger"
+        and append_kwargs["valueInputOption"] == "RAW"
     ):
-        ok("log_demo_lead(): legt fehlendes Tab \"Leads_Demo\" an und schreibt Nummer + Daten dorthin (nicht ins CRM-Tab)")
+        ok("log_demo_lead(): legt Tab \"Leads_Demo\" an, schreibt +Nummer als Text (RAW, keine Formel-Interpretation) dorthin, nicht ins CRM-Tab")
     else:
-        fail("log_demo_lead() (Tab fehlt) unerwartet", f"result={result} descs={descs} range={append_kwargs.get('range')}")
+        fail("log_demo_lead() (Tab fehlt) unerwartet", f"result={result} descs={descs} kwargs={append_kwargs}")
 
     result, descs, _ = _run_log(["CRM", "Leads_Demo"])
     if result is True and "Demo-Tab anlegen" not in descs:
@@ -2709,49 +2716,73 @@ def test_demo_sandbox() -> None:
     else:
         fail("log_demo_lead() Fail-Safe verletzt")
 
-    # 26d: voller Webhook-Durchlauf (Stub-Agent, kein LLM) -- Demo vs. normale Nachricht.
-    class _FakeSecret:
-        def get_secret_value(self) -> str:
-            return ""
-
+    # 26d: voller Durchlauf _process_whatsapp_message (Stub-Agent, kein LLM, gemockter Versand).
     class _StubAgent:
         def process(self, request):
             return SimpleNamespace(success=True, result=dict(sample), error=None)
 
-    original_token = main_module.settings.twilio_auth_token
     original_registry = main_module._AGENT_REGISTRY
     original_log_fn = main_module.log_demo_lead
-    calls: list[tuple] = []
-    try:
-        main_module.settings.twilio_auth_token = _FakeSecret()
-        main_module._AGENT_REGISTRY = {"field-worker": _StubAgent()}
-        main_module.log_demo_lead = lambda data, sender: calls.append((data, sender)) or True
+    original_numbers = settings.whatsapp_demo_test_numbers
+    log_calls: list[tuple] = []
+    docs: list[dict] = []
+    texts: list[tuple] = []
 
-        demo_req = _build_fake_whatsapp_request({"From": "whatsapp:+436607778899", "Body": "[DEMO] 2h Heizkörper getauscht bei Berger", "NumMedia": "0"})
-        demo_body = asyncio.run(main_module.whatsapp_webhook(demo_req)).body.decode("utf-8")
-        real_req = _build_fake_whatsapp_request({"From": "whatsapp:+436607778899", "Body": "2h Heizkörper getauscht bei Berger", "NumMedia": "0"})
-        real_body = asyncio.run(main_module.whatsapp_webhook(real_req)).body.decode("utf-8")
+    def fake_upload(data, filename, mime="application/pdf", pid=""):
+        docs.append({"filename": filename, "bytes": len(data)})
+        return "MEDIA-ID-1"
+
+    def fake_send_doc(to, media_id, filename, caption="", pid=""):
+        docs[-1].update(to=to, media_id=media_id, caption=caption)
+        return True
+
+    try:
+        settings.whatsapp_demo_test_numbers = "+4917632320243"
+        main_module._AGENT_REGISTRY = {"field-worker": _StubAgent()}
+        main_module.log_demo_lead = lambda data, sender: log_calls.append((data, sender)) or True
+
+        with mock.patch.object(whatsapp_cloud, "upload_media", side_effect=fake_upload), \
+             mock.patch.object(whatsapp_cloud, "send_document", side_effect=fake_send_doc), \
+             mock.patch.object(whatsapp_cloud, "send_text", side_effect=lambda to, text, pid="": texts.append((to, text)) or True):
+            # (1) [DEMO]-Tag von fremder Nummer
+            tagged = whatsapp_cloud.IncomingMessage("wamid.A", "+436607778899", "text", text="[DEMO] 2h Heizkörper getauscht bei Berger")
+            asyncio.run(main_module._process_whatsapp_message(tagged))
+            # (2) normale Nachricht von fremder Nummer
+            plain = whatsapp_cloud.IncomingMessage("wamid.B", "+436607778899", "text", text="2h Heizkörper getauscht bei Berger")
+            asyncio.run(main_module._process_whatsapp_message(plain))
+            # (3) Sprachnachricht von der Testnummer (kein Tag möglich)
+            voice = whatsapp_cloud.IncomingMessage("wamid.C", "+4917632320243", "audio", media_id="M1", mime_type="audio/ogg")
+            with mock.patch.object(main_module, "_download_and_normalize_audio", return_value=b"wav"), \
+                 mock.patch.object(main_module, "_transcribe_audio", return_value="Heute zwei Stunden bei Berger"):
+                asyncio.run(main_module._process_whatsapp_message(voice))
 
         if (
-            "DEMO-MODUS" in demo_body
-            and "<Media>" in demo_body
-            and "DEMO_" in demo_body
-            and len(calls) == 1
-            and calls[0][1] == "whatsapp:+436607778899"
+            len(docs) == 3
+            and docs[0]["filename"].startswith("DEMO_") and "DEMO-MODUS" in docs[0]["caption"] and docs[0]["to"] == "+436607778899"
+            and not docs[1]["filename"].startswith("DEMO_") and "DEMO" not in docs[1]["caption"]
+            and docs[2]["filename"].startswith("DEMO_") and docs[2]["to"] == "+4917632320243"
+            and [c[1] for c in log_calls] == ["+436607778899", "+4917632320243"]
+            and not texts
         ):
-            ok("Webhook mit [DEMO]: PDF (DEMO_-Dateiname) per WhatsApp-Media zurück, Nummer in Leads_Demo geloggt")
+            ok("Durchlauf: [DEMO]-Tag und Testnummer (auch Sprachnachricht) -> DEMO_-PDF per WhatsApp + Leads_Demo-Log; normale Nachricht -> normaler Bericht ohne Log")
         else:
-            fail("Webhook [DEMO]-Pfad unerwartet", f"calls={len(calls)} body={demo_body[:250]}")
+            fail("Demo-Durchlauf unerwartet", f"docs={docs} log_calls={[c[1] for c in log_calls]} texts={texts}")
 
-        if "DEMO" not in real_body and len(calls) == 1 and "<Media>" in real_body:
-            ok("Webhook ohne [DEMO]: normaler Bericht, KEIN Demo-Log, kein Demo-Vermerk")
+        # (4) PDF-Upload schlägt fehl -> Text-Fallback statt Stille
+        texts.clear()
+        with mock.patch.object(whatsapp_cloud, "upload_media", return_value=None), \
+             mock.patch.object(whatsapp_cloud, "send_text", side_effect=lambda to, text, pid="": texts.append((to, text)) or True):
+            asyncio.run(main_module._process_whatsapp_message(
+                whatsapp_cloud.IncomingMessage("wamid.D", "+436607778899", "text", text="2h bei Berger")))
+        if len(texts) == 1 and "PDF konnte gerade nicht zugestellt" in texts[0][1]:
+            ok("Upload-Fehler bei Meta -> Techniker bekommt Text-Fallback statt Stille")
         else:
-            fail("Webhook Normalpfad unerwartet", f"calls={len(calls)} body={real_body[:250]}")
+            fail("Upload-Fehler-Fallback unerwartet", str(texts))
     except Exception:
-        fail("Demo-Sandbox-Webhook-Test — Exception")
+        fail("Demo-Sandbox-Durchlauf — Exception")
         traceback.print_exc()
     finally:
-        main_module.settings.twilio_auth_token = original_token
+        settings.whatsapp_demo_test_numbers = original_numbers
         main_module._AGENT_REGISTRY = original_registry
         main_module.log_demo_lead = original_log_fn
         if main_module._REPORTS_DIR.exists():

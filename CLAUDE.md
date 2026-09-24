@@ -761,106 +761,17 @@ Techniker+Kunde+Zeitstempel für Aufrufer mit mehreren/parallelen Berichten
 (main.py nutzt IMMER diese Variante, nie den kollisionsanfälligen
 Default-Namen direkt).
 
-**`main.py POST /api/v1/webhook/whatsapp`** (Twilio-Webhook-Format:
-`application/x-www-form-urlencoded`, NICHT JSON wie jeder andere Endpoint).
-ÖFFENTLICH, KEIN `X-API-Key` — gleiches Muster wie der Vapi-Webhook und
-`landing_chat()` (Twilio kann wie Vapi keinen benutzerdefinierten Header
-mitschicken). Die Sicherheitsgrenze ist hier NICHT der API-Key, sondern
-Twilios eigene Request-Signatur (`X-Twilio-Signature`, HMAC-SHA1 über die
-vollständige aufgerufene URL + alle POST-Parameter,
-`_verify_twilio_signature()`) — eine ECHTE kryptografische Prüfung pro
-Request. Ohne konfiguriertes `TWILIO_AUTH_TOKEN` wird NICHT geprüft
-(Warn-Log, Fail-Safe für lokale Entwicklung ohne Twilio-Zugang, analog zu
-`ANTHROPIC_API_KEY`/Demo-Modus) — **in Produktion MUSS `TWILIO_AUTH_TOKEN`
-gesetzt sein**, sonst verarbeitet der Endpoint unauthentifizierte Requests
-(echte LLM-Calls + PDF-Erzeugung, Ressourcen-/Spam-Risiko). Per Smoke-Test
-verifiziert: korrekte Signatur akzeptiert (200), manipulierte UND fehlende
-Signatur abgelehnt (401), jeweils mit einer über `python3 -c` mit
-`twilio.request_validator.RequestValidator.compute_signature()`
-tatsächlich berechneten Signatur — keine bloße Annahme.
+**WhatsApp-Provider: ausschließlich Meta WhatsApp Cloud API (seit 24.09.2026; kein Twilio).** Die frühere Twilio-Anbindung (TwiML, `X-Twilio-Signature`, `twilio`-Paket, `TWILIO_*`-Variablen, `whatsapp:+…`-Nummernformat) wurde vollständig entfernt. Alles Provider-Spezifische steckt in `tools/whatsapp_cloud.py`; `main.py` enthält nur den Webhook-Handler.
 
-URL-Rekonstruktion für die Signaturprüfung nutzt `X-Forwarded-Proto`/
-`X-Forwarded-Host` statt `request.url` direkt: Railway terminiert TLS an
-einem vorgeschalteten Proxy, `request.url.scheme` könnte sonst fälschlich
-"http" statt der von Twilio tatsächlich aufgerufenen "https"-URL melden —
-ohne die Forwarded-Header würde JEDE Signatur fälschlich als ungültig gelten.
+- **`GET /api/v1/webhook/whatsapp`** -- Meta-Handshake beim Einrichten des Webhooks: bei `hub.mode=subscribe` und passendem `WHATSAPP_VERIFY_TOKEN` wird `hub.challenge` im Klartext zurückgegeben, sonst 403.
+- **`POST /api/v1/webhook/whatsapp`** -- JSON, ÖFFENTLICH (kein `X-API-Key`; Meta kann keinen Header setzen). Sicherheitsgrenze: `X-Hub-Signature-256` = HMAC-SHA256 über den ROHEN Body mit `WHATSAPP_APP_SECRET`, `hmac.compare_digest`. Falsche/fehlende Signatur → 401. Ohne App Secret lehnt Produktion JEDEN Request ab (fail-closed), lokal wird mit Warn-Log durchgelassen. Der Handler bestätigt sofort mit 200 und reiht `_process_whatsapp_message()` als Background-Task ein (Meta stellt sonst nach wenigen Sekunden erneut zu -> doppelte Berichte); `message_id`-Deduplizierung über einen begrenzten In-Memory-Speicher; Zustellstatus-Events (ohne `messages`) werden nur bestätigt.
+- **Antworten** gibt es bei Meta nicht im HTTP-Response, sondern als eigene Graph-API-Calls: Text über `/{phone_number_id}/messages`; das Regiebericht-PDF wird zuerst als Media hochgeladen (`/{phone_number_id}/media`) und dann per Media-ID als WhatsApp-Dokument gesendet (Text = Bildunterschrift) -- unabhängig von Railways ephemerem Dateisystem, die lokale Kopie wird danach gelöscht. Schlägt der Upload fehl, bekommt der Techniker eine Text-Antwort statt Stille. Die `send_*`-Funktionen werfen nie.
+- **Sprachnachrichten:** `download_media()` (Media-ID → URL → Bytes, beides mit Bearer-Token), pydub normalisiert auf WAV, Groq (`whisper-large-v3`, 1 Retry) transkribiert; ohne Groq-Key/bei Fehler ehrliche Text-Fallback-Aufforderung statt erfundener Zusammenfassung.
+- **Nummernformat:** Meta liefert `from` als reine Ziffern; intern überall E.164 mit `+` (`core.config.normalize_number()`).
+- **Env-Variablen (Railway):** `WHATSAPP_ACCESS_TOKEN` (System-User-Token), `WHATSAPP_PHONE_NUMBER_ID` (ID der Absender-Nummer, nicht die Telefonnummer), `WHATSAPP_VERIFY_TOKEN` (frei gewählt, identisch im Meta-Webhook-Setup), `WHATSAPP_APP_SECRET`, optional `WHATSAPP_GRAPH_API_VERSION` (Default `v21.0`). Webhook-URL im Meta-Dashboard: `https://novara-agents-production.up.railway.app/api/v1/webhook/whatsapp`, Feld `messages` abonnieren.
+- **Diagnose in Railway-Logs:** `[STEP 1]` Nachricht empfangen, `[STEP 2]` Transkription, `[STEP 3]` Agent fertig, `[STEP 4]`/`[STEP 4b]` PDF erzeugt / Demo-Sheet-Log, `[STEP 5]` Antwort gesendet (`sent=true/false`).
 
-Generierte PDFs landen unter `static/reports/<eindeutiger-Name>.pdf` (bereits
-über `app.mount("/static", ...)` ausgeliefert, siehe Abschnitt "Landing-Page-
-Chat-Widget" weiter unten) — verzeichnisiert und gitignored, siehe "Bekannte
-Einschränkungen" unten zur Konsequenz aus Railways ephemerem Dateisystem.
-Antwort ist immer TwiML (`twilio.twiml.messaging_response.MessagingResponse`,
-kein manuelles XML-String-Building — escaped den Nachrichtentext korrekt,
-relevant weil der Techniker-Text ungefiltert im Bestätigungstext landen
-kann), NIEMALS ein 5xx an Twilio (jeder interne Fehlerpfad — kein
-field-worker-Agent verfügbar, PDF-Erzeugung schlägt fehl — liefert
-stattdessen eine erklärende TwiML-Nachricht mit HTTP 200).
-
-> **Behoben (20.09.2026): Sprach-zu-Text für WhatsApp-Sprachnachrichten ist
-> jetzt angebunden.** `_download_and_normalize_audio()` lädt eine
-> WhatsApp-Sprachnachricht vollständig echt herunter (Twilio-Media-URL,
-> HTTP-Basic-Auth mit Account-SID+Auth-Token) und normalisiert sie via
-> pydub auf WAV; `_transcribe_audio()` schickt dieses WAV jetzt an die
-> **Groq API** (`whisper-large-v3`, `groq`-SDK, `GROQ_API_KEY` in
-> `core/config.py`/`.env.example`). Claude (Anthropic Messages API)
-> transkribiert weiterhin kein Audio selbst — anders als beim Vapi-Pfad
-> (`agents/voice_agent.py`, wo Vapi selbst/extern transkribiert und
-> novara-agents nur bereits transkribierten Text sieht) brauchte WhatsApp
-> also eine eigene, dedizierte STT-Anbindung. Ohne `GROQ_API_KEY` (oder bei
-> jedem Groq-API-Fehler — Netzwerk, Rate-Limit, leere Antwort)
-> liefert `_transcribe_audio()` weiterhin bewusst `None` statt zu raten/zu
-> halluzinieren (Fail-Safe, gleiche Philosophie wie `TWILIO_AUTH_TOKEN`);
-> der Techniker bekommt dann eine ehrliche Fallback-Aufforderung
-> ("automatische Transkription ist gerade fehlgeschlagen, bitte zusätzlich
-> als Text schicken") statt einer erfundenen/leeren Zusammenfassung.
-> Nebenbei behoben: der alte Platzhalter-Code rief ein nirgends definiertes
-> `logger.debug(...)` auf (kein Modul-Logger namens `logger` existiert in
-> `main.py`, nur `log = structlog.get_logger(...)`) — hätte bei jedem
-> Aufruf einen `NameError` geworfen, der aber vom umgebenden
-> `except Exception` in `whatsapp_webhook()` stillschweigend verschluckt
-> wurde. `_transcribe_audio()` nutzt jetzt konsistent `log.warning(...)`.
-
-> **Härtung (20.09.2026): Signaturprüfung robuster gegen Railway-Proxy-
-> Eigenheiten, globales Sicherheitsnetz + Schritt-Logging für die Diagnose in
-> Produktion.** Drei unabhängige Verbesserungen am bereits bestehenden
-> Webhook-Pfad, kein neues Feature:
->
-> 1. `_verify_twilio_signature()` behandelt `X-Forwarded-Proto`/
->    `X-Forwarded-Host` jetzt robust gegen zwei konkrete Proxy-Eigenheiten,
->    statt die Prüfung deswegen abzuschwächen: mehrfach verkettete Proxies
->    können diese Header kommagetrennt senden (nur der erste, client-nächste
->    Wert zählt, über `_first_forwarded_value()`), und falls der erkannte
->    `proto` nicht zur tatsächlich von Twilio aufgerufenen URL passt, wird
->    zusätzlich die jeweils andere https/http-Variante probiert, BEVOR die
->    Signatur als ungültig gilt. **Bewusst NICHT umgesetzt: ein bei einer
->    Anfrage kurzzeitig diskutierter "bei Signaturfehler nur warnen statt
->    401" -- das würde die einzige Authentifizierung dieses öffentlichen,
->    kostenpflichtige API-Calls (Anthropic + Groq) auslösenden Endpoints
->    abschalten (siehe Modul-Docstring, "ÖFFENTLICH, KEIN X-API-Key") und
->    jeden unauthentifizierten Request unbegrenzt durchlassen. Mit
->    konfiguriertem `TWILIO_AUTH_TOKEN` bleibt eine tatsächlich falsche
->    Signatur daher weiterhin ein harter 401, wie von TEST 25 verifiziert --
->    nur die URL-*Rekonstruktion* wurde toleranter gegenüber Proxy-Varianz,
->    nicht die kryptografische Prüfung selbst.**
-> 2. Neuer äußerer `try/except` in `whatsapp_webhook()`, der den gesamten
->    Verarbeitungspfad NACH der Signaturprüfung umschließt (die bestehenden,
->    spezifischer formulierten `try/except`-Blöcke für Audio/Agent/PDF
->    bleiben unverändert und greifen zuerst). Schließt eine reale Lücke: der
->    `field_worker.process(...)`-Aufruf selbst war bisher NICHT abgesichert
->    -- ein unerwarteter Bug dort hätte unbehandelt bis zu FastAPI
->    durchgeschlagen und Twilio einen 5xx gezeigt, entgegen der im
->    Modul-Docstring dokumentierten Garantie. Per Test verifiziert (simulierter
->    `RuntimeError` tief im Agenten → weiterhin `200` mit valider TwiML-
->    Fehlermeldung statt Crash).
-> 3. Fünf `[STEP N]`-Log-Marker (`log.info`, structlog) entlang des
->    Happy-Path-Ablaufs (`[STEP 1]` Request akzeptiert, `[STEP 2]` Groq-
->    Transkription erfolgreich, `[STEP 3]` FieldWorkerAgent fertig, `[STEP 4]`
->    PDF erzeugt, `[STEP 5]` TwiML-Antwort verschickt -- über den neuen
->    `_twiml_reply()`-Wrapper an JEDEM Rückgabepunkt, nicht nur beim
->    Erfolgsfall) -- rein für die Diagnose in Railways Log-Stream, grep-bar
->    nach `[STEP `, keine funktionale Änderung.
-
-**Demo-Sandbox (22./23.09.2026, `tools/demo_sandbox.py`).** Eine WhatsApp-Nachricht gilt als Demo, wenn sie `[DEMO]` enthält (case-insensitive, wird vor dem Agenten entfernt) ODER der Absender in `WHATSAPP_DEMO_TEST_NUMBERS` steht (kommagetrennt; Vergleich über `core.config.normalize_whatsapp_number()`, also mit oder ohne `whatsapp:`-Präfix). Ablauf identisch zum Normalpfad (Groq-Transkription, FieldWorkerAgent, TwiML mit PDF als Media), aber: (1) das PDF trägt in Kopf-, Fußzeile und diagonal die Marke "Novara Automation - DEMO" und der Dateiname beginnt mit `DEMO_`, (2) `log_demo_lead()` hängt Timestamp, Absendernummer, Techniker, Kunde, Stunden, Material, Tätigkeit, Datum an das Tab `Leads_Demo` (`DEMO_SHEET_TAB_NAME`) desselben Spreadsheets an -- legt das Tab samt Kopfzeile selbst an, schreibt nie ins echte CRM-Tab, wirft nie (Fehler → nur `False` + Log), (3) die Bestätigung beginnt mit "[DEMO-MODUS -- keine echten Daten]". Braucht `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON` für den Sheet-Log (ohne: PDF-Antwort funktioniert trotzdem). Für reine Sprachnachrichten (kein Text, kein Tag) muss die Absendernummer in `WHATSAPP_DEMO_TEST_NUMBERS` stehen. Regressionstest: `test_system.py` TEST 26 (komplett gemockt, schreibt nie ins echte Sheet).
+**Demo-Sandbox (`tools/demo_sandbox.py`).** Eine WhatsApp-Nachricht gilt als Demo, wenn sie `[DEMO]` enthält (case-insensitive, wird vor dem Agenten entfernt) ODER der Absender in `WHATSAPP_DEMO_TEST_NUMBERS` steht (kommagetrennt, E.164, z. B. `+4917632320243`; Vergleich formatunabhängig über `normalize_number()`). Ablauf identisch zum Normalpfad, aber: (1) das PDF trägt in Kopf-, Fußzeile und diagonal die Marke "Novara Automation - DEMO", Dateiname beginnt mit `DEMO_`; (2) `log_demo_lead()` hängt Timestamp, Absendernummer, Techniker, Kunde, Stunden, Material, Tätigkeit, Datum an das Tab `Leads_Demo` (`DEMO_SHEET_TAB_NAME`) desselben Spreadsheets an (legt das Tab samt Kopfzeile selbst an, schreibt nie ins CRM-Tab, wirft nie; `valueInputOption=RAW`, damit eine Nummer mit führendem `+` nicht als Formel interpretiert wird); (3) die Bestätigung beginnt mit "[DEMO-MODUS -- keine echten Daten]". Sheet-Log braucht `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON` (ohne: PDF-Antwort funktioniert trotzdem). Reine Sprachnachrichten (kein Tag möglich) zählen nur von einer Nummer aus `WHATSAPP_DEMO_TEST_NUMBERS` als Demo. Regressionstests: `test_system.py` TEST 25 (Meta: Signatur, Handshake, Parsing, Handler) und TEST 26 (Demo-Sandbox) -- komplett gemockt, kein echter Versand, schreibt nie ins echte Sheet.
 
 **Dockerfile aktualisiert:** `COPY utils/ utils/` ergänzt (das Verzeichnis
 fehlte in der expliziten COPY-Liste — ohne diesen Fix hätte main.py in der
@@ -875,11 +786,7 @@ textextrahierbares PDF ohne Crash, leere Daten → Platzhalter statt Absturz,
 Default-Dateiname wörtlich `"Regiebericht.pdf"`, `suggested_filename()`
 dateisystemsicher trotz Umlauten), TEST 24 (`FieldWorkerAgent`:
 valide/fehlgeschlagene/nicht-JSON-LLM-Antworten, Live-Test mit echtem
-Dialekt-Satz), TEST 25 (`_verify_twilio_signature()` akzeptiert/verwirft
-korrekt inkl. tatsächlich berechneter Signaturen, `whatsapp_webhook()` gibt
-bei ungültiger Signatur 401 zurück und bei jedem sonstigen Fehlerpfad
-IMMER TwiML statt 5xx, Live-Happy-Path erzeugt ein echtes PDF unter
-`static/reports/`).
+Dialekt-Satz), TEST 25 (Meta-Webhook: Signatur, Handshake, Payload-Parsing, Handler inkl. Deduplizierung -- siehe Abschnitt WhatsApp-Provider unten).
 
 ---
 
@@ -1577,7 +1484,7 @@ POST /api/v1/agents/onboarding/process
 Ein sechster, eigenständiger Agent — NICHT Teil der 5 Factory-Agenten oben und
 NICHT über `BaseAgent` implementiert. Nimmt echte Telefongespräche entgegen.
 
-**Plattform:** [Vapi](https://vapi.ai) als Custom-LLM-Backend, nicht Twilio.
+**Plattform:** [Vapi](https://vapi.ai) als Custom-LLM-Backend.
 `VoiceAgent.stream()`/`.complete()` liefern OpenAI-kompatible
 Chat-Completion-Chunks (SSE) bzw. ein einzelnes JSON-Objekt — exakt das
 Format, das Vapis Custom-LLM-Integration pro Gesprächsturn erwartet. System-
@@ -1789,4 +1696,4 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | Lead-Benachrichtigung (`tools/lead_notifier.py`) = einfaches SMTP-Anwendungspasswort, kein Retry/Queue bei SMTP-Ausfall | Bei Bedarf Retry-Queue oder Wechsel auf einen transaktionalen E-Mail-Dienst (SendGrid/Postmark/SES) |
 | `InboundChatGraph.document_node()` (Anhang-Extraktion) ist über die API voll funktionsfähig, aber `static/chat_widget.js` hat noch keine Upload-UI dafür | Frontend-Arbeit: Datei-Auswahl + Base64-Kodierung im Widget ergänzen, `attachment`-Feld an `/api/v1/chat/landing` mitschicken |
 | Baustellen-Voice-Assistant (`main.py` `/api/v1/webhook/whatsapp`): Speech-to-Text läuft über Groq (`whisper-large-v3`), 1 Retry bei transientem Groq-Fehler (seit 23.09.2026); erst nach dem zweiten Fehlschlag gibt `_transcribe_audio()` `None` zurück und der Techniker muss auf Text ausweichen | Bei Bedarf einen einfachen Retry (1-2 Versuche) in `_transcribe_audio()` ergänzen, analog zum `resilient_node()`-Decorator des GuardianAgent |
-| Regiebericht-PDFs (`static/reports/`) liegen auf Railways ephemerem Dateisystem — verschwinden bei jedem Redeploy/Neustart, keine Historie/Liste vergangener Berichte | Persistenter Objektspeicher (z. B. S3-kompatibel) statt lokalem Dateisystem, falls eine Berichtshistorie gebraucht wird |
+| Regiebericht-PDFs werden nach dem Versand nicht gespeichert (Upload zu Meta, lokale Kopie wird gelöscht) -- keine Berichtshistorie | Bei Bedarf Berichte zusätzlich in persistentem Objektspeicher/DB ablegen |

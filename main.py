@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,16 +19,14 @@ from typing import Optional
 
 import httpx
 import structlog
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Security, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Security, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from groq import Groq
 from pydantic import BaseModel, Field
-from twilio.request_validator import RequestValidator
-from twilio.twiml.messaging_response import MessagingResponse
 
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -44,7 +43,7 @@ from agents.voice_agent import VoiceAgent
 from core import consent, lead_capture
 from core.config import settings
 from core.security import OutputBlockedError, SecurityLayer
-from tools import lead_notifier, sequence_scheduler
+from tools import lead_notifier, sequence_scheduler, whatsapp_cloud
 from tools.calendar_integration import GoogleCalendarTool
 from tools.demo_sandbox import is_demo_message, log_demo_lead, strip_demo_marker
 from tools.document_parser import DocumentParser
@@ -181,8 +180,8 @@ app.add_middleware(
 # Besucher-IP (get_remote_address liest request.client.host, das dank
 # --proxy-headers im Dockerfile-CMD die echte, von Railway weitergereichte
 # IP trägt, nicht die interne Proxy-IP). Die anderen öffentlichen Endpunkte
-# (Vapi-/Twilio-Webhooks) haben bereits eine eigene kryptografische
-# Absicherung (Twilio-Signatur) bzw. sind an eine registrierte Vapi-
+# (Vapi-/WhatsApp-Webhooks) haben bereits eine eigene kryptografische
+# Absicherung (X-Hub-Signature-256) bzw. sind an eine registrierte Vapi-
 # Server-URL gebunden -- kein zusätzliches IP-Rate-Limiting dort in dieser
 # Runde.
 limiter = Limiter(key_func=get_remote_address)
@@ -1001,152 +1000,58 @@ async def voice_webhook(request: Request):
         return {"received": False, "error": "internal server error"}
 
 
-# ── Baustellen-Voice-Assistant: WhatsApp-Webhook (Twilio) ─────────────────────
+# ── Baustellen-Voice-Assistant: WhatsApp-Webhook (Meta WhatsApp Cloud API) ────
 # ÖFFENTLICH, KEIN X-API-Key -- gleiches Muster wie der Vapi-Webhook oben und
-# main.py landing_chat() (main.py docstrings dort): Twilio kann wie Vapi keinen
-# benutzerdefinierten Header mitschicken. Die Sicherheitsgrenze ist hier NICHT
-# der API-Key, sondern Twilios eigene Request-Signatur (X-Twilio-Signature,
-# HMAC-SHA1 über die vollständige aufgerufene URL + alle POST-Parameter,
-# geprüft in _verify_twilio_signature()) -- eine ECHTE kryptografische Prüfung
-# pro Request, kein Shared Secret im Header. Reports landen unter
-# static/reports/ (bereits über app.mount("/static", ...) oben ausgeliefert)
-# -- auf Railways ephemerem Dateisystem nur bis zum nächsten Deploy/Neustart
-# verfügbar, was für den Zweck (Twilio lädt die PDF kurz nach der
-# Webhook-Antwort herunter) ausreicht; siehe CLAUDE.md, "Bekannte
-# Einschränkungen" für die vollständige Begründung.
+# landing_chat(): Meta kann keinen benutzerdefinierten Header mitschicken. Die
+# Sicherheitsgrenze ist die Request-Signatur (X-Hub-Signature-256, HMAC-SHA256
+# über den rohen Body mit dem App Secret, tools/whatsapp_cloud.verify_signature)
+# -- eine ECHTE kryptografische Prüfung pro Request.
+#
+# Anders als bei einem synchronen Webhook-Response gibt es bei Meta KEINE
+# Antwort im HTTP-Response: der Handler bestätigt sofort mit 200 (Meta
+# wiederholt sonst nach wenigen Sekunden -> doppelte Berichte) und verarbeitet
+# die Nachricht als Background-Task; jede Antwort an den Techniker ist ein
+# eigener Graph-API-Call. Das PDF wird als Media zu Meta hochgeladen und per
+# Media-ID gesendet -- unabhängig von Railways ephemerem Dateisystem.
 
 _REPORTS_DIR = Path(__file__).parent / "static" / "reports"
 
-
-def _first_forwarded_value(header_value: str, fallback: str) -> str:
-    """Erster (client-nächste) Wert eines ggf. kommagetrennten Forwarded-Headers
-    (mehrere verkettete Proxies) -- Fallback, wenn der Header fehlt oder leer ist.
-    Gemeinsam genutzt von _verify_twilio_signature() und dem PDF-Link-Aufbau in
-    whatsapp_webhook(), damit beide dieselbe Railway-Proxy-Interpretation teilen."""
-    if not header_value:
-        return fallback
-    first = header_value.split(",")[0].strip()
-    return first or fallback
+# Meta liefert Webhooks "at least once": dieselbe message_id kann erneut
+# ankommen. Kleiner, begrenzter Speicher der zuletzt verarbeiteten IDs.
+_SEEN_WHATSAPP_IDS: "OrderedDict[str, None]" = OrderedDict()
+_SEEN_WHATSAPP_IDS_MAX = 2000
 
 
-def _verify_twilio_signature(request: Request, form_params: dict) -> bool:
-    """
-    Ohne TWILIO_AUTH_TOKEN (core/config.py) wird NICHT geprüft (Warn-Log) --
-    dieselbe Fail-Safe-für-lokale-Entwicklung-Philosophie wie
-    ANTHROPIC_API_KEY/Demo-Modus (core/llm.py): kein Twilio-Zugang lokal soll
-    den Endpoint nicht komplett unbenutzbar machen. In Produktion MUSS
-    TWILIO_AUTH_TOKEN gesetzt sein, sonst nimmt der Endpoint unauthentifizierte
-    Requests an, die echte LLM-Calls (Anthropic + Groq) und PDF-Erzeugung
-    auslösen -- MIT gesetztem Token bleibt eine fehlgeschlagene Prüfung ein
-    harter Ablehnungsgrund (401), NIE nur ein Warn-Log: das ist die einzige
-    Authentifizierung dieses öffentlichen Endpoints (kein X-API-Key möglich,
-    siehe Modul-Docstring oben), ein reines "Warnen statt Ablehnen" würde
-    Ressourcen-/Spam-Missbrauch durch beliebige unauthentifizierte Requests
-    öffnen.
-
-    URL wird bewusst NICHT aus request.url allein gebaut: Railway terminiert
-    TLS an einem vorgeschalteten Proxy, request.url.scheme/netloc können
-    dadurch "http"/die interne Adresse statt der von Twilio tatsächlich
-    aufgerufenen "https://...novaraautomation..."-URL melden -- ohne die
-    X-Forwarded-*-Header (von Railways Proxy gesetzt) würde JEDE Signatur
-    fälschlich als ungültig gelten. Zusätzlich robust gegen zwei konkrete
-    Proxy-Eigenheiten, statt die Prüfung deswegen ganz abzuschalten:
-    (a) mehrere verkettete Proxies können X-Forwarded-Proto/-Host als
-    kommagetrennte Liste senden -- nur der erste (client-nächste) Wert zählt;
-    (b) reicht der erkannte proto/netloc nicht, wird zusätzlich die jeweils
-    andere https/http-Variante probiert, BEVOR die Signatur als ungültig
-    gilt. Beides bleibt eine ECHTE kryptografische Prüfung: eine falsche
-    Signatur wird für KEINEN der Kandidaten akzeptiert, ohne den echten
-    TWILIO_AUTH_TOKEN zu kennen.
-    """
-    auth_token = settings.twilio_auth_token.get_secret_value()
-    if not auth_token:
-        log.warning("WhatsApp-Webhook: TWILIO_AUTH_TOKEN nicht gesetzt -- Signaturprüfung übersprungen")
-        return True
-
-    signature = request.headers.get("X-Twilio-Signature", "")
-    if not signature:
-        log.warning("WhatsApp-Webhook: X-Twilio-Signature-Header fehlt")
+def _already_processed(message_id: str) -> bool:
+    if not message_id:
         return False
-
-    detected_proto = _first_forwarded_value(request.headers.get("X-Forwarded-Proto", ""), request.url.scheme)
-    netloc = _first_forwarded_value(request.headers.get("X-Forwarded-Host", ""), request.url.netloc)
-    path_and_query = request.url.path
-    if request.url.query:
-        path_and_query += f"?{request.url.query}"
-
-    validator = RequestValidator(auth_token)
-    proto_candidates = [detected_proto] + [p for p in ("https", "http") if p != detected_proto]
-    for candidate_proto in proto_candidates:
-        url = f"{candidate_proto}://{netloc}{path_and_query}"
-        try:
-            if validator.validate(url, form_params, signature):
-                if candidate_proto != detected_proto:
-                    log.warning(
-                        "WhatsApp-Webhook: Signatur erst mit alternativem Protokoll-Kandidaten gültig "
-                        "-- X-Forwarded-Proto des Railway-Proxys wich von der tatsächlichen URL ab",
-                        detected_proto=detected_proto,
-                        matched_proto=candidate_proto,
-                    )
-                return True
-        except Exception as exc:
-            log.warning(
-                "WhatsApp-Webhook: Signaturprüfung für Kandidaten-URL fehlgeschlagen",
-                url=url, error=str(exc),
-            )
-
-    log.warning(
-        "WhatsApp-Webhook: ungültige Twilio-Signatur nach allen Protokoll-Kandidaten",
-        candidates=proto_candidates, netloc=netloc,
-    )
+    if message_id in _SEEN_WHATSAPP_IDS:
+        return True
+    _SEEN_WHATSAPP_IDS[message_id] = None
+    while len(_SEEN_WHATSAPP_IDS) > _SEEN_WHATSAPP_IDS_MAX:
+        _SEEN_WHATSAPP_IDS.popitem(last=False)
     return False
 
 
-def _twiml_response(message: str, media_url: Optional[str] = None) -> Response:
-    """Baut eine TwiML-Antwort (twilio.twiml.messaging_response.MessagingResponse
-    escaped den Nachrichtentext selbst korrekt -- kein manuelles XML-String-Building,
-    das bei Sonderzeichen im Techniker-Text zu ungültigem XML führen könnte)."""
-    twiml = MessagingResponse()
-    msg = twiml.message(message)
-    if media_url:
-        msg.media(media_url)
-    return Response(content=str(twiml), media_type="application/xml")
-
-
-def _twiml_reply(message: str, media_url: Optional[str] = None, **log_context) -> Response:
-    """[STEP 5] Baut die abschließende TwiML-Antwort UND protokolliert sie --
-    einziger Rückgabepunkt aus whatsapp_webhook(), damit STEP 5 für jeden
-    Ausgang (Happy Path wie jeder Fallback-Pfad) im Log auftaucht, nicht nur
-    beim erfolgreichen Durchlauf."""
-    log.info("[STEP 5] Respuesta TwiML enviada a Twilio", has_media=bool(media_url), **log_context)
-    return _twiml_response(message, media_url=media_url)
-
-
-def _download_and_normalize_audio(media_url: str, content_type: str) -> bytes:
+def _download_and_normalize_audio(media_id: str) -> bytes:
     """
     Synchron (Netzwerk-Download UND ffmpeg-Subprozess über pydub sind beide
     blockierend) -- der Aufrufer MUSS dies über loop.run_in_executor()
     aufrufen, sonst friert der Event Loop für alle gleichzeitigen Requests ein
     (gleiche Regel wie überall sonst in main.py, z. B. /health/llm).
 
-    Twilio-Media-URLs verlangen HTTP-Basic-Auth mit Account-SID+Auth-Token,
-    sonst liefert Twilio einen 401 statt der Audiodatei. Ergebnis ist auf WAV
-    normalisiert -- WhatsApp-Sprachnachrichten kommen i. d. R. als
+    Lädt die Sprachnachricht über die Graph API (tools/whatsapp_cloud) und
+    normalisiert sie auf WAV -- WhatsApp-Sprachnachrichten kommen als
     "audio/ogg; codecs=opus", ein für die meisten STT-Provider unhandliches
-    Format; WAV ist der kleinste gemeinsame Nenner für eine künftige
-    Transkriptions-Anbindung (siehe _transcribe_audio()).
+    Format; WAV ist der kleinste gemeinsame Nenner (siehe _transcribe_audio()).
     """
-    account_sid = settings.twilio_account_sid.get_secret_value()
-    auth_token = settings.twilio_auth_token.get_secret_value()
-    resp = httpx.get(media_url, auth=(account_sid, auth_token), timeout=15)
-    resp.raise_for_status()
-
     import io
 
     from pydub import AudioSegment
 
+    data, content_type = whatsapp_cloud.download_media(media_id)
     fmt = "ogg" if "ogg" in content_type.lower() else None
-    segment = AudioSegment.from_file(io.BytesIO(resp.content), format=fmt)
+    segment = AudioSegment.from_file(io.BytesIO(data), format=fmt)
     buffer = io.BytesIO()
     segment.export(buffer, format="wav")
     return buffer.getvalue()
@@ -1160,13 +1065,11 @@ def _transcribe_audio(wav_bytes: bytes) -> Optional[str]:
     fertig, hier passiert nur noch der STT-Aufruf.
 
     Ohne konfigurierten GROQ_API_KEY (core/config.py) wird NICHT versucht zu
-    transkribieren -- Fail-Safe für lokale Entwicklung ohne Groq-Zugang,
-    analog zu TWILIO_AUTH_TOKEN oben. Jeder Groq-API-Fehler (Netzwerk,
-    Rate-Limit, ungültiger Key, leere Antwort) wird abgefangen und geloggt
-    statt propagiert -- der Aufrufer (whatsapp_webhook()) antwortet dem
-    Techniker dann, dass seine Sprachnachricht nicht transkribiert werden
-    konnte, statt mit einer unbehandelten Exception zu enden (Twilio bekommt
-    nie einen 5xx, siehe whatsapp_webhook()-Docstring).
+    transkribieren -- Fail-Safe für lokale Entwicklung ohne Groq-Zugang.
+    Jeder Groq-API-Fehler (Netzwerk, Rate-Limit, ungültiger Key, leere
+    Antwort) wird abgefangen und geloggt statt propagiert -- der Aufrufer
+    antwortet dem Techniker dann, dass seine Sprachnachricht nicht
+    transkribiert werden konnte.
     """
     if not settings.groq_key_configured:
         log.warning("Audio-Transkription übersprungen -- kein GROQ_API_KEY konfiguriert")
@@ -1175,8 +1078,7 @@ def _transcribe_audio(wav_bytes: bytes) -> Optional[str]:
     client = Groq(api_key=settings.groq_api_key.get_secret_value())
     # Ein Retry bei transienten Groq-Fehlern (Netzwerk, Rate-Limit): der
     # Techniker soll seine Sprachnachricht nicht wegen eines einmaligen
-    # Aussetzers erneut schicken müssen. Bewusst nur 2 Versuche mit kurzem
-    # Backoff -- läuft synchron im Twilio-Antwortpfad.
+    # Aussetzers erneut schicken müssen. Bewusst nur 2 Versuche mit kurzem Backoff.
     max_attempts = 2
     for attempt in range(1, max_attempts + 1):
         try:
@@ -1196,136 +1098,117 @@ def _transcribe_audio(wav_bytes: bytes) -> Optional[str]:
     return None
 
 
-@app.post(
-    "/api/v1/webhook/whatsapp",
-    tags=["WhatsApp"],
-    summary="Twilio-WhatsApp-Webhook (Baustellen-Voice-Assistant)",
-    responses={
-        200: {"description": "TwiML-Antwort (auch bei internen Fehlern -- Twilio bekommt nie einen 5xx)"},
-        401: {"description": "Ungültige oder fehlende Twilio-Signatur"},
-    },
-)
-async def whatsapp_webhook(request: Request):
-    """
-    Nimmt eine WhatsApp-Text- oder Sprachnachricht eines Technikers entgegen
-    (Twilio WhatsApp Business API), extrahiert über field_worker_agent.py
-    strukturierte Regiebericht-Daten, erzeugt via utils/pdf_generator.py ein
-    PDF und schickt eine TwiML-Bestätigung (inkl. PDF-Link) zurück.
+async def _whatsapp_reply(msg: whatsapp_cloud.IncomingMessage, text: str, pdf_path: Optional[Path] = None) -> None:
+    """[STEP 5] Einziger Antwortpunkt: schickt Text -- oder, mit pdf_path, das
+    PDF als WhatsApp-Dokument mit dem Text als Bildunterschrift -- über die
+    WhatsApp Cloud API und protokolliert das Ergebnis für JEDEN Ausgang
+    (Happy Path wie Fallback). Wirft nie."""
+    import asyncio
 
-    Twilio sendet `application/x-www-form-urlencoded`, NICHT JSON -- anders
-    als jeder andere Endpoint in main.py. Wichtige Felder: `From` (Absender-
-    Nummer), `Body` (Text), `NumMedia`/`MediaUrl0`/`MediaContentType0`
-    (Anhang, z. B. eine Sprachnachricht).
-    """
+    loop = asyncio.get_running_loop()
+    sent = False
     try:
-        form = await request.form()
-        params = {k: str(v) for k, v in form.items()}
+        if pdf_path is not None:
+            media_id = await loop.run_in_executor(
+                None, whatsapp_cloud.upload_media, pdf_path.read_bytes(), pdf_path.name,
+                "application/pdf", msg.phone_number_id,
+            )
+            if media_id:
+                sent = await loop.run_in_executor(
+                    None, whatsapp_cloud.send_document, msg.sender, media_id, pdf_path.name, text,
+                    msg.phone_number_id,
+                )
+            else:
+                text += "\n\n(Das PDF konnte gerade nicht zugestellt werden -- bitte kurz nochmal versuchen.)"
+        if not sent:
+            sent = await loop.run_in_executor(None, whatsapp_cloud.send_text, msg.sender, text, msg.phone_number_id)
     except Exception as exc:
-        log.warning("WhatsApp-Webhook: Form-Parsing fehlgeschlagen", error=str(exc))
-        return _twiml_reply("Entschuldigung, deine Nachricht konnte nicht gelesen werden.")
+        log.error("WhatsApp-Antwort fehlgeschlagen", frm=msg.sender, error=str(exc), exc_info=True)
+    log.info("[STEP 5] Respuesta enviada por WhatsApp Cloud API", frm=msg.sender, has_pdf=pdf_path is not None, sent=sent)
 
-    sender = params.get("From", "unknown")
 
-    # Signaturprüfung bleibt AUSSERHALB des globalen try/except unten: eine
-    # ungültige Signatur ist die einzige Authentifizierung dieses öffentlichen
-    # Endpoints und muss ein echter 401 bleiben (siehe _verify_twilio_signature()-
-    # Docstring), nicht in eine 200-TwiML-Antwort umgewandelt werden.
-    if not _verify_twilio_signature(request, params):
-        log.warning("WhatsApp-Webhook: ungültige Twilio-Signatur", frm=sender)
-        raise HTTPException(status_code=401, detail="Invalid Twilio signature")
+async def _process_whatsapp_message(msg: whatsapp_cloud.IncomingMessage) -> None:
+    """
+    Verarbeitet EINE eingehende WhatsApp-Nachricht als Background-Task:
+    Text bzw. Sprachnachricht (Groq) -> FieldWorkerAgent -> Regiebericht-PDF ->
+    Antwort mit dem PDF. Demo-Sandbox (tools/demo_sandbox.py): Testnummer ODER
+    "[DEMO]" im Text schaltet PDF-Vermerk + Leads_Demo-Log ein. Der äußere
+    try/except schließt jeden unerwarteten Fehler ein -- der Techniker
+    bekommt immer eine Antwort, nie Stille.
+    """
+    import asyncio
 
-    body_text = (params.get("Body") or "").strip()
-    try:
-        num_media = int(params.get("NumMedia", "0") or "0")
-    except ValueError:
-        num_media = 0
+    loop = asyncio.get_running_loop()
+    body_text = (msg.text or "").strip()
 
-    # Demo-Sandbox (tools/demo_sandbox.py): Testnummer ODER "[DEMO]" im Text
-    # aktiviert den Sandbox-Pfad -- eigenes Sheet-Tab statt CRM, sichtbarer
-    # PDF-Vermerk. Marker wird VOR der Weitergabe an den Agenten entfernt,
-    # damit er nicht als Teil der Tätigkeitsbeschreibung im Bericht landet.
-    is_demo = is_demo_message(sender, body_text)
+    is_demo = is_demo_message(msg.sender, body_text)
     if is_demo:
         body_text = strip_demo_marker(body_text)
 
     log.info(
-        "[STEP 1] Webhook recibido de Twilio",
-        frm=sender, has_media=num_media > 0, body_chars=len(body_text), is_demo=is_demo,
+        "[STEP 1] Webhook recibido de WhatsApp Cloud API",
+        frm=msg.sender, msg_type=msg.msg_type, body_chars=len(body_text), is_demo=is_demo,
     )
 
-    import asyncio
-    loop = asyncio.get_running_loop()
-
-    # Globales Sicherheitsnetz für den gesamten Verarbeitungspfad NACH der
-    # Signaturprüfung: jeder einzelne Schritt hat bereits einen eigenen,
-    # spezifisch formulierten try/except (Audio, Agent, PDF) für die
-    # passendste Fehlermeldung an den Techniker -- dieser äußere Block fängt
-    # zusätzlich jeden UNERWARTETEN Fehler ab (z. B. einen Bug in
-    # field_worker.process(), der bisher komplett ungeschützt war), damit
-    # Twilio unter GAR KEINEN Umständen einen 5xx sieht, sondern immer eine
-    # valide TwiML-Antwort bekommt.
     try:
         transcript = body_text
         audio_note = ""
 
-        if num_media > 0:
-            media_url = params.get("MediaUrl0", "")
-            media_type = params.get("MediaContentType0", "")
-            if media_type.startswith("audio/"):
-                try:
-                    wav_bytes = await loop.run_in_executor(
-                        None, _download_and_normalize_audio, media_url, media_type
-                    )
-                    transcribed = _transcribe_audio(wav_bytes)
-                    if transcribed:
-                        transcript = f"{transcript}\n{transcribed}".strip()
-                        log.info("[STEP 2] Transcripción (Groq Whisper) completada", chars=len(transcribed))
-                    else:
-                        audio_note = (
-                            "\n\n\U0001f399️ Sprachnachricht erhalten, aber automatische Transkription "
-                            "ist gerade fehlgeschlagen -- bitte schick deinen Bericht zusätzlich als Text."
-                        )
-                except Exception as exc:
-                    log.warning("WhatsApp-Webhook: Audio-Verarbeitung fehlgeschlagen", error=str(exc))
+        if msg.msg_type == "audio" and msg.media_id:
+            try:
+                wav_bytes = await loop.run_in_executor(None, _download_and_normalize_audio, msg.media_id)
+                transcribed = _transcribe_audio(wav_bytes)
+                if transcribed:
+                    transcript = f"{transcript}\n{transcribed}".strip()
+                    log.info("[STEP 2] Transcripción (Groq Whisper) completada", chars=len(transcribed))
+                else:
                     audio_note = (
-                        "\n\n⚠️ Deine Sprachnachricht konnte nicht verarbeitet werden. "
-                        "Bitte schick deinen Bericht als Text."
+                        "\n\n\U0001f399️ Sprachnachricht erhalten, aber automatische Transkription "
+                        "ist gerade fehlgeschlagen -- bitte schick deinen Bericht zusätzlich als Text."
                     )
-            else:
+            except Exception as exc:
+                log.warning("WhatsApp: Audio-Verarbeitung fehlgeschlagen", error=str(exc))
                 audio_note = (
-                    f"\n\n\U0001f4ce Anhang ({media_type or 'unbekannter Typ'}) erhalten, aber nicht "
-                    "verarbeitet -- bitte schick Text oder eine Sprachnachricht."
+                    "\n\n⚠️ Deine Sprachnachricht konnte nicht verarbeitet werden. "
+                    "Bitte schick deinen Bericht als Text."
                 )
+        elif msg.msg_type not in ("text", "audio"):
+            audio_note = (
+                f"\n\n\U0001f4ce Anhang ({msg.msg_type or 'unbekannter Typ'}) erhalten, aber nicht "
+                "verarbeitet -- bitte schick Text oder eine Sprachnachricht."
+            )
 
         if not transcript:
-            return _twiml_reply(
+            await _whatsapp_reply(
+                msg,
                 "Hallo! Schick mir kurz, was du heute gemacht hast (Kunde, Stunden, Material) -- "
                 "ich erstelle daraus automatisch deinen Regiebericht." + audio_note,
-                frm=sender,
             )
+            return
 
         field_worker = _AGENT_REGISTRY.get("field-worker")
         if field_worker is None:
-            return _twiml_reply(
-                "Der Baustellen-Assistent ist gerade nicht verfügbar. Bitte versuch es in ein paar Minuten erneut.",
-                frm=sender,
+            await _whatsapp_reply(
+                msg, "Der Baustellen-Assistent ist gerade nicht verfügbar. Bitte versuch es in ein paar Minuten erneut."
             )
+            return
 
         agent_response = await loop.run_in_executor(
             None,
             field_worker.process,
-            AgentRequest(text=transcript, session_id=f"whatsapp-{sender}-{uuid.uuid4().hex[:8]}"),
+            AgentRequest(text=transcript, session_id=f"whatsapp-{msg.sender}-{uuid.uuid4().hex[:8]}"),
         )
 
         if not agent_response.success:
-            log.warning("WhatsApp-Webhook: field-worker-Agent fehlgeschlagen", error=agent_response.error)
-            return _twiml_reply(
+            log.warning("WhatsApp: field-worker-Agent fehlgeschlagen", error=agent_response.error)
+            await _whatsapp_reply(
+                msg,
                 "Entschuldigung, da ist etwas schiefgelaufen. Bitte versuch es nochmal oder melde dich direkt bei Anton."
                 + audio_note,
-                frm=sender,
             )
+            return
 
-        log.info("[STEP 3] Procesamiento de FieldWorkerAgent completado", frm=sender)
+        log.info("[STEP 3] Procesamiento de FieldWorkerAgent completado", frm=msg.sender)
         data = agent_response.result
 
         try:
@@ -1338,27 +1221,23 @@ async def whatsapp_webhook(request: Request):
                 is_demo,
             )
         except Exception as exc:
-            log.error("WhatsApp-Webhook: PDF-Erstellung fehlgeschlagen", error=str(exc))
-            return _twiml_reply(
+            log.error("WhatsApp: PDF-Erstellung fehlgeschlagen", error=str(exc))
+            await _whatsapp_reply(
+                msg,
                 "Ich habe deine Angaben erhalten, konnte aber den Regiebericht als PDF nicht erstellen. "
                 "Anton wurde informiert." + audio_note,
-                frm=sender,
             )
+            return
 
         log.info("[STEP 4] PDF generado con éxito", filename=pdf_path.name, is_demo=is_demo)
 
         if is_demo:
-            logged = await loop.run_in_executor(None, log_demo_lead, data, sender)
+            logged = await loop.run_in_executor(None, log_demo_lead, data, msg.sender)
             log.info("[STEP 4b] Demo-Sandbox: Sheet-Log", logged=logged)
-
-        proto = _first_forwarded_value(request.headers.get("X-Forwarded-Proto", ""), request.url.scheme)
-        netloc = _first_forwarded_value(request.headers.get("X-Forwarded-Host", ""), request.url.netloc)
-        pdf_url = f"{proto}://{netloc}/static/reports/{pdf_path.name}"
 
         stunden_text = data.get("stunden") if data.get("stunden") is not None else "?"
         confirmation = (
-            f"✅ Regiebericht erstellt für {data.get('kunde') or 'unbekannten Kunden'} "
-            f"({stunden_text} Std.).\n{pdf_url}"
+            f"✅ Regiebericht erstellt für {data.get('kunde') or 'unbekannten Kunden'} ({stunden_text} Std.)."
         )
         if is_demo:
             confirmation = "🧪 [DEMO-MODUS -- keine echten Daten]\n" + confirmation
@@ -1366,14 +1245,84 @@ async def whatsapp_webhook(request: Request):
             confirmation += f"\n\nHinweis: {data['confidence_notes']}"
         confirmation += audio_note
 
-        return _twiml_reply(confirmation, media_url=pdf_url, frm=sender)
+        await _whatsapp_reply(msg, confirmation, pdf_path=pdf_path)
+        # Das PDF liegt nach dem Upload zu Meta bei Meta -- die lokale Kopie
+        # (ephemeres Railway-Dateisystem) wird nicht mehr gebraucht.
+        try:
+            pdf_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     except Exception as exc:
-        log.error("WhatsApp-Webhook: unbehandelter Fehler im Verarbeitungspfad", frm=sender, error=str(exc), exc_info=True)
-        return _twiml_reply(
-            "Entschuldigung, bei der Verarbeitung deiner Nachricht ist ein unerwarteter Fehler aufgetreten. "
-            "Bitte versuch es nochmal oder melde dich direkt bei Anton.",
-            frm=sender,
+        log.error("WhatsApp: unbehandelter Fehler im Verarbeitungspfad", frm=msg.sender, error=str(exc), exc_info=True)
+        await _whatsapp_reply(
+            msg, "Entschuldigung, da ist etwas schiefgelaufen. Bitte versuch es in ein paar Minuten nochmal."
         )
+
+
+@app.get(
+    "/api/v1/webhook/whatsapp",
+    tags=["WhatsApp"],
+    summary="WhatsApp-Webhook-Verifizierung (Meta)",
+    include_in_schema=False,
+)
+async def whatsapp_verify(request: Request):
+    """Meta ruft diese URL beim Einrichten des Webhooks im Dashboard einmalig
+    mit hub.mode/hub.verify_token/hub.challenge auf; bei passendem
+    WHATSAPP_VERIFY_TOKEN wird der Challenge im Klartext zurückgegeben."""
+    q = request.query_params
+    challenge = whatsapp_cloud.verify_challenge(
+        q.get("hub.mode", ""), q.get("hub.verify_token", ""), q.get("hub.challenge", "")
+    )
+    if challenge is None:
+        log.warning("WhatsApp-Webhook-Verifizierung abgelehnt (falscher Verify-Token oder Modus)")
+        raise HTTPException(status_code=403, detail="Verification failed")
+    log.info("WhatsApp-Webhook-Verifizierung erfolgreich")
+    return PlainTextResponse(challenge)
+
+
+@app.post(
+    "/api/v1/webhook/whatsapp",
+    tags=["WhatsApp"],
+    summary="WhatsApp-Cloud-API-Webhook (Baustellen-Voice-Assistant)",
+    responses={
+        200: {"description": "Bestätigung -- die Verarbeitung läuft im Hintergrund, die Antwort geht per Graph API raus"},
+        401: {"description": "Ungültige oder fehlende X-Hub-Signature-256"},
+    },
+)
+async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Nimmt Text- oder Sprachnachrichten eines Technikers über die Meta
+    WhatsApp Cloud API entgegen (JSON, signiert mit X-Hub-Signature-256),
+    extrahiert über field_worker_agent.py strukturierte Regiebericht-Daten,
+    erzeugt via utils/pdf_generator.py ein PDF und schickt es als
+    WhatsApp-Dokument zurück.
+
+    Antwortet IMMER sofort mit 200 (außer bei ungültiger Signatur), damit Meta
+    nicht erneut zustellt; auch Zustellstatus-Events (ohne `messages`) werden
+    einfach bestätigt.
+    """
+    raw_body = await request.body()
+
+    # Signaturprüfung bleibt die einzige Authentifizierung dieses öffentlichen
+    # Endpoints und muss ein echter 401 bleiben.
+    if not whatsapp_cloud.verify_signature(raw_body, request.headers.get("X-Hub-Signature-256", "")):
+        log.warning("WhatsApp-Webhook: ungültige X-Hub-Signature-256")
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    try:
+        payload = json.loads(raw_body or b"{}")
+    except ValueError:
+        log.warning("WhatsApp-Webhook: Body ist kein gültiges JSON")
+        return {"status": "ignored"}
+
+    accepted = 0
+    for msg in whatsapp_cloud.parse_incoming(payload):
+        if _already_processed(msg.message_id):
+            log.info("WhatsApp-Webhook: doppelte Zustellung ignoriert", message_id=msg.message_id)
+            continue
+        background_tasks.add_task(_process_whatsapp_message, msg)
+        accepted += 1
+    return {"status": "received", "messages": accepted}
 
 
 # ── Post-Call Protokolle ──────────────────────────────────────────────────────

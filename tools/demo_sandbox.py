@@ -24,7 +24,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from core.config import normalize_whatsapp_number, settings
+from core.config import normalize_number, settings
 from core.security import SecurityLayer
 from tools import production_crm_bridge
 
@@ -41,7 +41,7 @@ _DEMO_HEADERS = [
 def is_demo_message(sender: str, body_text: str) -> bool:
     """True, wenn der Absender eine konfigurierte Testnummer ist ODER der
     Nachrichtentext den "[DEMO]"-Marker enthält."""
-    if sender and normalize_whatsapp_number(sender) in settings.whatsapp_demo_test_numbers_set:
+    if sender and normalize_number(sender) in settings.whatsapp_demo_test_numbers_set:
         return True
     return bool(_DEMO_MARKER_RE.search(body_text or ""))
 
@@ -121,8 +121,8 @@ def log_demo_lead(data: dict[str, Any], sender: str) -> bool:
             service.spreadsheets().values().append(
                 spreadsheetId=spreadsheet_id,
                 range=f"'{tab_name}'!A:H",
-                valueInputOption="USER_ENTERED",
-                insertDataOption="OVERWRITE",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
                 body={"values": [row]},
             ),
             "Demo-Lead anhängen",
