@@ -1016,13 +1016,7 @@ degradation). 21b/21c wurden auf die neuen Node-Namen (`supervisor_node`,
 `appointment_node`+`supervisor_node`) umgestellt, decken aber weiterhin
 exakt dieselbe Logik ab wie vorher.
 
-> **Bekannte Einschränkung:** `static/chat_widget.js` bietet noch keine
-> Datei-Upload-UI für `attachment` — Frontend-Arbeit, separat von diesem
-> Backend-Refactor. `document_node`s Bild-Pfad ist nur im Zusammenspiel mit
-> einem echten LLM (Vision-fähiges Claude-Modell) end-to-end getestet
-> (kein dedizierter Live-Test in `test_system.py`, da das echte Bilddaten +
-> gültigen `ANTHROPIC_API_KEY` erfordern würde) — die Graceful-Degradation
-> ohne LLM ist über TEST 21e abgedeckt.
+> **Stand 24.09.2026:** `static/chat_widget.js` hat die Upload-UI bereits (Büroklammer, Chip mit Dateiname, 8-MB-Vorabprüfung, Base64 im selben POST, Commit `309fbcf`) -- die frühere Einschränkung "noch keine Upload-UI" ist erledigt. Der Bild-Pfad von `document_node()` ist nur mit einem echten Vision-fähigen LLM end-to-end getestet (kein Live-Test in `test_system.py`).
 
 ---
 
@@ -1688,6 +1682,5 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 | `InboundChatSession`-Store (`agents/sdr_agent.py`) = In-Memory mit nur einer groben `_MAX_INBOUND_SESSIONS`-Obergrenze | Persistenter Session-Store (Redis) vor echtem Produktiv-Traffic — das Rate-Limiting selbst ist seit 21.09.2026 erledigt (`slowapi`, 20/Minute pro IP, siehe `main.py landing_chat()`) |
 | `static/chat_widget.js` nutzt kein Shadow DOM — CSS-Kollisionen mit sehr aggressiven globalen Host-Seiten-Styles theoretisch möglich | Bei Bedarf auf Shadow-DOM-Kapselung umstellen |
 | Lead-Benachrichtigung (`tools/lead_notifier.py`) = einfaches SMTP-Anwendungspasswort, kein Retry/Queue bei SMTP-Ausfall | Bei Bedarf Retry-Queue oder Wechsel auf einen transaktionalen E-Mail-Dienst (SendGrid/Postmark/SES) |
-| `InboundChatGraph.document_node()` (Anhang-Extraktion) ist über die API voll funktionsfähig, aber `static/chat_widget.js` hat noch keine Upload-UI dafür | Frontend-Arbeit: Datei-Auswahl + Base64-Kodierung im Widget ergänzen, `attachment`-Feld an `/api/v1/chat/landing` mitschicken |
 | Baustellen-Voice-Assistant (`main.py` `/api/v1/webhook/whatsapp`): Speech-to-Text läuft über Groq (`whisper-large-v3`), 1 Retry bei transientem Groq-Fehler (seit 23.09.2026); erst nach dem zweiten Fehlschlag gibt `_transcribe_audio()` `None` zurück und der Techniker muss auf Text ausweichen | Bei Bedarf einen einfachen Retry (1-2 Versuche) in `_transcribe_audio()` ergänzen, analog zum `resilient_node()`-Decorator des GuardianAgent |
 | Regiebericht-PDFs werden nach dem Versand nicht gespeichert (Upload zu Meta, lokale Kopie wird gelöscht) -- keine Berichtshistorie | Bei Bedarf Berichte zusätzlich in persistentem Objektspeicher/DB ablegen |
