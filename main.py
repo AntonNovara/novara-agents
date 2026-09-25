@@ -1211,6 +1211,19 @@ async def _process_whatsapp_message(msg: whatsapp_cloud.IncomingMessage) -> None
         log.info("[STEP 3] Procesamiento de FieldWorkerAgent completado", frm=msg.sender)
         data = agent_response.result
 
+        # Ein "Hallo" oder eine Frage enthält keinen Arbeitsbericht: statt eines
+        # leeren PDFs eine kurze Anleitung schicken.
+        if not any(data.get(k) for k in ("kunde", "stunden", "arbeit", "material")):
+            log.info("[STEP 3b] Keine Berichtsdaten erkannt -- Hilfetext statt leerem PDF", frm=msg.sender)
+            await _whatsapp_reply(
+                msg,
+                "Hallo! Ich bin der Novara-Assistent für Regieberichte. Schick mir einfach kurz, was du heute "
+                "gemacht hast -- als Text oder Sprachnachricht. Zum Beispiel:\n"
+                "\"Heute 2 Stunden bei Familie Berger, Verteilerkasten getauscht, 1 FI-Schalter.\"\n"
+                "Ich erstelle daraus automatisch deinen Regiebericht als PDF." + audio_note,
+            )
+            return
+
         try:
             _REPORTS_DIR.mkdir(parents=True, exist_ok=True)
             pdf_path = await loop.run_in_executor(

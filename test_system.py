@@ -2768,6 +2768,25 @@ def test_demo_sandbox() -> None:
         else:
             fail("Demo-Durchlauf unerwartet", f"docs={docs} log_calls={[c[1] for c in log_calls]} texts={texts}")
 
+        # (3b) Begrüßung ohne Berichtsdaten -> Hilfetext, kein leeres PDF
+        class _EmptyAgent:
+            def process(self, request):
+                return SimpleNamespace(success=True, result={"techniker": None, "kunde": None, "stunden": None, "material": None, "arbeit": None}, error=None)
+
+        texts.clear()
+        docs.clear()
+        main_module._AGENT_REGISTRY = {"field-worker": _EmptyAgent()}
+        with mock.patch.object(whatsapp_cloud, "upload_media", side_effect=fake_upload), \
+             mock.patch.object(whatsapp_cloud, "send_document", side_effect=fake_send_doc), \
+             mock.patch.object(whatsapp_cloud, "send_text", side_effect=lambda to, text, pid="": texts.append((to, text)) or True):
+            asyncio.run(main_module._process_whatsapp_message(
+                whatsapp_cloud.IncomingMessage("wamid.G", "+436607778899", "text", text="hola")))
+        main_module._AGENT_REGISTRY = {"field-worker": _StubAgent()}
+        if len(texts) == 1 and "Regiebericht" in texts[0][1] and not docs:
+            ok("Begrüßung ohne Berichtsdaten (\"hola\") -> Hilfetext per WhatsApp, kein leeres PDF")
+        else:
+            fail("Begrüßungs-Fallback unerwartet", f"texts={texts} docs={docs}")
+
         # (4) PDF-Upload schlägt fehl -> Text-Fallback statt Stille
         texts.clear()
         with mock.patch.object(whatsapp_cloud, "upload_media", return_value=None), \
