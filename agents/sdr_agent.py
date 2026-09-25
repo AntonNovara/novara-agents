@@ -503,6 +503,10 @@ class SDRGraph:
 
         # No company-name match → ask LLM to generate a target persona
         logger.debug("No DB match — generating persona via LLM")
+        # Nur eine E-Mail, die WIRKLICH im Lead-Text steht, ist echt. Die vom LLM geratene
+        # Adresse/LinkedIn-URL (vorname.nachname@firma.at) wird verworfen: sie würde als
+        # Fakt im CRM, im Consent-Ledger und in der Sequenz landen.
+        real_email = SecurityLayer.extract_email(state["input_text"]) or ""
         try:
             prompt = (
                 f"Company: {state['company_name']}\n"
@@ -524,8 +528,8 @@ class SDRGraph:
                 "company": state["company_name"],
                 "company_size": state["company_size"],
                 "industry": state["industry"],
-                "email": persona.get("email", ""),
-                "linkedin_url": persona.get("linkedin_url", ""),
+                "email": real_email,
+                "linkedin_url": "",
                 "pain_points": state["pain_points"],
                 "tech_stack": [],
             }
@@ -538,7 +542,7 @@ class SDRGraph:
                 "company": state["company_name"],
                 "company_size": state["company_size"],
                 "industry": state["industry"],
-                "email": "", "linkedin_url": "",
+                "email": real_email, "linkedin_url": "",
                 "pain_points": state["pain_points"],
                 "tech_stack": [],
             }

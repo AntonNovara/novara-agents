@@ -3753,7 +3753,8 @@ def test_sdr_generated_contact_crm() -> None:
                 system = _extract_text(messages[0].content)
                 if "Kein Kontakt wurde in unserer Datenbank" in system:
                     return AIMessage(content=_json.dumps({"first_name": "Thomas", "last_name": "Erfunden", "title": "Inhaber",
-                                                          "seniority": "c_level", "email": "", "linkedin_url": ""}))
+                                                          "seniority": "c_level", "email": "thomas.erfunden@zeta.at",
+                                                          "linkedin_url": "linkedin.com/in/thomas-erfunden"}))
                 if "ICP-Scoring gemäß" in system:
                     return AIMessage(content=_json.dumps({"company_name": self.company, "industry": "Elektrikerbetrieb", "company_size": 6,
                                                           "pain_points": ["x"], "outreach_channel": "email", "icp_score": 90,
@@ -3770,9 +3771,9 @@ def test_sdr_generated_contact_crm() -> None:
                 self.records.append(record)
                 return super().upsert_lead(record)
 
-        def run(company, tag):
+        def run(company, tag, extra=""):
             crm = _CapturingCRM()
-            res = SDRGraph(_LLM(company), LeadDatabase(), crm).run(f"{company}, Elektriker Wien, 6 MA ({tag})", f"t-crm-{tag}")
+            res = SDRGraph(_LLM(company), LeadDatabase(), crm).run(f"{company}, Elektriker Wien, 6 MA ({tag}) {extra}", f"t-crm-{tag}")
             return crm.records[0], res.get("final_result", res)
 
         orig_live, orig_audit = settings.sdr_crm_live_sheet, pa.run_audit
@@ -3780,6 +3781,7 @@ def test_sdr_generated_contact_crm() -> None:
         try:
             gen_rec, gen_fr = run("Testbetrieb Zeta Elektro", "gen")
             db_rec, db_fr = run("FastBox Logistics GmbH", "db")
+            real_rec, _ = run("Testbetrieb Zeta Elektro", "real", "Kontakt: office@zeta-elektro.at")
             cs = customer_state.get(company_name="Testbetrieb Zeta Elektro")
             cs_name = ""
             if cs:
@@ -3788,13 +3790,17 @@ def test_sdr_generated_contact_crm() -> None:
                 gen_rec.contact_source == "generated" and gen_rec.contact_name == "Unbekannt"
                 and gen_fr["contact"]["name"] == "Unbekannt" and "Thomas" not in str(gen_fr["contact"])
                 and cs_name == "Unbekannt"
+                and not gen_rec.contact_email and not gen_rec.contact_linkedin
+                and "erfunden" not in str(gen_fr["contact"]).lower()
+                and real_rec.contact_email == "office@zeta-elektro.at" and not real_rec.contact_linkedin
+                and db_rec.contact_email and db_rec.contact_linkedin
                 and db_rec.contact_source == "database" and db_rec.contact_name not in ("", "Unbekannt")
                 and db_fr["contact"]["name"] == db_rec.contact_name
             )
             if good:
-                ok("Erfundener Kontakt -> 'Unbekannt' in CRM-Record, customer_state und final_result; echter DB-Kontakt behält seinen Namen")
+                ok("Erfundener Kontakt -> 'Unbekannt', geratene E-Mail/LinkedIn verworfen (echte E-Mail aus dem Lead-Text bleibt); echter DB-Kontakt behält alle Daten")
             else:
-                fail("Kontaktname unerwartet", str((gen_rec.contact_name, gen_fr["contact"], cs_name, db_rec.contact_name)))
+                fail("Kontaktname unerwartet", str((gen_rec.contact_name, gen_rec.contact_email, gen_rec.contact_linkedin, gen_fr["contact"], cs_name, real_rec.contact_email, db_rec.contact_name)))
         finally:
             settings.sdr_crm_live_sheet, pa.run_audit = orig_live, orig_audit
     except Exception:
