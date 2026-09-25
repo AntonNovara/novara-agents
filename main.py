@@ -7,6 +7,7 @@ Strukturiertes JSON-Logging für alle Requests (DSGVO-Audit-Trail).
 """
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -204,7 +205,7 @@ _api_key_scheme = APIKeyHeader(name=settings.api_key_header, auto_error=False)
 async def require_api_key(api_key: Optional[str] = Security(_api_key_scheme)) -> str:
     expected = settings.api_secret_key.get_secret_value()
     # In development mode, skip auth when key is the default placeholder
-    if settings.environment == "development" and expected == "dev-secret":
+    if settings.environment == "development" and expected == "dev-secret" and not os.environ.get("RAILWAY_ENVIRONMENT_NAME"):
         return "dev-bypass"
     if not api_key or api_key != expected:
         raise HTTPException(
@@ -1022,6 +1023,33 @@ _SEEN_WHATSAPP_IDS: "OrderedDict[str, None]" = OrderedDict()
 _SEEN_WHATSAPP_IDS_MAX = 2000
 
 
+# Kosten-/Missbrauchsschutz: jede Nachricht löst Claude (+ ggf. Groq/ffmpeg + PDF) aus,
+# und die Nummer ist öffentlich erreichbar. Pro Absender höchstens N Nachrichten pro Stunde;
+# darüber wird still verworfen (nur EINE Hinweis-Antwort pro Fenster).
+_WHATSAPP_MAX_PER_HOUR = 30
+_WHATSAPP_MAX_AUDIO_SECONDS = 180
+_sender_hits: "dict[str, list[float]]" = {}
+_sender_warned: "dict[str, float]" = {}
+
+
+def _sender_rate_limited(sender: str, now: Optional[float] = None) -> "tuple[bool, bool]":
+    """(begrenzt?, Hinweis senden?) für diesen Absender. Gleitendes 1-Stunden-Fenster."""
+    now = time.time() if now is None else now
+    hits = [t for t in _sender_hits.get(sender, []) if now - t < 3600]
+    if len(hits) >= _WHATSAPP_MAX_PER_HOUR:
+        _sender_hits[sender] = hits
+        warn = now - _sender_warned.get(sender, 0) >= 3600
+        if warn:
+            _sender_warned[sender] = now
+        return True, warn
+    hits.append(now)
+    _sender_hits[sender] = hits
+    if len(_sender_hits) > 5000:  # Speicher begrenzen
+        for k in list(_sender_hits)[:1000]:
+            _sender_hits.pop(k, None)
+    return False, False
+
+
 def _already_processed(message_id: str) -> bool:
     if not message_id:
         return False
@@ -1052,6 +1080,8 @@ def _download_and_normalize_audio(media_id: str) -> bytes:
     data, content_type = whatsapp_cloud.download_media(media_id)
     fmt = "ogg" if "ogg" in content_type.lower() else None
     segment = AudioSegment.from_file(io.BytesIO(data), format=fmt)
+    if segment.duration_seconds > _WHATSAPP_MAX_AUDIO_SECONDS:
+        raise ValueError(f"Sprachnachricht zu lang ({segment.duration_seconds:.0f}s)")
     buffer = io.BytesIO()
     segment.export(buffer, format="wav")
     return buffer.getvalue()
@@ -1102,28 +1132,31 @@ async def _whatsapp_reply(msg: whatsapp_cloud.IncomingMessage, text: str, pdf_pa
     """[STEP 5] Einziger Antwortpunkt: schickt Text -- oder, mit pdf_path, das
     PDF als WhatsApp-Dokument mit dem Text als Bildunterschrift -- über die
     WhatsApp Cloud API und protokolliert das Ergebnis für JEDEN Ausgang
-    (Happy Path wie Fallback). Wirft nie."""
+    (Happy Path wie Fallback). Wirft nie. Scheitert der PDF-Weg (Datei nicht lesbar,
+    Upload oder Versand fehlgeschlagen), geht IMMER noch der Text raus."""
     import asyncio
 
     loop = asyncio.get_running_loop()
     sent = False
-    try:
-        if pdf_path is not None:
+    if pdf_path is not None:
+        try:
+            pdf_bytes = pdf_path.read_bytes()
             media_id = await loop.run_in_executor(
-                None, whatsapp_cloud.upload_media, pdf_path.read_bytes(), pdf_path.name,
-                "application/pdf", msg.phone_number_id,
+                None, whatsapp_cloud.upload_media, pdf_bytes, pdf_path.name, "application/pdf", msg.phone_number_id,
             )
             if media_id:
                 sent = await loop.run_in_executor(
-                    None, whatsapp_cloud.send_document, msg.sender, media_id, pdf_path.name, text,
-                    msg.phone_number_id,
+                    None, whatsapp_cloud.send_document, msg.sender, media_id, pdf_path.name, text, msg.phone_number_id,
                 )
-            else:
-                text += "\n\n(Das PDF konnte gerade nicht zugestellt werden -- bitte kurz nochmal versuchen.)"
+        except Exception as exc:
+            log.error("WhatsApp-PDF-Versand fehlgeschlagen", frm=msg.sender, error=str(exc), exc_info=True)
         if not sent:
+            text += "\n\n(Das PDF konnte gerade nicht zugestellt werden -- bitte kurz nochmal versuchen.)"
+    if not sent:
+        try:
             sent = await loop.run_in_executor(None, whatsapp_cloud.send_text, msg.sender, text, msg.phone_number_id)
-    except Exception as exc:
-        log.error("WhatsApp-Antwort fehlgeschlagen", frm=msg.sender, error=str(exc), exc_info=True)
+        except Exception as exc:
+            log.error("WhatsApp-Textantwort fehlgeschlagen", frm=msg.sender, error=str(exc), exc_info=True)
     log.info("[STEP 5] Respuesta enviada por WhatsApp Cloud API", frm=msg.sender, has_pdf=pdf_path is not None, sent=sent)
 
 
@@ -1139,6 +1172,14 @@ async def _process_whatsapp_message(msg: whatsapp_cloud.IncomingMessage) -> None
     import asyncio
 
     loop = asyncio.get_running_loop()
+
+    limited, warn = _sender_rate_limited(msg.sender)
+    if limited:
+        log.warning("WhatsApp: Absender überschreitet das Stundenlimit -- verworfen", frm=msg.sender, warn=warn)
+        if warn:
+            await _whatsapp_reply(msg, "Du hast in der letzten Stunde sehr viele Nachrichten geschickt. Bitte versuch es später erneut.")
+        return
+
     body_text = (msg.text or "").strip()
 
     is_demo = is_demo_message(msg.sender, body_text)
@@ -1215,7 +1256,7 @@ async def _process_whatsapp_message(msg: whatsapp_cloud.IncomingMessage) -> None
         # (Tätigkeit, Kunde/Baustelle, Stunden) -- die Entscheidung trifft der
         # Agent deterministisch im Code (agents/field_worker_agent.py evaluate()).
         # Sonst: ausschließlich ein freundlicher Text in der Sprache des Technikers.
-        if data.get("ready_for_pdf") is False:
+        if data.get("ready_for_pdf") is not True:
             log.info(
                 "[STEP 3b] Kein PDF -- Antworttext statt Bericht",
                 frm=msg.sender, guidance=data.get("guidance_type"), missing=data.get("missing_fields"),
@@ -1242,29 +1283,30 @@ async def _process_whatsapp_message(msg: whatsapp_cloud.IncomingMessage) -> None
             )
             return
 
-        log.info("[STEP 4] PDF generado con éxito", filename=pdf_path.name, is_demo=is_demo)
-
-        if is_demo:
-            logged = await loop.run_in_executor(None, log_demo_lead, data, msg.sender)
-            log.info("[STEP 4b] Demo-Sandbox: Sheet-Log", logged=logged)
-
-        stunden_text = data.get("stunden") if data.get("stunden") is not None else "?"
-        confirmation = (
-            f"✅ Regiebericht erstellt für {data.get('kunde') or 'unbekannten Kunden'} ({stunden_text} Std.)."
-        )
-        if is_demo:
-            confirmation = "🧪 [DEMO-MODUS -- keine echten Daten]\n" + confirmation
-        if data.get("confidence_notes"):
-            confirmation += f"\n\nHinweis: {data['confidence_notes']}"
-        confirmation += audio_note
-
-        await _whatsapp_reply(msg, confirmation, pdf_path=pdf_path)
-        # Das PDF liegt nach dem Upload zu Meta bei Meta -- die lokale Kopie
-        # (ephemeres Railway-Dateisystem) wird nicht mehr gebraucht.
         try:
-            pdf_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            log.info("[STEP 4] PDF generado con éxito", filename=pdf_path.name, is_demo=is_demo)
+
+            if is_demo:
+                logged = await loop.run_in_executor(None, log_demo_lead, data, msg.sender)
+                log.info("[STEP 4b] Demo-Sandbox: Sheet-Log", logged=logged)
+
+            stunden_text = data.get("stunden") if data.get("stunden") is not None else "?"
+            confirmation = (
+                f"✅ Regiebericht erstellt für {data.get('kunde') or 'unbekannten Kunden'} ({stunden_text} Std.)."
+            )
+            if is_demo:
+                confirmation = "🧪 [DEMO-MODUS -- keine echten Daten]\n" + confirmation
+            if data.get("confidence_notes"):
+                confirmation += f"\n\nHinweis: {data['confidence_notes']}"
+            confirmation += audio_note
+
+            await _whatsapp_reply(msg, confirmation, pdf_path=pdf_path)
+        finally:
+            # Das PDF enthält Kundendaten und läge sonst unter /static/reports/ öffentlich abrufbar.
+            try:
+                pdf_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     except Exception as exc:
         log.error("WhatsApp: unbehandelter Fehler im Verarbeitungspfad", frm=msg.sender, error=str(exc), exc_info=True)
         await _whatsapp_reply(
@@ -1360,6 +1402,9 @@ async def sequences_notify_due():
     due = await loop.run_in_executor(None, sequence_scheduler.list_due)
     sent = await loop.run_in_executor(None, lead_notifier.send_followup_digest, due)
     log.info("Follow-up-Digest", due=len(due), sent=sent)
+    if due and not sent:
+        # 502 statt 200, damit der GitHub-Actions-Lauf (curl --fail) rot wird und Anton es merkt.
+        raise HTTPException(status_code=502, detail="Digest-Mail konnte nicht gesendet werden")
     return {"count": len(due), "email_sent": sent}
 
 
@@ -1374,6 +1419,8 @@ class SequenceStepResult(BaseModel):
 )
 async def sequence_step_result(sequence_id: str, step_index: int, body: SequenceStepResult):
     """Markiert einen Schritt als erledigt (success=true) oder fehlgeschlagen."""
+    if step_index < 0:
+        raise HTTPException(status_code=404, detail="Sequence or step not found")
     try:
         step = sequence_scheduler.record_attempt(sequence_id, step_index, body.success, body.reason)
     except (KeyError, IndexError):

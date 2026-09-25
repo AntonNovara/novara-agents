@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from typing import Any, Optional
 
@@ -297,6 +298,35 @@ def _template_reply(kind: str, language: str, missing: list[str]) -> str:
     return _TEMPLATES[lang][kind].format(missing=missing_text)
 
 
+_MAX_HOURS_PER_REPORT = 24.0
+
+
+def _as_text(value: Any) -> str:
+    """LLM-Felder sind nicht typsicher: aus Zahl/Liste/dict immer einen sauberen String machen
+    (sonst AttributeError bei .strip() und ein Absturz statt einer Antwort an den Techniker)."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return ", ".join(_as_text(v) for v in value if _as_text(v))
+    return ""
+
+
+def _as_hours(value: Any) -> Optional[float]:
+    """Arbeitsstunden als endliche Zahl in (0, 24]; alles andere (NaN, inf, 9999, negativ,
+    Text) gilt als 'nicht verstanden' und wird nachgefragt, statt ein absurdes PDF zu erzeugen."""
+    try:
+        hours = float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+    if hours is None or not math.isfinite(hours) or hours <= 0 or hours > _MAX_HOURS_PER_REPORT:
+        return None
+    return hours
+
+
 _KEY_FIELDS = ("arbeit", "kunde", "stunden")
 
 
@@ -368,25 +398,21 @@ class FieldWorkerGraph:
         if not isinstance(material, list):
             material = [str(material)] if material else []
 
-        stunden_raw = data.get("stunden")
-        try:
-            stunden = float(stunden_raw) if stunden_raw is not None else None
-        except (TypeError, ValueError):
-            stunden = None
+        stunden = _as_hours(data.get("stunden"))
 
         return {
             **state,
-            "techniker": data.get("techniker") or defaults["techniker"],
-            "kunde": data.get("kunde") or defaults["kunde"],
-            "datum": data.get("datum") or defaults["datum"],
+            "techniker": _as_text(data.get("techniker")),
+            "kunde": _as_text(data.get("kunde")),
+            "datum": _as_text(data.get("datum")),
             "stunden": stunden,
             "material": [str(m) for m in material if str(m).strip()],
             # KEIN Rohtext-Fallback bei erfolgreicher Extraktion: ein leeres "arbeit"
             # heißt "keine Arbeitsinformation" (z. B. ein Gruß) und darf nicht mit der
             # Originalnachricht ("hola") aufgefüllt werden, sonst gälte sie als Arbeit.
-            "arbeit": str(data.get("arbeit") or "").strip(),
+            "arbeit": _as_text(data.get("arbeit")),
             "language": _normalize_language(data.get("language"), state["input_text"]),
-            "confidence_notes": data.get("confidence_notes", ""),
+            "confidence_notes": _as_text(data.get("confidence_notes")),
             "is_work_report": data.get("is_work_report") if isinstance(data.get("is_work_report"), bool) else None,
             "extraction_failed": False,
         }

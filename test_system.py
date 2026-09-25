@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import sys
 import traceback
+from pathlib import Path
 
 # ── Report-Helfer ───────────────────────────────────────────────────────────
 
@@ -3053,6 +3054,199 @@ def test_mcp_http_auth() -> None:
         fail("`--http` ohne MCP_API_KEY startete trotzdem", f"rc={proc.returncode}")
 
 
+def test_hardening_2026_09_25() -> None:
+    section("TEST 29 — Härtung nach Code-Review: Typsicherheit, Limits, Aufräumen, Fail-Safe")
+    info("Deckt die Review-Funde ab: NaN/9999 Stunden, Nicht-String-Felder, is not True, PDF-Versand-Fallback, "
+         "PDF wird immer gelöscht, Absender-Limit, Nicht-ASCII-Signatur, Media-Grenzen, Sequenz-Endpoints.")
+    import asyncio
+    import hashlib
+    import hmac
+    import shutil
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from fastapi import HTTPException
+
+    try:
+        import main as m
+        from agents.field_worker_agent import FieldWorkerGraph
+        from tools import whatsapp_cloud
+    except Exception as exc:
+        fail("Import für Härtungs-Test", str(exc))
+        return
+
+    # 29a: LLM-Felder sind nicht typsicher -> kein Absturz, kein PDF bei absurden Werten
+    class _R:
+        def __init__(self, c): self.content = c
+
+    class _L:
+        def __init__(self, j): self.j = j
+        def invoke(self, msgs): return _R("Hallo" if "KEIN JSON" in str(msgs[0].content) else self.j)
+
+    def run(j):
+        try:
+            return FieldWorkerGraph(llm=_L(j)).run(input_text="x", session_id="h")
+        except Exception as exc:
+            return {"exc": f"{type(exc).__name__}: {exc}"}
+
+    base = '{"kunde":"Berger","stunden":%s,"arbeit":"Steckdose gesetzt","language":"de","is_work_report":true}'
+    res = {
+        "NaN": run(base % "NaN"), "9999": run(base % "9999"), "-3": run(base % "-3"), "text": run(base % '"viel"'),
+        "kunde=123": run('{"kunde":123,"stunden":2,"arbeit":"Steckdose","language":"de","is_work_report":true}'),
+        "kunde=liste": run('{"kunde":["Berger","Wien"],"stunden":2,"arbeit":"Steckdose","language":"de","is_work_report":true}'),
+        "ok": run(base % "2.5"),
+    }
+    bad = {k: v for k, v in res.items() if "exc" in v}
+    absurd_blocked = all(res[k].get("ready_for_pdf") is False and res[k].get("missing_fields") == ["stunden"] for k in ("NaN", "9999", "-3", "text"))
+    numeric_ok = res["kunde=123"].get("ready_for_pdf") is True and res["kunde=liste"].get("kunde") == "Berger, Wien" and res["ok"].get("ready_for_pdf") is True
+    if not bad and absurd_blocked and numeric_ok:
+        ok("Agent: NaN/9999/negative/Text-Stunden -> kein PDF (Nachfrage); Zahl/Liste als Kunde stürzt nicht ab")
+    else:
+        fail("Agent-Typsicherheit unerwartet", str({"exc": bad, "absurd": absurd_blocked, "numeric": numeric_ok}))
+
+    # 29b: Signatur mit Nicht-ASCII-Header -> False statt Exception; Fail-Safe auf Railway auch ohne ENVIRONMENT
+    cfg = m.settings
+    orig = (cfg.whatsapp_app_secret, cfg.environment)
+    try:
+        cfg.whatsapp_app_secret = _FakeSecret("geheim")
+        try:
+            r1 = whatsapp_cloud.verify_signature(b"{}", "sha256=äöü✓")
+        except Exception as exc:
+            r1 = f"EXC {exc}"
+        cfg.whatsapp_app_secret = _FakeSecret("")
+        cfg.environment = "development"
+        with mock.patch.dict("os.environ", {"RAILWAY_ENVIRONMENT_NAME": "production"}):
+            r2 = whatsapp_cloud.verify_signature(b"{}", "")
+        if r1 is False and r2 is False:
+            ok("verify_signature(): Nicht-ASCII-Header -> False (kein 500); auf Railway ohne App Secret abgelehnt, auch wenn ENVIRONMENT fehlt")
+        else:
+            fail("verify_signature() Härtung unerwartet", str((r1, r2)))
+    finally:
+        cfg.whatsapp_app_secret, cfg.environment = orig
+
+    # 29c: Media-Grenzen
+    def fake_get_factory(meta_info, content=b"x"):
+        calls = []
+        def fake_get(url, **kw):
+            calls.append(url)
+            resp = mock.MagicMock()
+            resp.raise_for_status.return_value = None
+            if len(calls) == 1:
+                resp.json.return_value = meta_info
+            else:
+                resp.content = content
+                resp.headers = {"content-type": "audio/ogg"}
+            return resp
+        return fake_get
+    cases = {
+        "http-URL": ({"url": "http://evil/x", "mime_type": "audio/ogg"}, b"x"),
+        "file_size zu groß": ({"url": "https://ok/x", "file_size": 999_999_999, "mime_type": "audio/ogg"}, b"x"),
+        "Inhalt zu groß": ({"url": "https://ok/x", "mime_type": "audio/ogg"}, b"x" * (whatsapp_cloud.MAX_MEDIA_BYTES + 1)),
+    }
+    rejected = 0
+    for name, (meta_info, content) in cases.items():
+        with mock.patch.object(whatsapp_cloud.httpx, "get", side_effect=fake_get_factory(meta_info, content)):
+            try:
+                whatsapp_cloud.download_media("M1")
+            except ValueError:
+                rejected += 1
+    with mock.patch.object(whatsapp_cloud.httpx, "get", side_effect=fake_get_factory({"url": "https://ok/x", "mime_type": "audio/ogg"}, b"okdata")):
+        good = whatsapp_cloud.download_media("M1")[0] == b"okdata"
+    if rejected == 3 and good:
+        ok("download_media(): http-URL, zu große Datei (Angabe und Inhalt) werden abgelehnt, normale Datei geht durch")
+    else:
+        fail("download_media()-Grenzen unerwartet", f"rejected={rejected} good={good}")
+
+    # 29d: Absender-Limit
+    m._sender_hits.clear(); m._sender_warned.clear()
+    t0 = 1_000_000.0
+    results = [m._sender_rate_limited("+43111", t0 + i) for i in range(m._WHATSAPP_MAX_PER_HOUR + 3)]
+    first_over = results[m._WHATSAPP_MAX_PER_HOUR]
+    later_over = results[m._WHATSAPP_MAX_PER_HOUR + 1]
+    other = m._sender_rate_limited("+43222", t0 + 5)
+    after_hour = m._sender_rate_limited("+43111", t0 + 3700)
+    if (not any(r[0] for r in results[: m._WHATSAPP_MAX_PER_HOUR]) and first_over == (True, True)
+            and later_over == (True, False) and other == (False, False) and after_hour == (False, False)):
+        ok("Absender-Limit: 30/Stunde, danach verworfen mit nur EINEM Hinweis; andere Absender und das nächste Fenster unberührt")
+    else:
+        fail("Absender-Limit unerwartet", str((first_over, later_over, other, after_hour)))
+    m._sender_hits.clear(); m._sender_warned.clear()
+
+    # 29e: ready_for_pdf fehlt -> KEIN PDF ("is not True"); PDF wird immer gelöscht; PDF-Lesefehler -> Text geht trotzdem raus
+    sample = {"techniker": "Max", "kunde": "Berger", "stunden": 2, "material": [], "arbeit": "Steckdose", "datum": "25.09.2026", "ready_for_pdf": True}
+
+    class _Agent:
+        def __init__(self, result): self.result = result
+        def process(self, request): return SimpleNamespace(success=True, result=dict(self.result), error=None)
+
+    orig_reg = m._AGENT_REGISTRY
+    docs, texts = [], []
+    def up(data, filename, mime="application/pdf", pid=""): docs.append(filename); return "MID"
+    def sd(to, mid, filename, caption="", pid=""): return True
+    def st(to, text, pid=""): texts.append(text); return True
+    try:
+        with mock.patch.object(whatsapp_cloud, "upload_media", side_effect=up), \
+             mock.patch.object(whatsapp_cloud, "send_document", side_effect=sd), \
+             mock.patch.object(whatsapp_cloud, "send_text", side_effect=st):
+            # (1) Agent ohne ready_for_pdf-Schlüssel
+            m._AGENT_REGISTRY = {"field-worker": _Agent({k: v for k, v in sample.items() if k != "ready_for_pdf"})}
+            asyncio.run(m._process_whatsapp_message(whatsapp_cloud.IncomingMessage("wamid.h1", "+43900000001", "text", text="2h bei Berger")))
+            no_pdf_without_flag = not docs
+            # (2) Erfolg -> lokale PDF-Datei danach weg
+            docs.clear()
+            m._AGENT_REGISTRY = {"field-worker": _Agent(sample)}
+            asyncio.run(m._process_whatsapp_message(whatsapp_cloud.IncomingMessage("wamid.h2", "+43900000002", "text", text="2h bei Berger")))
+            left_after_success = list(m._REPORTS_DIR.glob("*.pdf")) if m._REPORTS_DIR.exists() else []
+            # (3) Upload scheitert -> Text-Fallback UND Datei weg
+            texts.clear()
+            with mock.patch.object(whatsapp_cloud, "upload_media", return_value=None):
+                asyncio.run(m._process_whatsapp_message(whatsapp_cloud.IncomingMessage("wamid.h3", "+43900000003", "text", text="2h bei Berger")))
+            left_after_fail = list(m._REPORTS_DIR.glob("*.pdf")) if m._REPORTS_DIR.exists() else []
+            fallback_text = len(texts) == 1 and "PDF konnte gerade nicht zugestellt" in texts[0]
+            # (4) PDF nicht lesbar -> Text geht trotzdem raus
+            texts.clear()
+            with mock.patch.object(Path, "read_bytes", side_effect=OSError("disk")):
+                asyncio.run(m._process_whatsapp_message(whatsapp_cloud.IncomingMessage("wamid.h4", "+43900000004", "text", text="2h bei Berger")))
+            unreadable_ok = len(texts) == 1
+        if no_pdf_without_flag and not left_after_success and not left_after_fail and fallback_text and unreadable_ok:
+            ok("Verarbeitung: ohne ready_for_pdf kein PDF; lokale PDFs werden immer gelöscht; Versandfehler -> Text statt Stille")
+        else:
+            fail("Verarbeitungs-Härtung unerwartet", str((no_pdf_without_flag, left_after_success, left_after_fail, fallback_text, unreadable_ok)))
+    except Exception:
+        fail("Verarbeitungs-Härtung — Exception")
+        traceback.print_exc()
+    finally:
+        m._AGENT_REGISTRY = orig_reg
+        m._sender_hits.clear(); m._sender_warned.clear()
+        if m._REPORTS_DIR.exists():
+            shutil.rmtree(m._REPORTS_DIR, ignore_errors=True)
+
+    # 29f: Sequenz-Endpoints: negativer Index -> 404; fehlgeschlagener Digest -> 502
+    try:
+        try:
+            asyncio.run(m.sequence_step_result("abc", -1, m.SequenceStepResult()))
+            neg = False
+        except HTTPException as exc:
+            neg = exc.status_code == 404
+        item = {"lead_key": "x", "channel": "email", "day_offset": 3, "due_since": "2026-09-01T00:00:00+00:00", "identifier": "a@b.c"}
+        with mock.patch.object(m.sequence_scheduler, "list_due", return_value=[item]), \
+             mock.patch.object(m.lead_notifier, "send_followup_digest", return_value=False):
+            try:
+                asyncio.run(m.sequences_notify_due())
+                digest = False
+            except HTTPException as exc:
+                digest = exc.status_code == 502
+        with mock.patch.object(m.sequence_scheduler, "list_due", return_value=[]):
+            empty = asyncio.run(m.sequences_notify_due()) == {"count": 0, "email_sent": True}
+        if neg and digest and empty:
+            ok("Sequenz-Endpoints: negativer Schritt-Index -> 404; gescheiterte Digest-Mail -> 502 (Workflow wird rot); nichts fällig -> 200")
+        else:
+            fail("Sequenz-Endpoint-Härtung unerwartet", str((neg, digest, empty)))
+    except Exception:
+        fail("Sequenz-Endpoint-Härtung — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -3095,6 +3289,7 @@ def main() -> int:
     test_demo_sandbox()
     test_followup_digest()
     test_mcp_http_auth()
+    test_hardening_2026_09_25()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

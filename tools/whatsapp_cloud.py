@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -42,6 +43,7 @@ from core.config import normalize_number, settings
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 20.0
+MAX_MEDIA_BYTES = 5 * 1024 * 1024  # eine Minute Sprachnachricht (Opus) sind ~100 KB
 
 
 @dataclass(frozen=True)
@@ -80,7 +82,9 @@ def verify_signature(raw_body: bytes, signature_header: str) -> bool:
     """
     secret = settings.whatsapp_app_secret.get_secret_value()
     if not secret:
-        if settings.is_production:
+        # Auf Railway NIE durchlassen, selbst wenn ENVIRONMENT versehentlich fehlt
+        # (Default "development"): RAILWAY_ENVIRONMENT_NAME setzt die Plattform selbst.
+        if settings.is_production or os.environ.get("RAILWAY_ENVIRONMENT_NAME"):
             logger.error("WhatsApp-Webhook: WHATSAPP_APP_SECRET fehlt in Produktion -- Request abgelehnt")
             return False
         logger.warning("WhatsApp-Webhook: WHATSAPP_APP_SECRET nicht gesetzt -- Signaturprüfung übersprungen (nur lokal)")
@@ -91,7 +95,8 @@ def verify_signature(raw_body: bytes, signature_header: str) -> bool:
         return False
 
     expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature_header[len("sha256="):])
+    # Als bytes vergleichen: compare_digest wirft bei Nicht-ASCII-Strings einen TypeError (-> 500).
+    return hmac.compare_digest(expected.encode("ascii"), signature_header[len("sha256="):].encode("utf-8", "ignore"))
 
 
 def verify_challenge(mode: str, token: str, challenge: str) -> Optional[str]:
@@ -132,12 +137,21 @@ def parse_incoming(payload: dict[str, Any]) -> list[IncomingMessage]:
 def download_media(media_id: str) -> tuple[bytes, str]:
     """Lädt eine Media-Datei (z. B. Sprachnachricht). Wirft bei Fehlern --
     der Aufrufer (main.py) fängt das mit der passenden Fehlermeldung an den
-    Techniker ab. Gibt (Bytes, MIME-Typ) zurück."""
+    Techniker ab. Gibt (Bytes, MIME-Typ) zurück. Begrenzt auf MAX_MEDIA_BYTES und
+    nur über https (die URL kommt aus einer Meta-Antwort, nie ungeprüft von außen)."""
     meta = httpx.get(_graph_url(media_id), headers=_auth_headers(), timeout=_TIMEOUT)
     meta.raise_for_status()
     info = meta.json()
-    resp = httpx.get(info["url"], headers=_auth_headers(), timeout=_TIMEOUT)
+    url = str(info.get("url") or "")
+    if not url.startswith("https://"):
+        raise ValueError("Media-URL ist nicht https")
+    declared = info.get("file_size")
+    if isinstance(declared, int) and declared > MAX_MEDIA_BYTES:
+        raise ValueError(f"Media zu groß ({declared} Bytes)")
+    resp = httpx.get(url, headers=_auth_headers(), timeout=_TIMEOUT)
     resp.raise_for_status()
+    if len(resp.content) > MAX_MEDIA_BYTES:
+        raise ValueError(f"Media zu groß ({len(resp.content)} Bytes)")
     return resp.content, str(info.get("mime_type") or resp.headers.get("content-type", ""))
 
 
