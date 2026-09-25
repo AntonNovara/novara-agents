@@ -3247,6 +3247,116 @@ def test_hardening_2026_09_25() -> None:
         traceback.print_exc()
 
 
+# ── Prospect-Audit ───────────────────────────────────────────────────────────
+
+def test_prospect_audit() -> None:
+    section("TEST — Prospect-Audit: deterministische Checks, Score, SSRF-Schutz")
+    try:
+        from tools import prospect_audit as pa
+
+        good = (
+            '<html><head><title>Elektro Muster Wien - Notdienst 24h</title>'
+            '<meta name="viewport" content="width=device-width">'
+            '<meta name="description" content="Ihr Elektriker in Wien: Installation, Notdienst und Service rund um die Uhr.">'
+            '<script type="application/ld+json">{"@type": "Electrician"}</script></head>'
+            '<body><a href="https://wa.me/4369912345">WhatsApp</a><a href="tel:+43123">Anruf</a>'
+            '<form><input type="email"><textarea></textarea></form><a href="/impressum">Impressum</a>'
+            '<iframe src="https://www.google.com/maps/embed"></iframe></body></html>'
+        )
+        bad = "<html><head></head><body>Hallo</body></html>"
+        good_checks = pa.run_checks("https://a.at", good, 1.0)
+        bad_checks = pa.run_checks("http://a.at", bad, 5.0)
+        gs, bs = pa.compute_score(good_checks), pa.compute_score(bad_checks)
+        if gs == 100 and bs == 0:
+            ok("Vollständige Seite = 100, leere Seite über HTTP/langsam = 0")
+        else:
+            fail("Score unerwartet", f"good={gs}, bad={bs}, failed_good={[c.id for c in good_checks if not c.passed]}")
+
+        res = pa.AuditResult("id", "http://a.at", "http://a.at", "Muster", bs, 5.0, bad_checks)
+        report = pa.render_report_de(res)
+        first_gap = report.split("\n")[3]
+        if "WhatsApp" in first_gap and "Anfragen/Monat" not in report and "nicht geprüft" in report.lower():
+            ok("Bericht: größte Lücke zuerst (WhatsApp), keine erfundenen Anfragen-Zahlen, Testanfrage als 'nicht geprüft'")
+        else:
+            fail("Bericht unerwartet", report)
+
+        blocked = []
+        for raw in ("file:///etc/passwd", "ftp://a.at", "https://user:pw@a.at", ""):
+            try:
+                pa.normalize_url(raw)
+            except pa.AuditFetchError:
+                blocked.append(raw)
+        for host in ("127.0.0.1", "localhost", "169.254.169.254", "10.0.0.5", "192.168.1.1", "::1"):
+            try:
+                pa._assert_public_host(host)
+            except pa.AuditFetchError:
+                blocked.append(host)
+        if len(blocked) == 10:
+            ok("SSRF: file://, ftp://, URL-Credentials, leere URL sowie Loopback/Metadata/Privat-IPs werden blockiert")
+        else:
+            fail("SSRF-Schutz lückenhaft", f"nur blockiert: {blocked}")
+
+        r = pa.run_audit("http://169.254.169.254/latest/meta-data", "Evil")
+        stored = pa.get_audit(r.audit_id)
+        if r.error and r.score == 0 and stored and stored["error"] == r.error:
+            ok("run_audit() auf interne Adresse: Fehler statt Abruf, Ergebnis trotzdem persistiert")
+        else:
+            fail("run_audit() bei blockierter URL unerwartet", str((r.error, stored)))
+    except Exception:
+        fail("Prospect-Audit — Exception")
+        traceback.print_exc()
+
+
+# ── Outbound-Guard ───────────────────────────────────────────────────────────
+
+def test_outbound_guard() -> None:
+    section("TEST — Outbound-Guard: Preise, Platzhalter, Garantien, Opt-out")
+    try:
+        from core.outbound_guard import OPT_OUT_LINE_DE, review_outreach
+
+        clean = f"Hallo Herr Huber,\n\nAnfragen-Starter: €390/Monat + €990 Setup.\n\n{OPT_OUT_LINE_DE}"
+        cases = {
+            "sauber": (clean, True),
+            "erfundener Preis": (clean.replace("€390", "€199"), False),
+            "Platzhalter": (clean + "\n[Demo-Modus] Platzhalter", False),
+            "Garantie": (clean + "\nGarantiert mehr Aufträge!", False),
+            "kein Opt-out": ("Hallo, Anfragen-Starter €390/Monat.", False),
+            "Prompt-Leak": (clean + "\nAs an AI language model", False),
+            "leer": ("", False),
+        }
+        wrong = [n for n, (b, exp) in cases.items() if review_outreach("", b).ok != exp]
+        if not wrong:
+            ok("Guard: sauber = OK; erfundener Preis, Platzhalter, Garantie, fehlender Opt-out, Prompt-Leak, leer = blockiert")
+        else:
+            fail("Guard-Urteil unerwartet", str(wrong))
+
+        from agents.sdr_agent import SDRGraph
+        from tools.lead_database import LeadDatabase
+        from tools.crm_integration import CRMIntegrationSDR
+        from core.llm import build_llm
+
+        class _BadLLM:
+            def invoke(self, _m):
+                from langchain_core.messages import AIMessage
+                return AIMessage(content="SUBJECT: X\n\nGarantiert mehr Aufträge für nur €5!")
+
+        g = SDRGraph(_BadLLM(), LeadDatabase(), CRMIntegrationSDR())
+        state = {
+            "contacts": [{"first_name": "Lena", "last_name": "Koch", "title": "GF"}],
+            "company_name": "Muster", "industry": "Elektro", "company_size": 5,
+            "pain_points": [], "outreach_channel": "email", "language": "de", "session_id": "t-guard",
+        }
+        out = g.compose_outreach(state)
+        if out["outreach_guard_violations"] and "€5" not in out["outreach_text"] and "Kein Interesse" in out["outreach_text"] \
+                and review_outreach(out["outreach_subject"], out["outreach_text"]).ok:
+            ok("compose_outreach(): schlechter LLM-Text wird durch sichere Vorlage ersetzt (Verstoß protokolliert, Ersatz besteht selbst den Guard)")
+        else:
+            fail("compose_outreach() Guard-Integration unerwartet", str(out))
+    except Exception:
+        fail("Outbound-Guard — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -3290,6 +3400,8 @@ def main() -> int:
     test_followup_digest()
     test_mcp_http_auth()
     test_hardening_2026_09_25()
+    test_prospect_audit()
+    test_outbound_guard()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

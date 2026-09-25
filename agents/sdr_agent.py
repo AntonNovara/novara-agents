@@ -67,6 +67,7 @@ from agents.guardian_agent import resilient_node
 from core import consent, customer_state, lead_capture
 from core.config import settings
 from core.knowledge import load_novara_wissen
+from core.outbound_guard import OPT_OUT_LINE_DE, has_opt_out, review_outreach
 from core.llm import build_llm, cached_system_message
 from core.security import SecurityLayer
 from tools import lead_notifier, sequence_scheduler
@@ -246,6 +247,7 @@ class SDRState(TypedDict):
     # set by compose_outreach
     outreach_text: str
     outreach_subject: str   # empty string for linkedin
+    outreach_guard_violations: list[str]  # Verstöße des LLM-Texts (leer = sauber); siehe core/outbound_guard.py
 
     # set by write_to_crm
     crm_result: dict
@@ -562,10 +564,31 @@ class SDRGraph:
         # Nur anhängen, wenn sie nicht schon (wörtlich, vom LLM befolgt) da
         # ist, damit sie nicht doppelt erscheint.
         disclosure = AI_DISCLOSURE_DE.format(client_name=_CLIENT_NAME)
+        if not has_opt_out(body):
+            # Opt-out deterministisch ergänzen (wie die KI-Offenlegung), bevor geprüft wird.
+            body = f"{body}\n\n{OPT_OUT_LINE_DE}"
         if disclosure not in body:
             body = f"{body}\n\n{disclosure}"
 
-        return {**state, "outreach_text": body, "outreach_subject": subject}
+        # Outbound-Guard: harte Geschäftsregeln (echte Preise, keine Platzhalter/
+        # Garantieversprechen, Opt-out). Verstoß -> sichere Vorlage statt LLM-Text.
+        verdict = review_outreach(subject, body)
+        if not verdict.ok:
+            logger.warning(
+                "Outbound-Guard: LLM-Outreach verworfen (%s)", "; ".join(verdict.violations),
+                extra={"session": state["session_id"]},
+            )
+            body = (
+                f"Hallo {top['first_name']},\n\nwir bei Novara Automation helfen "
+                f"{state['industry']}-Betrieben, keine Kundenanfrage mehr zu verpassen.\n\n"
+                f"Hat das für Sie Relevanz?\n\nBeste Grüße\n\n{OPT_OUT_LINE_DE}\n\n{disclosure}"
+            )
+            subject = subject or "Kurze Frage zu Ihren Kundenanfragen"
+
+        return {
+            **state, "outreach_text": body, "outreach_subject": subject,
+            "outreach_guard_violations": verdict.violations,
+        }
 
     # ── Node: write_to_crm ───────────────────────────────────────────────────
     # TODO: icp_tier-Berechnung ist dupliziert mit score_lead(), sollte
@@ -673,6 +696,7 @@ class SDRGraph:
                 "channel": state["outreach_channel"],
                 "subject": state.get("outreach_subject", ""),
                 "message": state["outreach_text"],
+                "guard_violations": state.get("outreach_guard_violations", []),
             },
             "crm": state["crm_result"],
             "sequence": {

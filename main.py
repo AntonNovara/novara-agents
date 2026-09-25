@@ -1408,6 +1408,36 @@ async def sequences_notify_due():
     return {"count": len(due), "email_sent": sent}
 
 
+class ProspectAuditRequest(BaseModel):
+    url: str = Field(..., min_length=3, max_length=2048)
+    company: str = Field("", max_length=255)
+
+
+@app.post("/api/v1/tools/prospect-audit", tags=["Audit"], dependencies=[Depends(require_api_key)])
+async def prospect_audit_run(req: ProspectAuditRequest):
+    """Deterministischer Website-Check eines Prospects (siehe tools/prospect_audit.py).
+    Kein LLM, kein externer Dienst; SSRF-geschützt. Fehler kommen als 200 mit
+    result.error zurück (Betrieb ohne erreichbare Website ist ein valides Ergebnis)."""
+    import asyncio
+
+    from tools import prospect_audit
+
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, prospect_audit.run_audit, req.url, req.company
+    )
+    return {**result.to_dict(), "report_de": prospect_audit.render_report_de(result)}
+
+
+@app.get("/api/v1/tools/prospect-audit/{audit_id}", tags=["Audit"], dependencies=[Depends(require_api_key)])
+async def prospect_audit_get(audit_id: str):
+    from tools import prospect_audit
+
+    found = prospect_audit.get_audit(audit_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="Audit nicht gefunden")
+    return found
+
+
 class SequenceStepResult(BaseModel):
     success: bool = True
     reason: str = "manuell erledigt"
