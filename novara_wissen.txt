@@ -14,7 +14,7 @@ Für wen: Einzelunternehmer & kleine Betriebe, die ihre Erreichbarkeit sofort
 verbessern wollen — ohne großen Aufwand und ohne IT-Vorkenntnisse
 Was: Ein digitaler Rezeptionist beantwortet Anfragen und vergibt Termine
 automatisch, rund um die Uhr.
-Umsetzungszeit: unter 48 Stunden
+Umsetzungszeit: wenige Tage
 Enthalten:
   - Rezeptionist-Agent (beantwortet Anfragen 24/7)
   - Termin-Agent (Terminvergabe direkt in Ihren Kalender)
@@ -34,7 +34,7 @@ Für wen: KMU mit 1-20 Mitarbeitern, die strukturiert wachsen wollen
 Was: Komplette Suite aus 5 KI-Agenten — Rezeption, Dokumentenanalyse,
 Qualifizierung, Terminvergabe und Support. Liest PDF-Angebote und Fotos
 automatisch aus und überwacht sich selbst rund um die Uhr.
-Umsetzungszeit: unter 48 Stunden
+Umsetzungszeit: wenige Tage
 Enthalten:
   - Komplette Suite aus 5 KI-Agenten
   - PDF-Regieberichte direkt per WhatsApp (Techniker schickt Text oder
@@ -453,7 +453,7 @@ Schätzung: 2–5 zusätzliche Anfragen pro Woche, die sonst verloren gegangen w
 
 Investition:
 Anfragen-Starter: €390/Monat + €990 einmaliges Setup (netto, keine USt.)
-Live in unter 48 Stunden.
+Live in wenigen Tagen.
 Garantie: System bei Übergabe voll funktionsfähig, 30 Tage kostenlose Fehlerbehebung.
 
 ================================================================================
