@@ -11,7 +11,11 @@ utils/pdf_generator.py generate_regiebericht() — main.py POST
 
 Workflow (LangGraph StateGraph):
   extract_entities  ← LLM: strukturierte Regiebericht-Felder aus Freitext
-        ↓                   (österreichischer Dialekt/Fachjargon-tolerant)
+        ↓                   (österreichischer Dialekt/Fachjargon-tolerant, jede Sprache)
+  evaluate          ← Code: echte Arbeitsinformation + Pflichtangaben (Tätigkeit,
+        ↓               Kunde, Stunden)? Nur dann ready_for_pdf=True
+  compose_guidance  ← nur wenn KEIN PDF: freundlicher Text in der Sprache des Technikers
+        ↓
   finalize
 """
 from __future__ import annotations
@@ -110,6 +114,12 @@ class FieldWorkerState(TypedDict):
     arbeit: str
     language: str
     confidence_notes: str   # z. B. "Kundenname nicht eindeutig verstanden" -- für main.py, um im Zweifel nachzufragen
+    is_work_report: Optional[bool]   # LLM-Einstufung: beschreibt die Nachricht echte Arbeit? None = unbekannt
+    extraction_failed: bool          # LLM-Aufruf/-Antwort unbrauchbar -> KEIN PDF, Bitte um erneutes Senden
+    missing_fields: list[str]        # fehlende Pflichtangaben (arbeit/kunde/stunden), im Code bestimmt
+    ready_for_pdf: bool              # NUR True, wenn echte Arbeitsinformation mit allen Pflichtangaben vorliegt
+    guidance_type: str               # "" | "greeting" | "missing" | "retry"
+    reply: str                       # Antworttext an den Techniker, wenn KEIN PDF erzeugt wird (in seiner Sprache)
 
     final_result: dict[str, Any]
 
@@ -144,6 +154,9 @@ geht an den Kunden, Dialekt/Umgangssprache gehören NICHT ins fertige Dokument,
 auch wenn die Nachricht selbst so klingt. Erfinde NIEMALS Details (Kundenname,
 Material, Stunden), die nicht in der Nachricht vorkommen oder sich daraus
 eindeutig erschließen lassen — fehlende Angaben bleiben leer/null, nicht geraten.
+Die Nachricht kann in JEDER Sprache kommen (Deutsch, Spanisch, Englisch,
+Türkisch, Serbisch, Rumänisch, Polnisch, ...) -- erkenne die Sprache und extrahiere
+trotzdem alle Felder; eine reine Begrüßung ist KEIN Arbeitsbericht.
 
 Gib AUSSCHLIESSLICH valides JSON zurück (kein Text davor/danach):
 {
@@ -156,13 +169,148 @@ Gib AUSSCHLIESSLICH valides JSON zurück (kein Text davor/danach):
   "material": [Liste von Strings, je ein Material-/Teilenamen, sonst leere Liste],
   "arbeit": string (2-5 Sätze, professionelles Hochdeutsch, sachliche Beschreibung
                     der durchgeführten Tätigkeit — Basis für den Regiebericht),
-  "language": "de" | "en",
+  "language": string (ISO-639-1-Code der Sprache, in der der Techniker geschrieben bzw.
+                    gesprochen hat, z. B. "de", "es", "en", "tr", "sr", "ro", "pl" --
+                    "arbeit" bleibt trotzdem IMMER Hochdeutsch),
+  "is_work_report": true oder false (true NUR, wenn die Nachricht tatsächlich
+                    durchgeführte Arbeit beschreibt. Begrüßungen ("Hallo", "Servus", "hola"),
+                    Danke, Smalltalk, Fragen, Testnachrichten und alles ohne konkrete
+                    Arbeitsinformation sind false -- dann "arbeit" leer lassen),
   "confidence_notes": string (kurzer Hinweis auf unsichere/geschätzte/fehlende
                     Angaben, z.B. "Stundenzahl geschätzt, nicht explizit genannt"
                     oder "Kundenname nicht erwähnt" — leerer String, wenn alles
                     eindeutig war)
 }
 """
+
+
+_SYSTEM_GUIDANCE = """\
+Du bist der freundliche WhatsApp-Assistent von Novara Automation für Handwerker
+und Techniker auf Baustellen in Österreich. Aus einer Text- oder Sprachnachricht
+erstellst du automatisch einen Regiebericht (Arbeitsnachweis) als PDF.
+
+Schreibe jetzt eine KURZE, freundliche Antwort (höchstens 4 Sätze) an den
+Techniker -- in DERSELBEN Sprache, in der er geschrieben bzw. gesprochen hat
+(Sprachcode steht in der Anfrage). Nur der Antworttext als Freitext, KEIN JSON, kein
+Markdown, keine Überschriften. Ein bis zwei passende Emojis sind erlaubt.
+
+Die Anfrage nennt die Situation:
+- GREETING: Begrüßung, Danke, Smalltalk oder eine Frage ohne Arbeitsinformation.
+  Erwidere die Begrüßung kurz, erkläre in einem Satz, dass du aus einer Text- oder
+  Sprachnachricht einen Regiebericht erstellst, und gib EIN kurzes Beispiel in
+  seiner Sprache, was er schicken soll (Kunde/Baustelle, Arbeitsstunden,
+  durchgeführte Arbeit, ggf. Material).
+- MISSING: Es wurde Arbeit beschrieben, aber Pflichtangaben fehlen. Bedanke dich
+  kurz, sage, dass der Bericht noch NICHT erstellt wurde, und bitte NUR um die
+  genannten fehlenden Angaben.
+
+Regeln: erfinde nichts, behaupte nie, ein PDF sei erstellt worden, keine Preise,
+keine Versprechen über Fristen.
+"""
+
+_FIELD_LABELS: dict[str, dict[str, str]] = {
+    "de": {"arbeit": "die durchgeführte Arbeit", "kunde": "den Kunden bzw. die Baustelle", "stunden": "die Arbeitsstunden"},
+    "es": {"arbeit": "el trabajo realizado", "kunde": "el cliente o la obra", "stunden": "las horas trabajadas"},
+    "en": {"arbeit": "the work performed", "kunde": "the customer or site", "stunden": "the hours worked"},
+}
+
+_TEMPLATES: dict[str, dict[str, str]] = {
+    "de": {
+        "greeting": (
+            "Hallo! \U0001f44b Ich bin der Novara-Assistent für Regieberichte. Schick mir einfach kurz, was du "
+            "heute gemacht hast -- als Text oder Sprachnachricht. Zum Beispiel: \"Heute 2 Stunden bei Familie "
+            "Berger, Verteilerkasten getauscht, 1 FI-Schalter.\" Ich erstelle daraus dein PDF."
+        ),
+        "missing": (
+            "Danke! Damit ich deinen Regiebericht erstellen kann, fehlt mir noch: {missing}. "
+            "Schick mir das bitte kurz als Text oder Sprachnachricht."
+        ),
+        "retry": (
+            "Entschuldigung, ich konnte deine Nachricht gerade nicht auswerten. "
+            "Bitte schick sie in ein paar Minuten noch einmal."
+        ),
+    },
+    "es": {
+        "greeting": (
+            "¡Hola! \U0001f44b Soy el asistente de Novara para partes de trabajo. Cuéntame brevemente qué has hecho "
+            "hoy, por texto o nota de voz. Por ejemplo: \"Hoy 2 horas en casa de la familia Berger, cambié el "
+            "cuadro eléctrico, 1 diferencial.\" Con eso te preparo el PDF."
+        ),
+        "missing": (
+            "¡Gracias! Para poder crear tu parte de trabajo me falta: {missing}. "
+            "Envíamelo por favor, por texto o nota de voz."
+        ),
+        "retry": (
+            "Lo siento, no he podido procesar tu mensaje ahora mismo. "
+            "Por favor, vuelve a enviarlo en unos minutos."
+        ),
+    },
+    "en": {
+        "greeting": (
+            "Hello! \U0001f44b I'm Novara's assistant for work reports. Just tell me briefly what you did today, "
+            "as text or a voice message. For example: \"Today 2 hours at the Berger house, replaced the "
+            "distribution board, 1 RCD.\" I'll turn it into your PDF."
+        ),
+        "missing": (
+            "Thanks! To create your work report I still need: {missing}. "
+            "Please send it as text or a voice message."
+        ),
+        "retry": (
+            "Sorry, I couldn't process your message just now. "
+            "Please send it again in a few minutes."
+        ),
+    },
+}
+
+_STOPWORDS: dict[str, set[str]] = {
+    "es": {"hola", "que", "qué", "el", "la", "los", "las", "un", "una", "hoy", "para", "por", "con", "de", "del",
+           "gracias", "buenas", "buenos", "días", "dias", "tardes", "horas", "trabajo", "cliente", "estoy", "he"},
+    "en": {"hello", "hi", "hey", "the", "and", "today", "for", "with", "hours", "work", "thanks", "thank", "you",
+           "customer", "did", "have", "was", "at"},
+    "de": {"hallo", "servus", "griaß", "moin", "der", "die", "das", "und", "heute", "für", "mit", "stunden", "arbeit",
+           "danke", "kunde", "hab", "habe", "bei", "ich", "ist", "nicht"},
+}
+
+
+def _guess_language(text: str) -> str:
+    """Grobe, rein lokale Spracherkennung (de/es/en) für die Fallback-Vorlagen,
+    wenn das LLM keine brauchbare Sprache geliefert hat. Standard: Deutsch."""
+    words = re.findall(r"[a-zA-ZäöüÄÖÜßáéíóúñÁÉÍÓÚÑ]+", (text or "").lower())
+    scores = {lang: sum(1 for w in words if w in vocab) for lang, vocab in _STOPWORDS.items()}
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else "de"
+
+
+def _normalize_language(code: Any, text: str) -> str:
+    """ISO-639-1-Kleinbuchstaben-Code aus der LLM-Angabe, sonst lokale Schätzung."""
+    if isinstance(code, str):
+        c = code.strip().lower()[:2]
+        if len(c) == 2 and c.isalpha():
+            return c
+    return _guess_language(text)
+
+
+def _template_reply(kind: str, language: str, missing: list[str]) -> str:
+    lang = language if language in _TEMPLATES else "de"
+    labels = _FIELD_LABELS[lang]
+    missing_text = ", ".join(labels[m] for m in missing if m in labels)
+    return _TEMPLATES[lang][kind].format(missing=missing_text)
+
+
+_KEY_FIELDS = ("arbeit", "kunde", "stunden")
+
+
+def _missing_key_fields(state: "FieldWorkerState") -> list[str]:
+    """Pflichtangaben für einen Regiebericht: Tätigkeit, Kunde/Baustelle, Stunden."""
+    missing: list[str] = []
+    if not (state.get("arbeit") or "").strip():
+        missing.append("arbeit")
+    if not (state.get("kunde") or "").strip():
+        missing.append("kunde")
+    hours = state.get("stunden")
+    if hours is None or hours <= 0:
+        missing.append("stunden")
+    return missing
 
 
 # ── Graph ──────────────────────────────────────────────────────────────────────
@@ -188,6 +336,8 @@ class FieldWorkerGraph:
             "arbeit": state["input_text"][:500],
             "language": "de",
             "confidence_notes": "LLM-Extraktion fehlgeschlagen — Rohtext als Arbeitsbeschreibung übernommen.",
+            "is_work_report": None,
+            "extraction_failed": True,
         }
 
         try:
@@ -200,7 +350,7 @@ class FieldWorkerGraph:
             # kein Antworttext zu retten, siehe agents/sdr_agent.py
             # receptionist_node() für dieselbe zweistufige Philosophie.
             logger.warning("extract_entities: LLM-Aufruf fehlgeschlagen: %s", exc)
-            return {**state, **defaults}
+            return {**state, **defaults, "language": _guess_language(state["input_text"])}
 
         try:
             data = _parse_llm_json(response.content)
@@ -212,7 +362,7 @@ class FieldWorkerGraph:
             logger.warning(
                 "extract_entities: LLM-Antwort war kein valides JSON, nutze Rohtext: %s", exc
             )
-            return {**state, **defaults}
+            return {**state, **defaults, "language": _guess_language(state["input_text"])}
 
         material = data.get("material")
         if not isinstance(material, list):
@@ -231,15 +381,70 @@ class FieldWorkerGraph:
             "datum": data.get("datum") or defaults["datum"],
             "stunden": stunden,
             "material": [str(m) for m in material if str(m).strip()],
-            "arbeit": data.get("arbeit") or defaults["arbeit"],
-            "language": data.get("language") or defaults["language"],
+            # KEIN Rohtext-Fallback bei erfolgreicher Extraktion: ein leeres "arbeit"
+            # heißt "keine Arbeitsinformation" (z. B. ein Gruß) und darf nicht mit der
+            # Originalnachricht ("hola") aufgefüllt werden, sonst gälte sie als Arbeit.
+            "arbeit": str(data.get("arbeit") or "").strip(),
+            "language": _normalize_language(data.get("language"), state["input_text"]),
             "confidence_notes": data.get("confidence_notes", ""),
+            "is_work_report": data.get("is_work_report") if isinstance(data.get("is_work_report"), bool) else None,
+            "extraction_failed": False,
         }
+
+    # ── Node: evaluate ───────────────────────────────────────────────────────
+    # Deterministische Entscheidung IM CODE (nicht im LLM): ein PDF entsteht nur
+    # bei echter Arbeitsinformation MIT allen Pflichtangaben. Alles andere
+    # (Gruß, Smalltalk, unvollständige Angaben, Extraktionsfehler) bekommt
+    # ausschließlich einen freundlichen Text in der Sprache des Technikers.
+
+    def evaluate(self, state: FieldWorkerState) -> FieldWorkerState:
+        if state["extraction_failed"]:
+            return {**state, "ready_for_pdf": False, "missing_fields": [], "guidance_type": "retry"}
+        if state["is_work_report"] is False:
+            return {**state, "ready_for_pdf": False, "missing_fields": [], "guidance_type": "greeting"}
+        missing = _missing_key_fields(state)
+        if missing:
+            # Nichts Verwertbares an Arbeit genannt (z. B. LLM ohne Einstufung, aber alles leer)
+            # ist inhaltlich ein Gruß, keine "unvollständige Meldung".
+            kind = "greeting" if set(missing) == set(_KEY_FIELDS) else "missing"
+            return {**state, "ready_for_pdf": False, "missing_fields": missing if kind == "missing" else [], "guidance_type": kind}
+        return {**state, "ready_for_pdf": True, "missing_fields": [], "guidance_type": ""}
+
+    @staticmethod
+    def _route_after_evaluate(state: FieldWorkerState) -> str:
+        return "compose_guidance" if state["guidance_type"] in ("greeting", "missing") else "finalize"
+
+    # ── Node: compose_guidance ───────────────────────────────────────────────
+
+    def compose_guidance(self, state: FieldWorkerState) -> FieldWorkerState:
+        logger.info("Node: compose_guidance", extra={"session": state["session_id"], "type": state["guidance_type"]})
+        kind = state["guidance_type"]
+        lang = state["language"]
+        situation = "GREETING" if kind == "greeting" else "MISSING"
+        request = f"Sprachcode: {lang}\nSituation: {situation}\n"
+        if kind == "missing":
+            labels = _FIELD_LABELS["en"]
+            request += "Fehlende Angaben: " + ", ".join(labels[m] for m in state["missing_fields"]) + "\n"
+        request += f"Nachricht des Technikers: {state['input_text'][:500]}"
+
+        reply = ""
+        try:
+            response = self._llm.invoke([cached_system_message(_SYSTEM_GUIDANCE), HumanMessage(content=request)])
+            reply = str(response.content or "").strip()[:700]
+        except Exception as exc:
+            logger.warning("compose_guidance: LLM-Aufruf fehlgeschlagen, nutze Vorlage: %s", exc)
+        if not reply:
+            reply = _template_reply(kind, lang, state["missing_fields"])
+        return {**state, "reply": reply}
 
     # ── Node: finalize ───────────────────────────────────────────────────────
 
     def finalize(self, state: FieldWorkerState) -> FieldWorkerState:
         logger.info("Node: finalize", extra={"session": state["session_id"]})
+
+        reply = state["reply"]
+        if not state["ready_for_pdf"] and not reply:
+            reply = _template_reply(state["guidance_type"] or "retry", state["language"], state["missing_fields"])
 
         # Struktur passt bewusst 1:1 auf utils/pdf_generator.py
         # generate_regiebericht()s erwartetes data-dict -- main.py reicht
@@ -254,6 +459,11 @@ class FieldWorkerGraph:
             "language": state["language"],
             "confidence_notes": state["confidence_notes"],
             "vollstaendig": bool(state["techniker"] and state["kunde"] and state["arbeit"]),
+            "is_work_report": state["is_work_report"],
+            "ready_for_pdf": state["ready_for_pdf"],
+            "missing_fields": state["missing_fields"],
+            "guidance_type": state["guidance_type"],
+            "reply": reply,
         }
         return {**state, "final_result": final}
 
@@ -262,10 +472,17 @@ class FieldWorkerGraph:
     def _build_graph(self):
         graph = StateGraph(FieldWorkerState)
         graph.add_node("extract_entities", self.extract_entities)
+        graph.add_node("evaluate", self.evaluate)
+        graph.add_node("compose_guidance", self.compose_guidance)
         graph.add_node("finalize", self.finalize)
 
         graph.set_entry_point("extract_entities")
-        graph.add_edge("extract_entities", "finalize")
+        graph.add_edge("extract_entities", "evaluate")
+        graph.add_conditional_edges(
+            "evaluate", self._route_after_evaluate,
+            {"compose_guidance": "compose_guidance", "finalize": "finalize"},
+        )
+        graph.add_edge("compose_guidance", "finalize")
         graph.add_edge("finalize", END)
 
         return graph.compile()
@@ -282,6 +499,12 @@ class FieldWorkerGraph:
             "arbeit": "",
             "language": "de",
             "confidence_notes": "",
+            "is_work_report": None,
+            "extraction_failed": False,
+            "missing_fields": [],
+            "ready_for_pdf": False,
+            "guidance_type": "",
+            "reply": "",
             "final_result": {},
         }
         return self._graph.invoke(initial)["final_result"]

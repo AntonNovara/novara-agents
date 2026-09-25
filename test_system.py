@@ -2366,7 +2366,7 @@ def test_field_worker_agent(live: bool) -> None:
     valid_json = (
         '{"techniker": "Markus", "kunde": "Familie Gruber, Hietzing", "datum": "19.09.2026", '
         '"stunden": 3.5, "material": ["FI-Schalter", "Kabel"], '
-        '"arbeit": "FI-Schalter getauscht.", "language": "de", "confidence_notes": ""}'
+        '"arbeit": "FI-Schalter getauscht.", "language": "de", "is_work_report": true, "confidence_notes": ""}'
     )
     graph = FieldWorkerGraph(llm=_FakeLLM(valid_json))
     result = graph.run(input_text="Oida, hob heit den FI bei da Gruber gwechselt.", session_id="fw-test-1")
@@ -2375,8 +2375,9 @@ def test_field_worker_agent(live: bool) -> None:
         and result.get("stunden") == 3.5
         and result.get("material") == ["FI-Schalter", "Kabel"]
         and result.get("vollstaendig") is True
+        and result.get("ready_for_pdf") is True
     ):
-        ok("extract_entities() übernimmt alle Felder korrekt aus valider LLM-JSON-Antwort", str(result))
+        ok("extract_entities() übernimmt alle Felder korrekt aus valider LLM-JSON-Antwort, ready_for_pdf=True", str(result))
     else:
         fail("extract_entities() (valides JSON) unerwartetes Ergebnis", str(result))
 
@@ -2384,8 +2385,13 @@ def test_field_worker_agent(live: bool) -> None:
     graph_broken = FieldWorkerGraph(llm=_BrokenLLM())
     try:
         result_broken = graph_broken.run(input_text="Testnachricht", session_id="fw-test-2")
-        if result_broken.get("vollstaendig") is False and result_broken.get("arbeit"):
-            ok("extract_entities() fällt bei LLM-Aufruf-Fehler graceful auf Platzhalter zurück, keine Exception")
+        if (
+            result_broken.get("vollstaendig") is False
+            and result_broken.get("ready_for_pdf") is False
+            and result_broken.get("guidance_type") == "retry"
+            and result_broken.get("reply")
+        ):
+            ok("LLM-Aufruf-Fehler: keine Exception, KEIN PDF, Bitte um erneutes Senden statt Rohtext-Bericht")
         else:
             fail("extract_entities() (LLM-Fehler) unerwartetes Ergebnis", str(result_broken))
     except Exception as exc:
@@ -2395,12 +2401,91 @@ def test_field_worker_agent(live: bool) -> None:
     graph_plain = FieldWorkerGraph(llm=_FakeLLM("Passt scho, hob heit nix Besonderes gmacht."))
     try:
         result_plain = graph_plain.run(input_text="Testnachricht 2", session_id="fw-test-3")
-        if result_plain.get("arbeit") and result_plain.get("vollstaendig") is False:
-            ok("extract_entities() nutzt bei nicht-JSON-LLM-Antwort den Rohtext statt die Nachricht zu verwerfen")
+        if result_plain.get("ready_for_pdf") is False and result_plain.get("guidance_type") == "retry" and result_plain.get("reply"):
+            ok("Nicht-JSON-LLM-Antwort: kein PDF aus Rohtext, stattdessen Bitte um erneutes Senden")
         else:
             fail("extract_entities() (Nicht-JSON-Antwort) unerwartetes Ergebnis", str(result_plain))
     except Exception as exc:
         fail("extract_entities() (Nicht-JSON-Antwort) hat eine Exception propagiert", str(exc))
+
+    # 24e-i: PDF nur bei echter Arbeitsinformation; sonst Text in der Sprache des Technikers.
+    class _RoutingLLM:
+        """Antwortet auf den Extraktions-Prompt mit JSON und auf den Guidance-Prompt mit Freitext."""
+
+        def __init__(self, extraction_json: str, guidance_text: str = "") -> None:
+            self._json = extraction_json
+            self._text = guidance_text
+            self.guidance_calls = 0
+            self.last_request = ""
+
+        def invoke(self, messages):
+            system = str(messages[0].content)
+            if "KEIN JSON" in system:
+                self.guidance_calls += 1
+                self.last_request = str(messages[1].content)
+                if not self._text:
+                    raise RuntimeError("Guidance-LLM nicht verfügbar")
+                return _FakeResponse(self._text)
+            return _FakeResponse(self._json)
+
+    # 24e: Gruß auf Spanisch -> kein PDF, Antwort in seiner Sprache (LLM-Text wird durchgereicht)
+    llm_hola = _RoutingLLM(
+        '{"techniker":"","kunde":"","datum":"","stunden":null,"material":[],"arbeit":"","language":"es","is_work_report":false,"confidence_notes":""}',
+        "¡Hola! Cuéntame qué trabajo has hecho hoy y te preparo el parte.",
+    )
+    r = FieldWorkerGraph(llm=llm_hola).run(input_text="hola", session_id="fw-e")
+    if (
+        r["ready_for_pdf"] is False and r["guidance_type"] == "greeting" and r["language"] == "es"
+        and r["reply"].startswith("¡Hola!") and llm_hola.guidance_calls == 1 and "Sprachcode: es" in llm_hola.last_request
+    ):
+        ok("Gruß (\"hola\"): KEIN PDF, freundlicher Text auf Spanisch, Sprachcode ans LLM übergeben")
+    else:
+        fail("Gruß-Fall unerwartet", str(r))
+
+    # 24f: Guidance-LLM fällt aus -> Vorlage in der erkannten Sprache (es / en / de)
+    outcomes = {}
+    for lang, greeting in (("es", "hola"), ("en", "hello"), ("de", "servus")):
+        llm = _RoutingLLM(
+            '{"kunde":"","stunden":null,"material":[],"arbeit":"","language":"%s","is_work_report":false}' % lang
+        )
+        outcomes[lang] = FieldWorkerGraph(llm=llm).run(input_text=greeting, session_id="fw-f")["reply"]
+    if "Soy el asistente" in outcomes["es"] and "I'm Novara" in outcomes["en"] and "Ich bin der Novara" in outcomes["de"]:
+        ok("Fallback-Vorlagen: Gruß wird ohne Guidance-LLM auf Spanisch/Englisch/Deutsch beantwortet")
+    else:
+        fail("Fallback-Vorlagen unerwartet", str(outcomes))
+
+    # 24g: Arbeit genannt, aber Kunde fehlt -> kein PDF, fragt NUR nach dem Fehlenden
+    llm_missing = _RoutingLLM(
+        '{"techniker":"","kunde":"","datum":"","stunden":2,"material":[],"arbeit":"Verteilerkasten getauscht.","language":"es","is_work_report":true}'
+    )
+    r = FieldWorkerGraph(llm=llm_missing).run(input_text="Hoy 2 horas cambié un cuadro eléctrico", session_id="fw-g")
+    if (
+        r["ready_for_pdf"] is False and r["guidance_type"] == "missing" and r["missing_fields"] == ["kunde"]
+        and "el cliente o la obra" in r["reply"] and "horas" not in r["reply"].split("me falta:")[-1]
+    ):
+        ok("Kunde fehlt: KEIN PDF, Nachfrage NUR nach dem Kunden, auf Spanisch (Vorlage)")
+    else:
+        fail("Fehlende-Angaben-Fall unerwartet", str(r))
+
+    # 24h: Stunden fehlen; Stunden = 0 zählt ebenfalls als fehlend
+    for hours in ("null", "0"):
+        llm = _RoutingLLM(
+            '{"kunde":"Familie Berger","stunden":%s,"material":[],"arbeit":"Steckdose gesetzt.","language":"de","is_work_report":true}' % hours
+        )
+        r = FieldWorkerGraph(llm=llm).run(input_text="Bei Berger Steckdose gesetzt", session_id="fw-h")
+        if not (r["ready_for_pdf"] is False and r["missing_fields"] == ["stunden"] and "die Arbeitsstunden" in r["reply"]):
+            fail(f"Fehlende Stunden (stunden={hours}) unerwartet", str(r))
+            break
+    else:
+        ok("Fehlende bzw. 0 Arbeitsstunden: kein PDF, Nachfrage nach den Stunden")
+
+    # 24i: LLM stuft nichts ein, aber alles leer -> wie ein Gruß, kein PDF; Extraktionsfehler auf Spanisch geschätzt
+    r = FieldWorkerGraph(llm=_RoutingLLM('{"kunde":"","stunden":null,"material":[],"arbeit":""}')).run(input_text="ok", session_id="fw-i")
+    r2 = FieldWorkerGraph(llm=_BrokenLLM()).run(input_text="hola gracias, buenos días", session_id="fw-i2")
+    if r["ready_for_pdf"] is False and r["guidance_type"] == "greeting" and r2["guidance_type"] == "retry" and "Lo siento" in r2["reply"]:
+        ok("Leere Extraktion = Gruß (kein PDF); Extraktionsfehler -> Bitte um erneutes Senden in erkannter Sprache (es)")
+    else:
+        fail("Leere Extraktion / Fehler-Sprache unerwartet", str((r, r2)))
 
     # 24d: voller Durchlauf mit echtem LLM (österreichischer Dialekt/Fachjargon).
     if not live:
@@ -2719,7 +2804,7 @@ def test_demo_sandbox() -> None:
     # 26d: voller Durchlauf _process_whatsapp_message (Stub-Agent, kein LLM, gemockter Versand).
     class _StubAgent:
         def process(self, request):
-            return SimpleNamespace(success=True, result=dict(sample), error=None)
+            return SimpleNamespace(success=True, result=dict(sample, ready_for_pdf=True), error=None)
 
     original_registry = main_module._AGENT_REGISTRY
     original_log_fn = main_module.log_demo_lead
@@ -2768,24 +2853,28 @@ def test_demo_sandbox() -> None:
         else:
             fail("Demo-Durchlauf unerwartet", f"docs={docs} log_calls={[c[1] for c in log_calls]} texts={texts}")
 
-        # (3b) Begrüßung ohne Berichtsdaten -> Hilfetext, kein leeres PDF
-        class _EmptyAgent:
+        # (3b) Gruß/unvollständig -> nur Text des Agenten (in der Sprache des Technikers), kein PDF, kein Sheet-Log
+        class _GuidanceAgent:
             def process(self, request):
-                return SimpleNamespace(success=True, result={"techniker": None, "kunde": None, "stunden": None, "material": None, "arbeit": None}, error=None)
+                return SimpleNamespace(success=True, error=None, result={
+                    "ready_for_pdf": False, "guidance_type": "greeting", "language": "es",
+                    "missing_fields": [], "reply": "¡Hola! Cuéntame qué trabajo has hecho hoy.",
+                })
 
         texts.clear()
         docs.clear()
-        main_module._AGENT_REGISTRY = {"field-worker": _EmptyAgent()}
+        log_calls.clear()
+        main_module._AGENT_REGISTRY = {"field-worker": _GuidanceAgent()}
         with mock.patch.object(whatsapp_cloud, "upload_media", side_effect=fake_upload), \
              mock.patch.object(whatsapp_cloud, "send_document", side_effect=fake_send_doc), \
              mock.patch.object(whatsapp_cloud, "send_text", side_effect=lambda to, text, pid="": texts.append((to, text)) or True):
             asyncio.run(main_module._process_whatsapp_message(
-                whatsapp_cloud.IncomingMessage("wamid.G", "+436607778899", "text", text="hola")))
+                whatsapp_cloud.IncomingMessage("wamid.G", "+4917632320243", "text", text="hola")))
         main_module._AGENT_REGISTRY = {"field-worker": _StubAgent()}
-        if len(texts) == 1 and "Regiebericht" in texts[0][1] and not docs:
-            ok("Begrüßung ohne Berichtsdaten (\"hola\") -> Hilfetext per WhatsApp, kein leeres PDF")
+        if texts == [("+4917632320243", "¡Hola! Cuéntame qué trabajo has hecho hoy.")] and not docs and not log_calls:
+            ok("Gruß (\"hola\"): nur der Antworttext des Agenten (Spanisch), KEIN PDF und KEIN Demo-Sheet-Eintrag")
         else:
-            fail("Begrüßungs-Fallback unerwartet", f"texts={texts} docs={docs}")
+            fail("Gruß-Pfad unerwartet", f"texts={texts} docs={docs} log={log_calls}")
 
         # (4) PDF-Upload schlägt fehl -> Text-Fallback statt Stille
         texts.clear()

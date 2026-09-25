@@ -1211,17 +1211,17 @@ async def _process_whatsapp_message(msg: whatsapp_cloud.IncomingMessage) -> None
         log.info("[STEP 3] Procesamiento de FieldWorkerAgent completado", frm=msg.sender)
         data = agent_response.result
 
-        # Ein "Hallo" oder eine Frage enthält keinen Arbeitsbericht: statt eines
-        # leeren PDFs eine kurze Anleitung schicken.
-        if not any(data.get(k) for k in ("kunde", "stunden", "arbeit", "material")):
-            log.info("[STEP 3b] Keine Berichtsdaten erkannt -- Hilfetext statt leerem PDF", frm=msg.sender)
-            await _whatsapp_reply(
-                msg,
-                "Hallo! Ich bin der Novara-Assistent für Regieberichte. Schick mir einfach kurz, was du heute "
-                "gemacht hast -- als Text oder Sprachnachricht. Zum Beispiel:\n"
-                "\"Heute 2 Stunden bei Familie Berger, Verteilerkasten getauscht, 1 FI-Schalter.\"\n"
-                "Ich erstelle daraus automatisch deinen Regiebericht als PDF." + audio_note,
+        # Ein PDF entsteht NUR bei echter Arbeitsinformation mit allen Pflichtangaben
+        # (Tätigkeit, Kunde/Baustelle, Stunden) -- die Entscheidung trifft der
+        # Agent deterministisch im Code (agents/field_worker_agent.py evaluate()).
+        # Sonst: ausschließlich ein freundlicher Text in der Sprache des Technikers.
+        if data.get("ready_for_pdf") is False:
+            log.info(
+                "[STEP 3b] Kein PDF -- Antworttext statt Bericht",
+                frm=msg.sender, guidance=data.get("guidance_type"), missing=data.get("missing_fields"),
+                language=data.get("language"),
             )
+            await _whatsapp_reply(msg, (data.get("reply") or "").strip() or "Hallo! Schick mir bitte kurz, was du heute gemacht hast.")
             return
 
         try:
