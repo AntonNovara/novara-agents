@@ -73,6 +73,7 @@ from core.security import SecurityLayer
 from tools import lead_notifier, sequence_scheduler
 from tools.crm_integration import CRMIntegrationSDR, LeadRecord
 from tools.document_parser import DocumentParser
+from tools import prospect_audit
 from tools.lead_database import LeadDatabase, LeadSearchResult, ProspectContact
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,40 @@ _CLIENT_NAME = "Novara Automation"
 
 # Wissensdatenbank einmalig laden
 _WISSEN = load_novara_wissen()
+
+# Website des Prospects im Eingabetext: vollständige URL, www.-Adresse oder nackte Domain
+# (.at/.com/.de/.wien/.eu). Nicht direkt nach "@"/Wortzeichen, damit E-Mail-Adressen
+# ("office@elektro-huber.at") nicht als Website gelten. Bewusst per Regex, nicht per LLM:
+# das Ergebnis wird abgerufen -- ein halluzinierter Host wäre ein falscher Audit.
+_WEBSITE_RE = re.compile(
+    r"(?<![@\w.\-])((?:https?://)?(?:www\.)?[a-z0-9][a-z0-9\-]*(?:\.[a-z0-9\-]+)*\.(?:at|com|de|wien|eu)\b(?:/[^\s<>\"',)]*)?)",
+    re.IGNORECASE,
+)
+
+
+def _find_website(text: str) -> str:
+    for m in _WEBSITE_RE.finditer(text or ""):
+        url = m.group(1).rstrip(".,;:")
+        if url.lower().startswith(("http://", "https://")) or "." in url:
+            return url
+    return ""
+
+
+def _audit_context(audit: dict) -> str:
+    """Faktenblock für den Outreach-Prompt. Nur verifizierte Ergebnisse, keine Verlustzahlen."""
+    gaps = sorted((c for c in audit.get("checks", []) if not c["passed"]), key=lambda c: -c["weight"])[:2]
+    if not gaps:
+        return ""
+    lines = "; ".join(f"{g['label']} ({g['hint'].split(' -- ')[0].split(':')[0]})" for g in gaps)
+    return (
+        f"Website-Check (automatisch geprüft, {audit['final_url']}, Score {audit['score']}/100). "
+        f"Größte Lücken: {lines}.\n"
+        "Der Check liest nur den HTML-Quelltext (kein JavaScript) und kann sich irren. Erwähne "
+        "HÖCHSTENS EINE dieser Lücken, vorsichtig formuliert (z. B. 'ich konnte auf Ihrer Website "
+        "keinen ... finden', NIE 'Ihre Website hat keinen ...'), freundlich, ohne Zahlen zu "
+        "Verlusten und ohne weitere Aussagen über die Website.\n"
+    )
+
 
 # Anrede in der ersten Zeile ("Hallo Thomas,", "Sehr geehrter Herr Huber," ...). Nur für
 # LLM-erfundene Kontakte (contact_source == "generated") relevant: ein erfundener Name
@@ -268,6 +303,10 @@ class SDRState(TypedDict):
     consent_allowed: bool
     consent_identifier: str
     consent_reason: str
+
+    # set by audit_prospect (leer, wenn keine Website im Input oder Audit fehlgeschlagen)
+    website_url: str
+    audit: dict
 
     # set by compose_outreach
     outreach_text: str
@@ -549,6 +588,25 @@ class SDRGraph:
             "consent_reason": reason,
         }
 
+    # ── Node: audit_prospect ─────────────────────────────────────────────────
+    # Nur für qualifizierte, einwilligungsfähige Leads (läuft nach check_consent):
+    # keine Webseiten-Abrufe für verworfene Leads. Nie blockierend.
+
+    def audit_prospect(self, state: SDRState) -> SDRState:
+        logger.info("Node: audit_prospect", extra={"session": state["session_id"]})
+        url = _find_website(state["input_text"])
+        if not url:
+            return {**state, "website_url": "", "audit": {}}
+        try:
+            result = prospect_audit.run_audit(url, state["company_name"])
+        except Exception as exc:  # run_audit fängt selbst, aber dieser Node darf nie den Lauf abbrechen
+            logger.warning("audit_prospect fehlgeschlagen: %s", exc)
+            return {**state, "website_url": url, "audit": {}}
+        if result.error:
+            logger.info("audit_prospect ohne Ergebnis (%s)", result.error)
+            return {**state, "website_url": url, "audit": {"error": result.error, "audit_id": result.audit_id}}
+        return {**state, "website_url": url, "audit": result.to_dict()}
+
     # ── Node: compose_outreach ───────────────────────────────────────────────
 
     def compose_outreach(self, state: SDRState) -> SDRState:
@@ -576,6 +634,7 @@ class SDRGraph:
             f"Company size: ~{state['company_size'] or 'unknown'} employees\n"
             f"Pain points: {', '.join(state['pain_points']) or 'not specified'}\n"
             f"Channel: {channel}\n"
+            + _audit_context(state.get("audit") or {})
         )
 
         try:
@@ -738,6 +797,11 @@ class SDRGraph:
                 "message": state["outreach_text"],
                 "guard_violations": state.get("outreach_guard_violations", []),
             },
+            "website_audit": (
+                {"url": state.get("website_url", ""), "score": state["audit"].get("score"),
+                 "audit_id": state["audit"].get("audit_id"), "error": state["audit"].get("error", "")}
+                if state.get("audit") else {}
+            ),
             "crm": state["crm_result"],
             "sequence": {
                 "sequence_id": sequence.sequence_id,
@@ -838,6 +902,7 @@ class SDRGraph:
         graph.add_node("search_leads", self.search_leads)
         graph.add_node("score_lead", self.score_lead)
         graph.add_node("check_consent", self.check_consent)
+        graph.add_node("audit_prospect", self.audit_prospect)
         graph.add_node("compose_outreach", self.compose_outreach)
         graph.add_node("write_to_crm", self.write_to_crm)
         graph.add_node("schedule_sequence", self.schedule_sequence)
@@ -861,10 +926,11 @@ class SDRGraph:
             "check_consent",
             self._route_after_consent,
             {
-                "compose_outreach": "compose_outreach",
+                "compose_outreach": "audit_prospect",
                 "finalize_opted_out": "finalize_opted_out",
             },
         )
+        graph.add_edge("audit_prospect", "compose_outreach")
         graph.add_edge("compose_outreach", "write_to_crm")
         graph.add_edge("write_to_crm", "schedule_sequence")
         graph.add_edge("schedule_sequence", "finalize")
@@ -894,6 +960,8 @@ class SDRGraph:
             "consent_allowed": True,
             "consent_identifier": "",
             "consent_reason": "",
+            "website_url": "",
+            "audit": {},
             "outreach_text": "",
             "outreach_subject": "",
             "crm_result": {},

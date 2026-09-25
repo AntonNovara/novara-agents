@@ -3636,6 +3636,100 @@ def test_sdr_generated_contact_greeting() -> None:
         traceback.print_exc()
 
 
+# ── SDR + Prospect-Audit ─────────────────────────────────────────────────────
+
+def test_sdr_prospect_audit_integration() -> None:
+    section("TEST — SDR ↔ Prospect-Audit: nur für qualifizierte Leads, Fakten im Prompt, nie blockierend")
+    try:
+        import json as _json
+        from langchain_core.messages import AIMessage
+        from agents import sdr_agent
+        from agents.sdr_agent import SDRGraph, _find_website
+        from core.config import settings
+        from core.llm import _extract_text
+        from tools import prospect_audit as pa
+        from tools.crm_integration import CRMIntegrationSDR
+        from tools.lead_database import LeadDatabase
+
+        class _Scripted:
+            def __init__(self, icp):
+                self.icp, self.outreach_contexts = icp, []
+
+            def invoke(self, messages):
+                system = _extract_text(messages[0].content)
+                human = _extract_text(messages[-1].content)
+                if "Kein Kontakt wurde in unserer Datenbank" in system:
+                    return AIMessage(content=_json.dumps({"first_name": "Thomas", "last_name": "Huber", "title": "Inhaber",
+                                                          "seniority": "c_level", "email": "t.huber@x.at", "linkedin_url": ""}))
+                if "ICP-Scoring gemäß" in system:
+                    return AIMessage(content=_json.dumps({"company_name": "Testbetrieb Alpha", "industry": "Elektrikerbetrieb",
+                                                          "company_size": 6, "pain_points": ["verpasste Anrufe"], "outreach_channel": "email",
+                                                          "icp_score": self.icp, "icp_rationale": "t", "language": "de"}))
+                self.outreach_contexts.append(human)
+                return AIMessage(content="SUBJECT: Frage\n\nHallo Thomas,\n\nwir helfen mit dem Anfragen-Starter (€390/Monat).\n\n"
+                                         "Kein Interesse? Kurze Antwort genügt, dann melde ich mich nicht mehr.")
+
+        def fake_audit(url, company="", persist=True):
+            calls.append(url)
+            if behaviour["mode"] == "raise":
+                raise RuntimeError("boom")
+            checks = [pa.Check("whatsapp", "WhatsApp-Kontakt auf der Website", False, 15, "Kein WhatsApp-Button: viele Anfragen gehen verloren."),
+                      pa.Check("https", "HTTPS", True, 10, "")]
+            err = "HTTP 500" if behaviour["mode"] == "error" else ""
+            return pa.AuditResult("aud-1", url, "https://" + url.replace("https://", ""), company, 42, 1.0, [] if err else checks, err)
+
+        calls: list = []
+        behaviour = {"mode": "ok"}
+
+        def run(text, icp):
+            llm = _Scripted(icp)
+            g = SDRGraph(llm, LeadDatabase(), CRMIntegrationSDR())
+            res = g.run(text, "t-audit")
+            return res.get("final_result", res), llm
+
+        orig_audit, orig_live = pa.run_audit, settings.sdr_crm_live_sheet
+        pa.run_audit = fake_audit
+        settings.sdr_crm_live_sheet = False  # niemals ins echte CRM-Sheet schreiben
+        try:
+            fr, llm = run("Testbetrieb Alpha, Elektriker Wien, 6 MA, Website www.testbetrieb-alpha.at, verpasst Anrufe.", 90)
+            ctx = llm.outreach_contexts[0] if llm.outreach_contexts else ""
+            if (calls == ["www.testbetrieb-alpha.at"] and "Website-Check" in ctx and "WhatsApp" in ctx and "42/100" in ctx and "kann sich irren" in ctx
+                    and fr["website_audit"]["score"] == 42 and fr["website_audit"]["audit_id"] == "aud-1"):
+                ok("Qualifizierter Lead mit Website: Audit läuft einmal, Lücke (WhatsApp) steht im Outreach-Prompt, Ergebnis in final_result.website_audit")
+            else:
+                fail("Audit-Integration (Happy Path) unerwartet", str((calls, ctx[-300:], fr.get("website_audit"))))
+
+            calls.clear()
+            fr, llm = run("Testbetrieb Alpha, Elektriker Wien, 6 MA, office@testbetrieb-alpha.at, verpasst Anrufe.", 90)
+            if not calls and fr["website_audit"] == {} and "Website-Check" not in llm.outreach_contexts[0]:
+                ok("Nur E-Mail-Adresse, keine Website: kein Audit, kein Faktenblock (E-Mail-Domain wird nicht als Website gewertet)")
+            else:
+                fail("Ohne Website unerwartet", str((calls, fr.get("website_audit"))))
+
+            calls.clear()
+            fr, llm = run("Bäckerei Mayer, Graz, www.baeckerei-mayer.at, Kassensoftware", 20)
+            if not calls and fr["qualified"] is False:
+                ok("Disqualifizierter Lead: keine Webseite wird abgerufen")
+            else:
+                fail("Disqualifizierter Lead löste Audit aus", str((calls, fr.get("qualified"))))
+
+            calls.clear(); behaviour["mode"] = "raise"
+            fr, llm = run("Testbetrieb Alpha, Elektriker Wien, www.testbetrieb-alpha.at", 90)
+            raised_ok = bool(fr.get("outreach", {}).get("message")) and fr["website_audit"] == {}
+            calls.clear(); behaviour["mode"] = "error"
+            fr2, llm2 = run("Testbetrieb Alpha, Elektriker Wien, www.testbetrieb-alpha.at", 90)
+            if raised_ok and fr2["website_audit"].get("error") == "HTTP 500" and "Website-Check" not in llm2.outreach_contexts[0] \
+                    and fr2["outreach"]["message"]:
+                ok("Audit wirft / Website nicht abrufbar: Outreach wird trotzdem erzeugt, kein Faktenblock, Fehler in final_result")
+            else:
+                fail("Audit-Fehlerpfad unerwartet", str((raised_ok, fr2.get("website_audit"))))
+        finally:
+            pa.run_audit, settings.sdr_crm_live_sheet = orig_audit, orig_live
+    except Exception:
+        fail("SDR-Audit-Integration — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -3684,6 +3778,7 @@ def main() -> int:
     test_outbound_guard()
     test_llm_provider()
     test_sdr_generated_contact_greeting()
+    test_sdr_prospect_audit_integration()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")
