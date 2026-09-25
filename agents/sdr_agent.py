@@ -156,6 +156,18 @@ _GREETING_WITH_NAME = re.compile(
 )
 
 
+UNKNOWN_CONTACT_NAME = "Unbekannt"
+
+
+def _contact_display_name(state: "SDRState", top: dict) -> str:
+    """Name des Kontakts für CRM/Customer-State/Ergebnis. Bei einem vom LLM erfundenen
+    Kontakt (contact_source == "generated") ist der Name geraten -- er darf nie wie ein
+    echter Datensatz gespeichert werden."""
+    if state.get("contact_source") == "generated":
+        return UNKNOWN_CONTACT_NAME
+    return f"{top.get('first_name', '')} {top.get('last_name', '')}".strip()
+
+
 def _neutral_greeting(body: str) -> str:
     """Ersetzt eine Namens-Anrede in der ersten Zeile durch 'Guten Tag,'."""
     lines = body.split("\n")
@@ -702,7 +714,7 @@ class SDRGraph:
 
         record = LeadRecord(
             company_name=state["company_name"],
-            contact_name=f"{top['first_name']} {top['last_name']}",
+            contact_name=_contact_display_name(state, top),
             contact_title=top["title"],
             contact_email=top.get("email") or None,
             contact_linkedin=top.get("linkedin_url") or None,
@@ -782,7 +794,7 @@ class SDRGraph:
                 "rationale": state["icp_rationale"],
             },
             "contact": {
-                "name": f"{top.get('first_name', '')} {top.get('last_name', '')}".strip(),
+                "name": _contact_display_name(state, top),
                 "title": top.get("title", ""),
                 "email": top.get("email", ""),
                 "linkedin": top.get("linkedin_url", ""),

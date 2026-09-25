@@ -3730,6 +3730,78 @@ def test_sdr_prospect_audit_integration() -> None:
         traceback.print_exc()
 
 
+# ── Erfundener Kontakt im CRM ────────────────────────────────────────────────
+
+def test_sdr_generated_contact_crm() -> None:
+    section("TEST — SDR: erfundener Kontaktname wird nie als echter Name im CRM gespeichert")
+    try:
+        import json as _json
+        from langchain_core.messages import AIMessage
+        from agents.sdr_agent import SDRGraph
+        from core import customer_state
+        from core.config import settings
+        from core.llm import _extract_text
+        from tools import prospect_audit as pa
+        from tools.crm_integration import CRMIntegrationSDR
+        from tools.lead_database import LeadDatabase
+
+        class _LLM:
+            def __init__(self, company):
+                self.company = company
+
+            def invoke(self, messages):
+                system = _extract_text(messages[0].content)
+                if "Kein Kontakt wurde in unserer Datenbank" in system:
+                    return AIMessage(content=_json.dumps({"first_name": "Thomas", "last_name": "Erfunden", "title": "Inhaber",
+                                                          "seniority": "c_level", "email": "", "linkedin_url": ""}))
+                if "ICP-Scoring gemäß" in system:
+                    return AIMessage(content=_json.dumps({"company_name": self.company, "industry": "Elektrikerbetrieb", "company_size": 6,
+                                                          "pain_points": ["x"], "outreach_channel": "email", "icp_score": 90,
+                                                          "icp_rationale": "t", "language": "de"}))
+                return AIMessage(content="SUBJECT: F\n\nGuten Tag,\n\nAnfragen-Starter (€390/Monat).\n\n"
+                                         "Kein Interesse? Kurze Antwort genügt, dann melde ich mich nicht mehr.")
+
+        class _CapturingCRM(CRMIntegrationSDR):
+            def __init__(self):
+                super().__init__()
+                self.records = []
+
+            def upsert_lead(self, record):
+                self.records.append(record)
+                return super().upsert_lead(record)
+
+        def run(company, tag):
+            crm = _CapturingCRM()
+            res = SDRGraph(_LLM(company), LeadDatabase(), crm).run(f"{company}, Elektriker Wien, 6 MA ({tag})", f"t-crm-{tag}")
+            return crm.records[0], res.get("final_result", res)
+
+        orig_live, orig_audit = settings.sdr_crm_live_sheet, pa.run_audit
+        settings.sdr_crm_live_sheet = False  # niemals ins echte CRM-Sheet schreiben
+        try:
+            gen_rec, gen_fr = run("Testbetrieb Zeta Elektro", "gen")
+            db_rec, db_fr = run("FastBox Logistics GmbH", "db")
+            cs = customer_state.get(company_name="Testbetrieb Zeta Elektro")
+            cs_name = ""
+            if cs:
+                cs_name = cs.stages["sdr"].data.get("contact_name", "") if "sdr" in cs.stages else ""
+            good = (
+                gen_rec.contact_source == "generated" and gen_rec.contact_name == "Unbekannt"
+                and gen_fr["contact"]["name"] == "Unbekannt" and "Thomas" not in str(gen_fr["contact"])
+                and cs_name == "Unbekannt"
+                and db_rec.contact_source == "database" and db_rec.contact_name not in ("", "Unbekannt")
+                and db_fr["contact"]["name"] == db_rec.contact_name
+            )
+            if good:
+                ok("Erfundener Kontakt -> 'Unbekannt' in CRM-Record, customer_state und final_result; echter DB-Kontakt behält seinen Namen")
+            else:
+                fail("Kontaktname unerwartet", str((gen_rec.contact_name, gen_fr["contact"], cs_name, db_rec.contact_name)))
+        finally:
+            settings.sdr_crm_live_sheet, pa.run_audit = orig_live, orig_audit
+    except Exception:
+        fail("SDR-Kontaktname — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -3779,6 +3851,7 @@ def main() -> int:
     test_llm_provider()
     test_sdr_generated_contact_greeting()
     test_sdr_prospect_audit_integration()
+    test_sdr_generated_contact_crm()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")
