@@ -3587,6 +3587,55 @@ def test_llm_provider() -> None:
         traceback.print_exc()
 
 
+# ── SDR-Anrede bei erfundenem Kontakt ────────────────────────────────────────
+
+def test_sdr_generated_contact_greeting() -> None:
+    section("TEST — SDR: erfundener Kontakt bekommt 'Guten Tag' statt erfundenem Namen; Katalog ohne SMS")
+    try:
+        from langchain_core.messages import AIMessage
+        from agents.sdr_agent import SDRGraph, _neutral_greeting
+        from core.knowledge import load_novara_wissen
+        from tools.crm_integration import CRMIntegrationSDR
+        from tools.lead_database import LeadDatabase
+
+        class _NamedLLM:
+            def invoke(self, _m):
+                return AIMessage(content="SUBJECT: Frage\n\nHallo Thomas,\n\nwir helfen Elektrikern mit dem Anfragen-Starter (€390/Monat).\n\nKein Interesse? Kurze Antwort genügt, dann melde ich mich nicht mehr.")
+
+        class _BrokenLLM:
+            def invoke(self, _m):
+                raise RuntimeError("down")
+
+        def run(llm, source):
+            g = SDRGraph(llm, LeadDatabase(), CRMIntegrationSDR())
+            st = {"contacts": [{"first_name": "Thomas", "last_name": "Huber", "title": "Inhaber"}],
+                  "contact_source": source, "company_name": "Muster", "industry": "Elektro", "company_size": 5,
+                  "pain_points": [], "outreach_channel": "email", "language": "de", "session_id": "t-greet"}
+            return g.compose_outreach(st)["outreach_text"]
+
+        gen, real, fb = run(_NamedLLM(), "generated"), run(_NamedLLM(), "database"), run(_BrokenLLM(), "generated")
+        good = (
+            gen.startswith("Guten Tag,") and "Thomas" not in gen
+            and real.startswith("Hallo Thomas,")
+            and fb.startswith("Guten Tag,") and "Thomas" not in fb
+            and _neutral_greeting("Sehr geehrter Herr Huber,\n\nText") == "Guten Tag,\n\nText"
+            and _neutral_greeting("Text ohne Anrede") == "Text ohne Anrede"
+        )
+        if good:
+            ok("Erfundener Kontakt: 'Guten Tag,' (auch im LLM-Fehler-Fallback); echter DB-Kontakt behält 'Hallo Thomas,'")
+        else:
+            fail("Anrede unerwartet", str((gen[:40], real[:40], fb[:40])))
+
+        wissen = load_novara_wissen()
+        if "sms" not in wissen.lower() and "WhatsApp" in wissen:
+            ok("novara_wissen.txt nennt WhatsApp statt SMS")
+        else:
+            fail("novara_wissen.txt enthält noch SMS")
+    except Exception:
+        fail("SDR-Anrede — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -3634,6 +3683,7 @@ def main() -> int:
     test_prospect_audit()
     test_outbound_guard()
     test_llm_provider()
+    test_sdr_generated_contact_greeting()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

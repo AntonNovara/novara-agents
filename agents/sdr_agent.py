@@ -113,6 +113,25 @@ _CLIENT_NAME = "Novara Automation"
 # Wissensdatenbank einmalig laden
 _WISSEN = load_novara_wissen()
 
+# Anrede in der ersten Zeile ("Hallo Thomas,", "Sehr geehrter Herr Huber," ...). Nur für
+# LLM-erfundene Kontakte (contact_source == "generated") relevant: ein erfundener Name
+# darf nie in einer echten Nachricht landen.
+_GREETING_WITH_NAME = re.compile(
+    r"^\s*(?:hallo|hi|guten\s+tag|servus|liebe[rn]?|sehr\s+geehrte[rn]?)\b[^\n,]*,?", re.IGNORECASE
+)
+
+
+def _neutral_greeting(body: str) -> str:
+    """Ersetzt eine Namens-Anrede in der ersten Zeile durch 'Guten Tag,'."""
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if _GREETING_WITH_NAME.match(line):
+            lines[i] = _GREETING_WITH_NAME.sub("Guten Tag,", line, count=1)
+        break
+    return "\n".join(lines)
+
 
 # ── LLM singleton ─────────────────────────────────────────────────────────────
 
@@ -536,12 +555,23 @@ class SDRGraph:
         logger.info("Node: compose_outreach", extra={"session": state["session_id"]})
 
         top = state["contacts"][0]
+        # Kontakt vom LLM erfunden (nicht in der Lead-DB): der Name ist geraten und darf
+        # nie in der Nachricht stehen -- neutrale Anrede, auch deterministisch erzwungen.
+        generated = state.get("contact_source") == "generated"
         contact_name = f"{top['first_name']} {top['last_name']}"
         lang_label = "German" if state["language"] == "de" else "English"
         channel = state["outreach_channel"]
 
+        if generated:
+            contact_line = (
+                f"Contact: name unknown ({top['title']}) at {state['company_name']} -- "
+                "use NO personal name; greet with 'Guten Tag,' only\n"
+            )
+        else:
+            contact_line = f"Contact: {contact_name}, {top['title']} at {state['company_name']}\n"
+
         context = (
-            f"Contact: {contact_name}, {top['title']} at {state['company_name']}\n"
+            contact_line +
             f"Industry: {state['industry']}\n"
             f"Company size: ~{state['company_size'] or 'unknown'} employees\n"
             f"Pain points: {', '.join(state['pain_points']) or 'not specified'}\n"
@@ -556,7 +586,8 @@ class SDRGraph:
             raw = response.content.strip()
         except Exception as exc:
             logger.warning("compose_outreach LLM failed: %s", exc)
-            raw = f"Hallo {top['first_name']},\n\nwir bei Novara Automation helfen {state['industry']}-Unternehmen, manuelle Prozesse zu automatisieren.\n\nHat das für Sie Relevanz?\n\nBeste Grüße"
+            greeting = "Guten Tag" if generated else f"Hallo {top['first_name']}"
+            raw = f"{greeting},\n\nwir bei Novara Automation helfen {state['industry']}-Unternehmen, manuelle Prozesse zu automatisieren.\n\nHat das für Sie Relevanz?\n\nBeste Grüße"
 
         subject = ""
         body = raw
@@ -564,6 +595,9 @@ class SDRGraph:
             lines = raw.split("\n", 2)
             subject = lines[0].split(":", 1)[1].strip()
             body = lines[2].strip() if len(lines) > 2 else raw
+
+        if generated:
+            body = _neutral_greeting(body)
 
         # Deterministische Garantie für die AI-Act-Art.-50-Offenlegung: die
         # Prompt-Instruktion oben ist eine Empfehlung ans LLM, kein Beweis.
@@ -585,7 +619,7 @@ class SDRGraph:
                 extra={"session": state["session_id"]},
             )
             body = (
-                f"Hallo {top['first_name']},\n\nwir bei Novara Automation helfen "
+                f"{'Guten Tag' if generated else 'Hallo ' + top['first_name']},\n\nwir bei Novara Automation helfen "
                 f"{state['industry']}-Betrieben, keine Kundenanfrage mehr zu verpassen.\n\n"
                 f"Hat das für Sie Relevanz?\n\nBeste Grüße\n\n{OPT_OUT_LINE_DE}\n\n{disclosure}"
             )

@@ -22,10 +22,10 @@ Enthalten:
   - Vollständige Einrichtung & Testing
   - 30 Tage E-Mail-Support nach Übergabe
 Beispiel-Workflows:
-  - Verpasster Anruf -> automatische SMS an den Kunden
+  - Verpasster Anruf -> automatische Ansage führt den Anrufer zu WhatsApp, dort wird sofort geantwortet
   - Anfrage -> automatischer Terminvorschlag
   - Neuer Termin -> automatische Bestätigung & Kalender-Eintrag
-  - Erinnerungs-SMS vor dem Termin
+  - Terminerinnerung per WhatsApp
 
 ------------------------------------------------------------
 PAKET 2: DER AUTONOME BETRIEB (empfohlen) — €890/Monat + €1.990 einmaliges Setup
@@ -443,7 +443,7 @@ Der Anrufer legt auf und ruft beim nächsten Elektriker an."
 
 Lösung:
 "Wir richten ein automatisches System ein: Wenn ein Anruf verpasst wird, bekommt
-der Anrufer sofort eine SMS mit dem Angebot, einen Rückruftermin zu buchen.
+der Anrufer sofort eine Ansage, die ihn zu WhatsApp führt — dort bekommt er sofort eine Antwort und kann einen Rückruftermin buchen.
 Sie sehen alle Anfragen gesammelt in einer Übersicht — ohne dass Sie etwas
 manuell tun müssen."
 
