@@ -105,6 +105,7 @@ class LeadRecord(BaseModel):
     contact_title: str
     contact_email: Optional[str] = None
     contact_linkedin: Optional[str] = None
+    website: Optional[str] = None       # Website des Betriebs (aus dem Lead-Text, siehe SDR audit_prospect)
     industry: str
     company_size: Optional[int] = None
     lead_score: int
@@ -149,7 +150,7 @@ def _lead_record_to_sheet_row(record: LeadRecord) -> dict[str, str]:
         "position": record.contact_title,
         "email": record.contact_email or "",
         "telefon": "",
-        "website": "",
+        "website": record.website or "",
         "quelle": "SDR-Agent",
         "notizen": " | ".join(notizen_parts),
     }

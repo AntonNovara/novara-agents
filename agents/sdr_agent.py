@@ -132,6 +132,22 @@ def _find_website(text: str) -> str:
     return ""
 
 
+def _crm_website(state: "SDRState") -> Optional[str]:
+    """Website für die CRM-Spalte: bevorzugt die geprüfte Endadresse (nach Redirects), sonst die
+    URL aus dem Lead-Text (mit https:// ergänzt). Leer, wenn der Lead keine Website nennt."""
+    audit = state.get("audit") or {}
+    final = audit.get("final_url")
+    if final and not audit.get("error"):
+        return final
+    raw = state.get("website_url") or ""
+    if not raw:
+        return None
+    try:
+        return prospect_audit.normalize_url(raw)
+    except prospect_audit.AuditFetchError:
+        return None
+
+
 def _audit_context(audit: dict) -> str:
     """Faktenblock für den Outreach-Prompt. Nur verifizierte Ergebnisse, keine Verlustzahlen."""
     gaps = sorted((c for c in audit.get("checks", []) if not c["passed"]), key=lambda c: -c["weight"])[:2]
@@ -722,6 +738,7 @@ class SDRGraph:
             contact_title=top["title"],
             contact_email=top.get("email") or None,
             contact_linkedin=top.get("linkedin_url") or None,
+            website=_crm_website(state),
             industry=state["industry"],
             company_size=state["company_size"],
             lead_score=score,

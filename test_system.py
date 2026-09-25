@@ -3808,6 +3808,75 @@ def test_sdr_generated_contact_crm() -> None:
         traceback.print_exc()
 
 
+# ── CRM-Spalte "website" ─────────────────────────────────────────────────────
+
+def test_sdr_crm_website_column() -> None:
+    section("TEST — SDR: CRM-Spalte 'website' aus der auditierten URL")
+    try:
+        import json as _json
+        from langchain_core.messages import AIMessage
+        from agents.sdr_agent import SDRGraph
+        from core.config import settings
+        from core.llm import _extract_text
+        from tools import prospect_audit as pa
+        from tools.crm_integration import CRMIntegrationSDR, _lead_record_to_sheet_row
+        from tools.lead_database import LeadDatabase
+
+        class _LLM:
+            def invoke(self, messages):
+                system = _extract_text(messages[0].content)
+                if "Kein Kontakt wurde in unserer Datenbank" in system:
+                    return AIMessage(content=_json.dumps({"first_name": "A", "last_name": "B", "title": "Inhaber", "seniority": "c_level"}))
+                if "ICP-Scoring gemäß" in system:
+                    return AIMessage(content=_json.dumps({"company_name": "Testbetrieb Omega", "industry": "Elektrikerbetrieb", "company_size": 5,
+                                                          "pain_points": ["x"], "outreach_channel": "email", "icp_score": 90,
+                                                          "icp_rationale": "t", "language": "de"}))
+                return AIMessage(content="SUBJECT: F\n\nGuten Tag,\n\nAnfragen-Starter (€390/Monat).\n\n"
+                                         "Kein Interesse? Kurze Antwort genügt, dann melde ich mich nicht mehr.")
+
+        class _CapturingCRM(CRMIntegrationSDR):
+            def __init__(self):
+                super().__init__()
+                self.records = []
+
+            def upsert_lead(self, record):
+                self.records.append(record)
+                return super().upsert_lead(record)
+
+        mode = {"m": "ok"}
+
+        def fake_audit(url, company="", persist=True):
+            err = "HTTP 500" if mode["m"] == "error" else ""
+            return pa.AuditResult("a1", url, "https://www.omega-elektro.at/start", company, 60, 1.0, [], err)
+
+        def run(text):
+            crm = _CapturingCRM()
+            SDRGraph(_LLM(), LeadDatabase(), crm).run(text, "t-web")
+            return crm.records[0]
+
+        orig_live, orig_audit = settings.sdr_crm_live_sheet, pa.run_audit
+        settings.sdr_crm_live_sheet = False  # niemals ins echte CRM-Sheet schreiben
+        pa.run_audit = fake_audit
+        try:
+            ok_rec = run("Testbetrieb Omega, Elektriker Wien, 5 MA, omega-elektro.at")
+            mode["m"] = "error"
+            err_rec = run("Testbetrieb Omega, Elektriker Wien, 5 MA, omega-elektro.at")
+            none_rec = run("Testbetrieb Omega, Elektriker Wien, 5 MA, office@omega-elektro.at")
+            row = _lead_record_to_sheet_row(ok_rec)
+            row_none = _lead_record_to_sheet_row(none_rec)
+            if (ok_rec.website == "https://www.omega-elektro.at/start" and row["website"] == ok_rec.website
+                    and err_rec.website == "https://omega-elektro.at"
+                    and none_rec.website is None and row_none["website"] == ""):
+                ok("CRM-'website': geprüfte Endadresse nach Redirects; bei Audit-Fehler die normalisierte URL aus dem Lead; ohne Website leer")
+            else:
+                fail("CRM-Website unerwartet", str((ok_rec.website, err_rec.website, none_rec.website, row["website"])))
+        finally:
+            settings.sdr_crm_live_sheet, pa.run_audit = orig_live, orig_audit
+    except Exception:
+        fail("CRM-Website — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -3858,6 +3927,7 @@ def main() -> int:
     test_sdr_generated_contact_greeting()
     test_sdr_prospect_audit_integration()
     test_sdr_generated_contact_crm()
+    test_sdr_crm_website_column()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")
