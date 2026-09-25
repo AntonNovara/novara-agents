@@ -22,6 +22,23 @@ class Settings(BaseSettings):
     anthropic_api_key: SecretStr = Field(default="mock-key", alias="ANTHROPIC_API_KEY")
     anthropic_model: str = Field(default="claude-sonnet-4-6", alias="ANTHROPIC_MODEL")
 
+    # LLM-Provider-Selektor: "anthropic" (Default, unverändertes Verhalten) oder
+    # "ollama" (lokales Modell, keine Token-Kosten, Daten verlassen den Rechner nicht).
+    # Ollama läuft auf dem Mac/Server des Betreibers -- Railway erreicht es NICHT,
+    # solange OLLAMA_BASE_URL nicht auf einen öffentlich erreichbaren (abgesicherten)
+    # Host zeigt.
+    llm_provider: str = Field(default="anthropic", alias="LLM_PROVIDER")
+    ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
+    ollama_model: str = Field(default="qwen2.5:7b", alias="OLLAMA_MODEL")
+
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def normalize_provider(cls, v: object) -> object:
+        v = v.strip().lower() if isinstance(v, str) else v
+        if v not in ("anthropic", "ollama"):
+            raise ValueError("LLM_PROVIDER muss 'anthropic' oder 'ollama' sein")
+        return v
+
     @field_validator("anthropic_api_key", mode="before")
     @classmethod
     def strip_api_key(cls, v: object) -> object:
@@ -256,7 +273,11 @@ class Settings(BaseSettings):
         entweder explizit über DEMO_MODE=true, oder implizit, weil kein
         echter API-Key konfiguriert ist (verhindert Abstürze bei fehlendem Key).
         """
-        return self.demo_mode or not self.anthropic_key_configured
+        if self.demo_mode:
+            return True
+        if self.llm_provider == "ollama":
+            return False  # lokales Modell braucht keinen Anthropic-Key
+        return not self.anthropic_key_configured
 
 
 @lru_cache(maxsize=1)

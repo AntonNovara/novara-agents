@@ -132,6 +132,53 @@ class _DemoChatModel:
         return AIMessage(content=content)
 
 
+class _OllamaChatModel:
+    """
+    Lokaler Provider (LLM_PROVIDER=ollama): dieselbe Minimal-Schnittstelle wie
+    _DemoChatModel/ChatAnthropic (.invoke(messages) -> Objekt mit .content), direkt
+    über Ollamas REST-API (/api/chat) -- keine zusätzliche Abhängigkeit.
+
+    Erwartet der System-Prompt JSON (gleiche Erkennung wie im Demo-Modus), wird
+    Ollamas `format: json` erzwungen -- kleine Modelle halten sich sonst oft nicht
+    an das Format. Bild-Content-Blöcke werden nicht unterstützt (Text-Modell):
+    das wirft, und die aufrufenden Nodes (document_node) fangen das bereits ab.
+    """
+
+    def __init__(self, base_url: str, model: str, max_tokens: int, timeout: float = 180.0) -> None:
+        self._url = base_url.rstrip("/") + "/api/chat"
+        self._model = model
+        self._max_tokens = max_tokens
+        self._timeout = timeout
+
+    @staticmethod
+    def _role(m: BaseMessage) -> str:
+        return {"system": "system", "human": "user", "ai": "assistant"}.get(getattr(m, "type", ""), "user")
+
+    def invoke(self, messages: list[BaseMessage]) -> AIMessage:
+        import httpx
+
+        payload_msgs = []
+        for m in messages:
+            if isinstance(m.content, list) and any(
+                isinstance(b, dict) and b.get("type") == "image" for b in m.content
+            ):
+                raise NotImplementedError("Ollama-Textmodell unterstützt keine Bild-Inputs")
+            payload_msgs.append({"role": self._role(m), "content": _extract_text(m.content)})
+
+        system_text = next((x["content"] for x in payload_msgs if x["role"] == "system"), "")
+        body: dict[str, Any] = {
+            "model": self._model,
+            "messages": payload_msgs,
+            "stream": False,
+            "options": {"temperature": 0, "num_predict": self._max_tokens},
+        }
+        if _expects_json(system_text):
+            body["format"] = "json"
+        resp = httpx.post(self._url, json=body, timeout=self._timeout)
+        resp.raise_for_status()
+        return AIMessage(content=resp.json()["message"]["content"])
+
+
 def build_llm(max_tokens: int = 1024) -> Any:
     """
     Zentrale Factory für den LLM-Client aller Agenten. Ersetzt die bisher pro
@@ -140,6 +187,9 @@ def build_llm(max_tokens: int = 1024) -> Any:
     if settings.effective_demo_mode:
         logger.info("LLM-Factory: Demo-Modus aktiv, kein echter API-Call")
         return _DemoChatModel()
+    if settings.llm_provider == "ollama":
+        logger.info("LLM-Factory: Ollama (%s)", settings.ollama_model)
+        return _OllamaChatModel(settings.ollama_base_url, settings.ollama_model, max_tokens)
     return ChatAnthropic(
         model=settings.anthropic_model,
         api_key=settings.anthropic_api_key.get_secret_value(),

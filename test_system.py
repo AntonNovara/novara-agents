@@ -3506,6 +3506,72 @@ def test_telnyx_missed_calls() -> None:
         cfg.telnyx_public_key, cfg.telnyx_api_key, cfg.missed_call_whatsapp_number, cfg.missed_call_business_name = orig
 
 
+# ── LLM-Provider-Selektor ────────────────────────────────────────────────────
+
+def test_llm_provider() -> None:
+    section("TEST — LLM_PROVIDER: anthropic (Default) vs. ollama (lokal)")
+    try:
+        import httpx
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from core import llm
+        from core.config import Settings, settings
+
+        seen: dict = {}
+
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self): return {"message": {"content": '{"ok": true}'}}
+
+        def fake_post(url, json=None, timeout=None):
+            seen["url"], seen["body"] = url, json
+            return _Resp()
+
+        orig_post, orig_provider, orig_demo = httpx.post, settings.llm_provider, settings.demo_mode
+        httpx.post = fake_post
+        try:
+            settings.demo_mode = False
+            settings.llm_provider = "ollama"
+            m = llm.build_llm(200)
+            out = m.invoke([llm.cached_system_message("Gib AUSSCHLIESSLICH valides JSON zurück"), HumanMessage(content="hi")])
+            good = (
+                isinstance(m, llm._OllamaChatModel) and out.content == '{"ok": true}'
+                and seen["url"].endswith("/api/chat") and seen["body"]["format"] == "json"
+                and seen["body"]["messages"][0] == {"role": "system", "content": "Gib AUSSCHLIESSLICH valides JSON zurück"}
+                and seen["body"]["options"]["num_predict"] == 200 and seen["body"]["stream"] is False
+            )
+            if good:
+                ok("provider=ollama: Client wird gewählt, System-Block als Text, format=json bei JSON-Prompt, kein Anthropic-Key nötig")
+            else:
+                fail("Ollama-Request unerwartet", str((type(m), out.content, seen)))
+
+            seen.clear()
+            m.invoke([SystemMessage(content="Schreibe Freitext, kein JSON"), HumanMessage(content="hi")])
+            image_blocked = False
+            try:
+                m.invoke([HumanMessage(content=[{"type": "image", "source": {}}])])
+            except NotImplementedError:
+                image_blocked = True
+            if "format" not in seen["body"] and image_blocked:
+                ok("Freitext-Prompt ohne format=json; Bild-Input wird sauber abgelehnt (Nodes fangen das ab)")
+            else:
+                fail("Ollama Freitext/Bild-Verhalten unerwartet", str((seen, image_blocked)))
+        finally:
+            httpx.post, settings.llm_provider, settings.demo_mode = orig_post, orig_provider, orig_demo
+
+        try:
+            Settings(LLM_PROVIDER="openai")
+            bad = False
+        except Exception:
+            bad = True
+        if bad and settings.llm_provider == "anthropic":
+            ok("Ungültiger LLM_PROVIDER wird abgelehnt; Default bleibt anthropic")
+        else:
+            fail("Provider-Validierung unerwartet", settings.llm_provider)
+    except Exception:
+        fail("LLM-Provider — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -3552,6 +3618,7 @@ def main() -> int:
     test_telnyx_missed_calls()
     test_prospect_audit()
     test_outbound_guard()
+    test_llm_provider()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")
