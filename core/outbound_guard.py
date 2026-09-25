@@ -24,6 +24,9 @@ _PLACEHOLDER = re.compile(
     r"(\[Demo-Modus|Platzhalter|\[\s*(Name|Firma|Vorname|Betrieb)\s*\]|\{\{?[a-z_]+\}?\}|XXX|lorem ipsum)",
     re.IGNORECASE,
 )
+_BRACKET_PLACEHOLDER = re.compile(r"\[[^\]\n]{2,40}\]")          # z. B. "[Datum]", "[Ihr Name]"
+_MARKDOWN = re.compile(r"(^\s*#{1,6}\s|\*\*[^*\n]+\*\*)", re.MULTILINE)  # Überschriften/Fettdruck gehören nicht in eine Mail
+_MULTI_MESSAGE = re.compile(r"(folge-?mail|follow-?up|nachfass|tag\s*\d+\s*[—–-]|\n---+\n)", re.IGNORECASE)
 _PROMISES = re.compile(
     r"(garantiert(e|en)?\s+(mehr|dass|umsatz|auftr)|100\s?%\s*(sicher|garant|erfolg)|risikofrei|"
     r"sicher(e|en)?\s+mehr\s+auftr)",
@@ -74,6 +77,12 @@ def review_outreach(subject: str, body: str) -> GuardVerdict:
         v.append("leere Nachricht")
     if _PLACEHOLDER.search(text):
         v.append("Platzhalter/Demo-Text in der Nachricht")
+    if _BRACKET_PLACEHOLDER.search(text):
+        v.append("unausgefüllter Platzhalter in eckigen Klammern")
+    if _MARKDOWN.search(text):
+        v.append("Markdown-Formatierung in der Nachricht")
+    if _MULTI_MESSAGE.search(body):
+        v.append("mehrere Nachrichten/Follow-ups in einer Nachricht")
     if _LLM_LEAKAGE.search(text):
         v.append("LLM-/Prompt-Artefakt in der Nachricht")
     if _PROMISES.search(text):

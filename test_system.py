@@ -3323,10 +3323,13 @@ def test_outbound_guard() -> None:
             "kein Opt-out": ("Hallo, Anfragen-Starter €390/Monat.", False),
             "Prompt-Leak": (clean + "\nAs an AI language model", False),
             "leer": ("", False),
+            "[Datum]-Platzhalter": (clean + "\nzu meiner E-Mail von [Datum]", False),
+            "Markdown": (clean + "\n**Betreff:** X", False),
+            "mehrere Mails": (clean + "\n---\nFolge-Mail (Tag 3)", False),
         }
         wrong = [n for n, (b, exp) in cases.items() if review_outreach("", b).ok != exp]
         if not wrong:
-            ok("Guard: sauber = OK; erfundener Preis, Platzhalter, Garantie, fehlender Opt-out, Prompt-Leak, leer = blockiert")
+            ok("Guard: sauber = OK; erfundener Preis, Platzhalter (auch [Datum]), Markdown, Mehrfach-Mails, Garantie, fehlender Opt-out, Prompt-Leak, leer = blockiert")
         else:
             fail("Guard-Urteil unerwartet", str(wrong))
 
