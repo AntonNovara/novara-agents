@@ -43,6 +43,18 @@ _OPT_OUT = re.compile(
 )
 _EURO = re.compile(r"€\s?(\d[\d.]*)|(\d[\d.]*)\s?(?:€|EUR|Euro)\b")
 
+# "unser/unsere ... -System/-Software/-Lösung/-App/-Tool/-Plattform": wer hier etwas
+# Konkretes anbietet, darf nur Begriffe nennen, die in novara_wissen.txt vorkommen.
+# Erfundene Angebote (z. B. "unser Kassen-System" für eine Bäckerei) sind der
+# gefährlichste Fehler kleiner Modelle.
+_OFFER_PHRASE = re.compile(
+    r"\bunser(?:e[nrms]?)?\s+((?:[\w\-äöüÄÖÜß]+\s+){0,4}?[\w\-äöüÄÖÜß]*(?:system|software|lösung|app|tool|plattform|assistent|bot)\b)",
+    re.IGNORECASE,
+)
+_GENERIC_OFFER_WORDS = {"system", "software", "lösung", "app", "tool", "plattform", "assistent", "bot",
+                        "team", "service", "angebot", "ki", "automatisch", "automatische", "automatischen",
+                        "automatisches", "intelligent", "intelligente", "intelligenten", "intelligentes"}
+
 MAX_CHARS = 1500
 
 
@@ -59,6 +71,22 @@ def _allowed_prices() -> set[int]:
     for m in _EURO.finditer(load_novara_wissen()):
         prices.add(_amount(m.group(1) or m.group(2)))
     return prices
+
+
+def _tokens(text: str) -> set[str]:
+    return {t.lower() for t in re.findall(r"[A-Za-zÄÖÜäöüß]{3,}", text)}
+
+
+def _unknown_offer_terms(text: str) -> list[str]:
+    vocab = _tokens(load_novara_wissen())
+    unknown: list[str] = []
+    for m in _OFFER_PHRASE.finditer(text):
+        for tok in _tokens(m.group(1)):
+            base = re.sub(r"(system|software|lösung|app|tool|plattform|assistent|bot)$", "", tok)
+            if tok in _GENERIC_OFFER_WORDS or not base or tok in vocab or base in vocab:
+                continue
+            unknown.append(tok)
+    return sorted(set(unknown))
 
 
 @dataclass
@@ -93,6 +121,10 @@ def review_outreach(subject: str, body: str) -> GuardVerdict:
         amount = _amount(m.group(1) or m.group(2))
         if amount not in allowed:
             v.append(f"Preis €{amount} steht nicht in novara_wissen.txt")
+
+    unknown = _unknown_offer_terms(body)
+    if unknown:
+        v.append(f"Angebot nicht in novara_wissen.txt belegt: {', '.join(unknown)}")
 
     if not has_opt_out(body):
         v.append("kein Opt-out-Hinweis")

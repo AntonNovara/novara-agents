@@ -3323,6 +3323,9 @@ def test_outbound_guard() -> None:
             "kein Opt-out": ("Hallo, Anfragen-Starter €390/Monat.", False),
             "Prompt-Leak": (clean + "\nAs an AI language model", False),
             "leer": ("", False),
+            "erfundenes Angebot (Kassen-System)": (clean + "\nUnser Kassen-System hilft Ihnen.", False),
+            "belegtes Angebot (Anfragen-Starter)": (clean + "\nMit unserem Anfragen-Starter verpassen Sie keine Anrufe.", True),
+            "belegtes Angebot (WhatsApp-Assistent)": (clean + "\nUnser WhatsApp-Assistent antwortet sofort.", True),
             "[Datum]-Platzhalter": (clean + "\nzu meiner E-Mail von [Datum]", False),
             "Markdown": (clean + "\n**Betreff:** X", False),
             "mehrere Mails": (clean + "\n---\nFolge-Mail (Tag 3)", False),
@@ -3333,10 +3336,19 @@ def test_outbound_guard() -> None:
         else:
             fail("Guard-Urteil unerwartet", str(wrong))
 
-        from agents.sdr_agent import SDRGraph
+        from agents.sdr_agent import OUTBOUND_MIN_ICP, SDRGraph
         from tools.lead_database import LeadDatabase
         from tools.crm_integration import CRMIntegrationSDR
         from core.llm import build_llm
+
+        _g = SDRGraph(None, LeadDatabase(), CRMIntegrationSDR())
+        def _q(icp, seniority):
+            st = {"contacts": [{"seniority": seniority}], "icp_score": icp, "icp_rationale": "", "session_id": "t-q"}
+            return _g.score_lead(st)["qualified"]
+        if _q(75, "ic") and _q(OUTBOUND_MIN_ICP, "ic") and not _q(60, "c_level") and not _q(30, "c_level"):
+            ok("Outbound-Qualifizierung: ICP >= 70 nötig -- Seniority-Bonus (+15) rettet keinen Nicht-Handwerksbetrieb (ICP 60 + C-Level = disqualifiziert)")
+        else:
+            fail("Outbound-Schwelle unerwartet", str((_q(75, "ic"), _q(60, "c_level"))))
 
         class _BadLLM:
             def invoke(self, _m):

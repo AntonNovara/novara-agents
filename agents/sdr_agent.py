@@ -78,6 +78,12 @@ from tools.lead_database import LeadDatabase, LeadSearchResult, ProspectContact
 logger = logging.getLogger(__name__)
 
 QUALIFICATION_THRESHOLD = 40
+# Outbound-Kaltakquise: Mindest-ICP (OHNE Seniority-Bonus). Die Rubrik ordnet "anderes
+# Handwerk" bei 70-84 ein, beliebige KMU nur bei 45-69 -- Novaras Angebot (verpasste
+# Anrufe/WhatsApp/Angebote) passt zum Handwerk, nicht zu jeder Pyme. Kalt angeschriebene
+# Nicht-Handwerksbetriebe (z. B. Bäckerei) bekamen sonst einen erfundenen Pitch. Der
+# Inbound-Chat behält QUALIFICATION_THRESHOLD: dort hat der Besucher uns selbst kontaktiert.
+OUTBOUND_MIN_ICP = 70
 _SENIORITY_BONUS: dict[str, int] = {
     "c_level": 15,
     "director": 10,
@@ -478,7 +484,7 @@ class SDRGraph:
         seniority = top.get("seniority", "ic")
         bonus = _SENIORITY_BONUS.get(seniority, 0)
         score = min(100, state["icp_score"] + bonus)
-        qualified = score >= QUALIFICATION_THRESHOLD
+        qualified = score >= QUALIFICATION_THRESHOLD and state["icp_score"] >= OUTBOUND_MIN_ICP
 
         tier = "low"
         for label, threshold in _ICP_TIER_THRESHOLDS.items():
@@ -762,7 +768,8 @@ class SDRGraph:
             "score_rationale": state["score_rationale"],
             "message": (
                 f"Lead '{state['company_name']}' disqualifiziert "
-                f"(Score {state['lead_score']}/{QUALIFICATION_THRESHOLD} min). "
+                f"(Score {state['lead_score']}, min. {QUALIFICATION_THRESHOLD}; ICP {state['icp_score']}, "
+                f"min. {OUTBOUND_MIN_ICP} für Outbound). "
                 "Kein CRM-Eintrag, keine Outreach-Nachricht erstellt."
             ),
         }
