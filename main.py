@@ -44,7 +44,7 @@ from agents.voice_agent import VoiceAgent
 from core import consent, lead_capture
 from core.config import settings
 from core.security import OutputBlockedError, SecurityLayer
-from tools import lead_notifier, sequence_scheduler, whatsapp_cloud
+from tools import lead_notifier, sequence_scheduler, telnyx_voice, whatsapp_cloud
 from tools.calendar_integration import GoogleCalendarTool
 from tools.demo_sandbox import is_demo_message, log_demo_lead, strip_demo_marker
 from tools.document_parser import DocumentParser
@@ -1456,6 +1456,56 @@ async def sequence_step_result(sequence_id: str, step_index: int, body: Sequence
     except (KeyError, IndexError):
         raise HTTPException(status_code=404, detail="Sequence or step not found")
     return {"status": step.status, "attempts": step.attempts}
+
+
+# ── Anfragen-Starter: verpasste Anrufe über Telnyx (Call Control) ──────────────
+# ÖFFENTLICH, KEIN X-API-Key (Telnyx kann keinen Header setzen); die Sicherheitsgrenze
+# ist die Ed25519-Signatur jedes Webhooks (tools/telnyx_voice.verify_signature, fail-closed).
+# Antwortet sofort mit 200 (Telnyx erwartet < 2 s) und führt die Befehle im Hintergrund aus.
+
+_SEEN_TELNYX_EVENT_IDS: "OrderedDict[str, None]" = OrderedDict()
+
+
+@app.post("/api/v1/webhook/telnyx/voice", tags=["Telefonie"], include_in_schema=False)
+async def telnyx_voice_webhook(request: Request, background_tasks: BackgroundTasks):
+    raw_body = await request.body()
+    if not telnyx_voice.verify_signature(
+        raw_body,
+        request.headers.get("telnyx-signature-ed25519", ""),
+        request.headers.get("telnyx-timestamp", "0"),
+    ):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    try:
+        event = (json.loads(raw_body or b"{}").get("data")) or {}
+    except (ValueError, AttributeError):
+        return {}
+
+    event_id = str(event.get("id") or "")
+    if event_id:
+        if event_id in _SEEN_TELNYX_EVENT_IDS:
+            return {}
+        _SEEN_TELNYX_EVENT_IDS[event_id] = None
+        while len(_SEEN_TELNYX_EVENT_IDS) > 2000:
+            _SEEN_TELNYX_EVENT_IDS.popitem(last=False)
+
+    try:
+        action = telnyx_voice.process_event(event)
+    except Exception as exc:
+        log.error("Telnyx-Event konnte nicht verarbeitet werden", error=str(exc), exc_info=True)
+        return {}
+    if action is not None:
+        background_tasks.add_task(telnyx_voice.execute, action)
+    return {}
+
+
+@app.get("/api/v1/internal/missed-calls", tags=["Telefonie"], dependencies=[Depends(require_api_key)])
+async def missed_calls(limit: int = 50):
+    """Zuletzt verpasste Anrufe (aus dem Telnyx-Desvío). Nur mit API-Key."""
+    import asyncio
+
+    rows = await asyncio.get_running_loop().run_in_executor(None, telnyx_voice.list_recent, max(1, min(limit, 200)))
+    return {"count": len(rows), "calls": rows}
 
 
 @app.get("/api/v1/calls", tags=["Calls"], dependencies=[Depends(require_api_key)])

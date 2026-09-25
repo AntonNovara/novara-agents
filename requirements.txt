@@ -54,3 +54,6 @@ slowapi==0.1.9
 # sequence_scheduler — Postgres in Produktion (Railway-Plugin), SQLite lokal.
 sqlalchemy==2.0.36
 psycopg2-binary==2.9.10
+
+# Telnyx-Webhook-Signatur (Ed25519), tools/telnyx_voice.py
+cryptography>=42.0

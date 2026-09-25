@@ -3357,6 +3357,155 @@ def test_outbound_guard() -> None:
         traceback.print_exc()
 
 
+def test_telnyx_missed_calls() -> None:
+    section("TEST 30 — Telnyx-Desvío: Signatur (Ed25519), Event->Aktion, Ansage, Webhook")
+    info("Alles offline: eigenes Ed25519-Schlüsselpaar, Telnyx-API gemockt, kein echter Anruf.")
+    import asyncio
+    import base64
+    import uuid
+    from datetime import datetime, timezone
+    from unittest import mock
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from fastapi import BackgroundTasks, HTTPException
+    from starlette.requests import Request
+
+    try:
+        import main as m
+        from tools import telnyx_voice as tv
+    except Exception as exc:
+        fail("Import für Telnyx-Test", str(exc))
+        return
+
+    cfg = m.settings
+    priv = Ed25519PrivateKey.generate()
+    pub_b64 = base64.b64encode(priv.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+    orig = (cfg.telnyx_public_key, cfg.telnyx_api_key, cfg.missed_call_whatsapp_number, cfg.missed_call_business_name)
+
+    def sign(body: bytes, ts: int) -> str:
+        return base64.b64encode(priv.sign(str(ts).encode() + b"|" + body)).decode()
+
+    def make_request(body: bytes, headers: dict) -> Request:
+        scope = {"type": "http", "method": "POST", "path": "/api/v1/webhook/telnyx/voice", "query_string": b"",
+                 "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()], "scheme": "https",
+                 "server": ("x", 443), "client": ("1.2.3.4", 1)}
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+        return Request(scope, receive)
+
+    try:
+        cfg.telnyx_public_key = pub_b64
+        now = int(datetime.now(timezone.utc).timestamp())
+        body = b'{"data":{}}'
+
+        # 30a: Signatur
+        checks = {
+            "gültig": tv.verify_signature(body, sign(body, now), str(now)),
+            "manipulierter Body": not tv.verify_signature(b'{"data":{"x":1}}', sign(body, now), str(now)),
+            "falscher Zeitstempel im Header": not tv.verify_signature(body, sign(body, now), str(now + 1)),
+            "zu alt (10 min)": not tv.verify_signature(body, sign(body, now - 600), str(now - 600)),
+            "Müll-Signatur": not tv.verify_signature(body, "@@@", str(now)),
+            "Müll-Zeitstempel": not tv.verify_signature(body, sign(body, now), "abc"),
+        }
+        cfg.telnyx_public_key = ""
+        checks["ohne öffentlichen Schlüssel: abgelehnt (fail-closed)"] = not tv.verify_signature(body, sign(body, now), str(now))
+        if all(checks.values()):
+            ok("telnyx verify_signature(): gültig ok; Manipulation, alter/falscher Zeitstempel, Müll und fehlender Schlüssel abgelehnt", f"{len(checks)} Checks")
+        else:
+            fail("telnyx verify_signature() unerwartet", str({k: v for k, v in checks.items() if not v}))
+        cfg.telnyx_public_key = pub_b64
+
+        # 30b: Ansage
+        cfg.missed_call_whatsapp_number = "+43 660 1112233"
+        cfg.missed_call_business_name = "Elektro Huber"
+        text = tv.build_announcement()
+        cfg.missed_call_whatsapp_number = ""
+        text_no_number = tv.build_announcement()
+        if ("Elektro Huber" in text and "plus vier drei" in text and "WhatsApp" in text and "automatische Ansage" in text
+                and "WhatsApp" not in text_no_number and tv.spoken_number("+4366") == "plus vier drei, sechs sechs"):
+            ok("Ansage: Betrieb + WhatsApp-Nummer ziffernweise vorgelesen, Hinweis auf automatische Ansage; ohne Nummer keine WhatsApp-Aufforderung")
+        else:
+            fail("Ansage unerwartet", text + " | " + text_no_number)
+        cfg.missed_call_whatsapp_number = "+436601112233"
+
+        # 30c: Event -> Aktion (vollständiger Anrufablauf, Duplikate, Statusreihenfolge)
+        sid, cc = "sess-" + uuid.uuid4().hex[:8], "cc-" + uuid.uuid4().hex[:8]
+        ev_init = {"event_type": "call.initiated", "occurred_at": "2026-09-25T10:00:00Z",
+                   "payload": {"call_control_id": cc, "call_session_id": sid, "from": "+436991234567", "to": "+43199999", "direction": "incoming"}}
+        a1 = tv.process_event(ev_init)
+        a1b = tv.process_event(ev_init)  # doppelt zugestellt: kein zweiter Datensatz
+        a2 = tv.process_event({"event_type": "call.answered", "payload": {"call_control_id": cc, "call_session_id": sid}})
+        a3 = tv.process_event({"event_type": "call.speak.ended", "payload": {"call_control_id": cc, "call_session_id": sid}})
+        a4 = tv.process_event({"event_type": "call.hangup", "payload": {"call_control_id": cc, "call_session_id": sid}})
+        out = tv.process_event({"event_type": "call.initiated", "payload": {"call_control_id": "x", "call_session_id": "s2", "direction": "outgoing"}})
+        rows = [r for r in tv.list_recent(200) if r["call_session_id"] == sid]
+        tv.advance_status(sid, "answered")  # Rückschritt wird ignoriert
+        rows_after = [r for r in tv.list_recent(200) if r["call_session_id"] == sid]
+        if (a1 and a1.name == "answer" and a1b and a1b.name == "answer" and a2 and a2.name == "speak"
+                and a2.body["language"] == "de-DE" and "Ansage" in a2.body["payload"]
+                and a3 and a3.name == "hangup" and a4 is None and out is None
+                and len(rows) == 1 and rows[0]["from"] == "+436991234567" and rows_after[0]["status"] == "hangup"):
+            ok("Anrufablauf: initiated->answer, answered->speak(de-DE), speak.ended->hangup; ein Datensatz, Status nur vorwärts, ausgehende Anrufe ignoriert")
+        else:
+            fail("Anrufablauf unerwartet", str((a1, a2, a3, a4, out, rows, rows_after)))
+
+        # 30d: Webhook-Handler: 403 ohne Signatur, gültig -> Befehl eingereiht, Duplikat verworfen
+        ev_id = "evt-" + uuid.uuid4().hex
+        payload = {"data": {"id": ev_id, "event_type": "call.answered", "payload": {"call_control_id": "cc-w", "call_session_id": "sess-w"}}}
+        raw = json.dumps(payload).encode()
+        try:
+            asyncio.run(m.telnyx_voice_webhook(make_request(raw, {"telnyx-signature-ed25519": "AAAA", "telnyx-timestamp": str(now)}), BackgroundTasks()))
+            rejected = False
+        except HTTPException as exc:
+            rejected = exc.status_code == 403
+        headers = {"telnyx-signature-ed25519": sign(raw, now), "telnyx-timestamp": str(now)}
+        tasks1, tasks2 = BackgroundTasks(), BackgroundTasks()
+        asyncio.run(m.telnyx_voice_webhook(make_request(raw, headers), tasks1))
+        asyncio.run(m.telnyx_voice_webhook(make_request(raw, headers), tasks2))
+        if rejected and len(tasks1.tasks) == 1 and len(tasks2.tasks) == 0:
+            ok("Telnyx-Webhook: falsche Signatur -> 403; gültiges Event -> Befehl im Hintergrund eingereiht; doppelte Zustellung verworfen")
+        else:
+            fail("Telnyx-Webhook unerwartet", str((rejected, len(tasks1.tasks), len(tasks2.tasks))))
+
+        # 30e: Befehle an die Telnyx-API (gemockt)
+        calls = []
+
+        def fake_post(url, **kw):
+            calls.append((url, kw))
+            r = mock.MagicMock()
+            r.status_code = 200
+            return r
+
+        cfg.telnyx_api_key = _FakeSecret("KEY")
+        with mock.patch.object(tv.httpx, "post", side_effect=fake_post):
+            good = tv.execute(tv.Action("hangup", "cc1", {"command_id": "h-cc1"}))
+        cfg.telnyx_api_key = _FakeSecret("")
+        no_key = tv.execute(tv.Action("hangup", "cc1", {}))
+        with mock.patch.object(tv.httpx, "post", side_effect=RuntimeError("net")):
+            cfg.telnyx_api_key = _FakeSecret("KEY")
+            boom = tv.execute(tv.Action("hangup", "cc1", {}))
+        if (good and calls[0][0].endswith("/calls/cc1/actions/hangup")
+                and calls[0][1]["headers"]["Authorization"] == "Bearer KEY" and no_key is False and boom is False):
+            ok("execute(): richtiger Endpunkt + Bearer; ohne API-Key oder bei Netzfehler -> False statt Exception")
+        else:
+            fail("execute() unerwartet", str((good, calls, no_key, boom)))
+
+        # 30f: interne Liste nur mit API-Key
+        route = [r for r in m.app.routes if getattr(r, "path", "") == "/api/v1/internal/missed-calls"]
+        if route and route[0].dependant.dependencies:
+            ok("/api/v1/internal/missed-calls hängt an require_api_key")
+        else:
+            fail("/internal/missed-calls ohne Auth-Dependency")
+    except Exception:
+        fail("Telnyx-Test — Exception")
+        traceback.print_exc()
+    finally:
+        cfg.telnyx_public_key, cfg.telnyx_api_key, cfg.missed_call_whatsapp_number, cfg.missed_call_business_name = orig
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -3400,6 +3549,7 @@ def main() -> int:
     test_followup_digest()
     test_mcp_http_auth()
     test_hardening_2026_09_25()
+    test_telnyx_missed_calls()
     test_prospect_audit()
     test_outbound_guard()
 

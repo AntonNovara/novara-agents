@@ -519,6 +519,12 @@ Der Sequence Scheduler hatte keinen Worker. Bewusst KEIN automatischer Versand v
 
 ---
 
+## Anfragen-Starter: verpasste Anrufe über Telnyx (25.09.2026, `tools/telnyx_voice.py`)
+
+Der Handwerker leitet sein Telefon BEDINGT (nicht erreichbar/besetzt/keine Antwort, GSM-Codes `**61`, `**67`, `**62`) auf eine virtuelle österreichische Telnyx-Nummer um. Telnyx (Call Control) schickt Events an `POST /api/v1/webhook/telnyx/voice`: `call.initiated` (incoming) → Anruf in Tabelle `missed_calls` speichern + `answer`; `call.answered` → `speak` (de-DE): Betrieb nicht erreichbar, bitte per WhatsApp schreiben (Nummer ziffernweise, "automatische Ansage"); `call.speak.ended` → `hangup`. Die Ansage bringt den Anrufer zu WhatsApp (Opt-in + kostenloses 24-h-Fenster). Keine Aufzeichnung. Sicherheit: Ed25519-Signatur jedes Webhooks (`telnyx-signature-ed25519`, `telnyx-timestamp`, Nachricht `timestamp|rohbody`, Toleranz 5 min), **ohne `TELNYX_PUBLIC_KEY` wird alles abgelehnt** (fail-closed, auch lokal); Duplikate über Event-ID; Status nur vorwärts; Rufnummern in Logs maskiert. `GET /api/v1/internal/missed-calls` (API-Key) listet die Anrufe. Env: `TELNYX_API_KEY`, `TELNYX_PUBLIC_KEY`, `TELNYX_VOICE` (Default `AWS.Polly.Vicki`, **nicht gegen Telnyx verifiziert**), `MISSED_CALL_WHATSAPP_NUMBER`, `MISSED_CALL_BUSINESS_NAME`. **Status: gegen die Doku gebaut, noch NICHT gegen eine echte Telnyx-Nummer getestet** -- offen: Name der deutschen Stimme, echte Payloads von answered/speak.ended/hangup, ob `from` bei umgeleiteten Anrufen die Original-Nummer trägt (betreiberabhängig), Wiener Nummern bei Telnyx, KYC (Wohnsitz in Österreich, Einzelunternehmen ggf. Rückfrage beim Support). Single-Tenant (eine Ansage); Multi-Tenant (Zuordnung `to`-Nummer → Betrieb) ist der nächste Schritt. Regressionstest: TEST 30.
+
+---
+
 ## Sprint 3: Architektur & Skalierbarkeit (16.09.2026)
 
 Drei Infrastruktur-Bausteine, alle aus der bisherigen Roadmap/"Bekannte

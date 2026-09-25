@@ -157,6 +157,21 @@ class Settings(BaseSettings):
         """True, wenn Senden über die WhatsApp Cloud API möglich ist."""
         return bool(self.whatsapp_access_token.get_secret_value() and self.whatsapp_phone_number_id)
 
+    # "Anfragen-Starter" -- verpasste Anrufe (tools/telnyx_voice.py, main.py
+    # POST /api/v1/webhook/telnyx/voice): Telnyx Call Control. Ohne TELNYX_PUBLIC_KEY
+    # lehnt der Webhook JEDE Anfrage ab (fail-closed).
+    #  - telnyx_api_key: API-Key v2 (Bearer) für answer/speak/hangup.
+    #  - telnyx_public_key: Ed25519-Public-Key (Base64) der Telnyx-Konto-Einstellungen.
+    #  - telnyx_voice: Name der TTS-Stimme; die deutsche Stimme ist NOCH NICHT gegen
+    #    Telnyx verifiziert (siehe Modul-Docstring).
+    #  - missed_call_whatsapp_number: WhatsApp-Nummer (E.164), die die Ansage nennt.
+    #  - missed_call_business_name: Name des Betriebs in der Ansage.
+    telnyx_api_key: SecretStr = Field(default="", alias="TELNYX_API_KEY")
+    telnyx_public_key: str = Field(default="", alias="TELNYX_PUBLIC_KEY")
+    telnyx_voice: str = Field(default="AWS.Polly.Vicki", alias="TELNYX_VOICE")
+    missed_call_whatsapp_number: str = Field(default="", alias="MISSED_CALL_WHATSAPP_NUMBER")
+    missed_call_business_name: str = Field(default="", alias="MISSED_CALL_BUSINESS_NAME")
+
     # Baustellen-Voice-Assistant (main.py _transcribe_audio()): Groq-API-Key
     # für Speech-to-Text (whisper-large-v3) von WhatsApp-Sprachnachrichten.
     # Ohne Key liefert _transcribe_audio() None (fail-safe, kein Absturz) --
