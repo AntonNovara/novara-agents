@@ -1,0 +1,23 @@
+{
+  "client_id": "beispiel-elektro",
+  "firmenname": "Beispiel Elektro GmbH",
+  "branche": "Elektrikerbetrieb",
+  "servicegebiet": "Wien und Umgebung",
+  "leistungen": [
+    "Elektroinstallation Neubau & Sanierung",
+    "Wallbox-Installation",
+    "Störungsbehebung / Notdienst",
+    "E-Check / Prüfungen"
+  ],
+  "notdienst_regel": "Bei Stromausfall, Kurzschluss oder Brandgeruch sofort auf den Notdienst hinweisen und die Telefonnummer nennen -- kein Terminvorschlag, sondern direkter Rückruf.",
+  "buchungslink": "https://calendar.app.google/BEISPIEL",
+  "haeufige_fragen": [
+    { "frage": "Was kostet eine Steckdose setzen?", "antwort": "Das hängt vom Aufwand vor Ort ab -- wir schauen uns das am liebsten kurz an oder besprechen es im Erstgespräch, damit die Zusage verbindlich ist." },
+    { "frage": "Wie schnell könnt ihr kommen?", "antwort": "Bei normalen Anfragen meist innerhalb weniger Tage, bei Notdienst so schnell wie möglich -- am besten kurz die Dringlichkeit im Chat nennen." }
+  ],
+  "ansprechpartner": "Max Mustermann",
+  "telefonnummer": "+43 664 0000000",
+  "ton": "freundlich, professionell, per Sie",
+  "preise_oeffentlich": false,
+  "preishinweise": ""
+}

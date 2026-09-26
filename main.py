@@ -33,6 +33,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from agents.base_agent import AgentRequest, AgentResponse
+from agents.client_receptionist_agent import ClientReceptionistAgent
 from agents.field_worker_agent import FieldWorkerAgent
 from agents.guardian_agent import GuardianAgent
 from agents.onboarding_agent import OnboardingAgent
@@ -42,6 +43,7 @@ from agents.sdr_agent import SDRAgent
 from agents.support_agent import SupportAgent
 from agents.voice_agent import VoiceAgent
 from core import consent, lead_capture
+from core.client_profiles import ClientProfileInvalidError, ClientProfileNotFoundError
 from core.config import settings
 from core.security import OutputBlockedError, SecurityLayer
 from tools import lead_notifier, sequence_scheduler, telnyx_voice, whatsapp_cloud
@@ -88,6 +90,12 @@ _CALENDAR_TOOL: Optional[GoogleCalendarTool] = None
 # AgentRequest/AgentResponse), passt nicht ins generische BaseAgent-Interface.
 _GUARDIAN_AGENT: Optional[GuardianAgent] = None
 
+# Pilotprogramm (clients/README.md): ein ClientReceptionistAgent pro
+# Betriebsprofil unter clients/*.json, beim Start eingelesen -- analog zu
+# _AGENT_REGISTRY, damit ein kaputtes Profil beim Deploy sofort auffällt
+# statt erst beim ersten Chat-Request eines Pilotkunden.
+_CLIENT_AGENTS: dict[str, ClientReceptionistAgent] = {}
+
 
 def _build_registry() -> dict:
     return {
@@ -100,11 +108,32 @@ def _build_registry() -> dict:
     }
 
 
+def _build_client_agents() -> dict[str, ClientReceptionistAgent]:
+    """Lädt ein ClientReceptionistAgent pro clients/<client_id>.json (Dateien,
+    die mit "_" beginnen -- z. B. _vorlage.json -- sind keine echten Profile
+    und werden übersprungen). Ein einzelnes kaputtes Profil darf die anderen
+    Piloten oder den Rest des Deployments nicht mitreißen -- Fehler werden
+    geloggt, das Deployment startet trotzdem, der betroffene Kunde bekommt
+    dann beim Chat-Aufruf einen klaren 404/500 statt eines toten Prozesses."""
+    agents: dict[str, ClientReceptionistAgent] = {}
+    clients_dir = Path(__file__).parent / "clients"
+    if not clients_dir.is_dir():
+        return agents
+    for path in sorted(clients_dir.glob("*.json")):
+        if path.stem.startswith("_"):
+            continue
+        try:
+            agents[path.stem] = ClientReceptionistAgent(path.stem)
+        except Exception:
+            log.exception("Betriebsprofil konnte nicht geladen werden", client=path.stem)
+    return agents
+
+
 # ── Application Lifespan ──────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _AGENT_REGISTRY, _VOICE_AGENT, _CALENDAR_TOOL, _GUARDIAN_AGENT
+    global _AGENT_REGISTRY, _VOICE_AGENT, _CALENDAR_TOOL, _GUARDIAN_AGENT, _CLIENT_AGENTS
     log.info("Novara Agent Factory starting", environment=settings.environment)
 
     # Persistenter Store (core/db.py) für consent/customer_state/lead_capture/
@@ -141,6 +170,9 @@ async def lifespan(app: FastAPI):
     # Anthropic-Teil seines Audits, daher erst NACH VoiceAgent() konstruiert.
     _GUARDIAN_AGENT = GuardianAgent(voice_agent=_VOICE_AGENT)
     log.info("Agent registry initialised", agents=list(_AGENT_REGISTRY.keys()))
+
+    _CLIENT_AGENTS = _build_client_agents()
+    log.info("Pilotkunden-Rezeptionisten initialisiert", clients=list(_CLIENT_AGENTS.keys()))
 
     # Egress/Auth gegen die Anthropic-API beim Start verifizieren, damit ein
     # APIConnectionError (z. B. blockierter Egress auf Railway) sofort in den
@@ -705,6 +737,99 @@ async def landing_chat(request: Request, payload: LandingChatRequest) -> Landing
         booking_url=sanitized.get("booking_url"),
         icp_score=(sanitized.get("icp") or {}).get("score", 0),
         dlp_findings=input_dlp.findings,
+    )
+
+
+# ── Pilotprogramm: Rezeptionist für einen einzelnen Kunden ───────────────────
+
+class ClientChatRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, max_length=100)
+    message: str = Field(..., min_length=1, max_length=2_000)
+    visitor_info: LandingVisitorInfo = Field(default_factory=LandingVisitorInfo)
+
+
+class ClientChatResponse(BaseModel):
+    success: bool
+    session_id: str
+    reply: str = ""
+    urgent: bool = False
+    should_offer_booking: bool = False
+    booking_url: Optional[str] = None
+    error: Optional[str] = None
+
+
+@app.post(
+    "/api/v1/chat/client/{client_id}",
+    response_model=ClientChatResponse,
+    tags=["Chat"],
+    summary="Pilotprogramm: WhatsApp/Web-Rezeptionist für EINEN Kunden (clients/<client_id>.json)",
+    responses={
+        200: {"description": "Antwort generiert (auch bei DLP-Block: success=false, kein 4xx/5xx)"},
+        404: {"description": "Kein Betriebsprofil für diese client_id (siehe clients/README.md)"},
+        422: {"description": "Validierungsfehler im Request-Body"},
+        429: {"description": "Rate limit überschritten (20 Requests/Minute pro IP)"},
+    },
+)
+@limiter.limit("20/minute")
+async def client_chat(request: Request, client_id: str, payload: ClientChatRequest) -> ClientChatResponse:
+    """
+    ÖFFENTLICH, KEIN API-Key -- exakt dieselbe Begründung wie landing_chat()
+    oben (das Skript, das diesen Endpoint aufruft, läuft im Browser jedes
+    anonymen Website-Besuchers eines PILOTKUNDEN, nicht nur von Novara
+    selbst). agents/client_receptionist_agent.py beantwortet FÜR den unter
+    `client_id` hinterlegten Betrieb (clients/<client_id>.json,
+    clients/README.md), niemals über Novara selbst -- siehe dessen
+    Moduldocstring für die Abgrenzung zu landing_chat()/InboundChatGraph.
+
+    Rate-Limiting/DLP identisch zu landing_chat() (gleiche Bedrohungslage:
+    öffentlicher Endpoint, der pro Request einen echten LLM-Call auslöst).
+    """
+    agent = _CLIENT_AGENTS.get(client_id)
+    if agent is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Kein Betriebsprofil für '{client_id}' gefunden.",
+        )
+
+    input_dlp = SecurityLayer.check_and_redact(payload.message)
+    if not input_dlp.approved:
+        log.warning(
+            "Client chat blocked by DLP",
+            client=client_id, session=payload.session_id, reason=input_dlp.blocked_reason,
+        )
+        return ClientChatResponse(
+            success=False,
+            session_id=payload.session_id,
+            error=f"Input blocked by DLP: {input_dlp.blocked_reason}",
+        )
+
+    try:
+        result = agent.process_chat(
+            session_id=payload.session_id,
+            message=input_dlp.redacted_text,
+            visitor_info=payload.visitor_info.model_dump(),
+        )
+    except Exception as exc:
+        log.exception("Client chat failed", client=client_id, session=payload.session_id)
+        return ClientChatResponse(success=False, session_id=payload.session_id, error=str(exc))
+
+    try:
+        sanitized = SecurityLayer.sanitize_dict(result)
+    except OutputBlockedError as exc:
+        log.warning("Client chat output blocked by DLP", client=client_id, session=payload.session_id)
+        return ClientChatResponse(
+            success=False,
+            session_id=payload.session_id,
+            error=f"Output blocked by DLP: {exc.blocked_reason}",
+        )
+
+    return ClientChatResponse(
+        success=True,
+        session_id=payload.session_id,
+        reply=sanitized.get("reply", ""),
+        urgent=sanitized.get("urgent", False),
+        should_offer_booking=sanitized.get("should_offer_booking", False),
+        booking_url=sanitized.get("booking_url"),
     )
 
 

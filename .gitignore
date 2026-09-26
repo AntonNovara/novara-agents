@@ -10,6 +10,13 @@ build/
 .pytest_cache/
 *.log
 *.json
+# Ausnahme zur globalen *.json-Regel oben (die eigentlich Secrets wie
+# credentials.json treffen soll): Pilotprogramm-Betriebsprofile
+# (clients/README.md) sind keine Secrets und müssen committet werden,
+# sonst greift der dort dokumentierte "Profil ändern -> committen -> Push
+# löst Redeploy aus"-Workflow nie -- gefunden erst beim ersten Testcommit,
+# *.json hatte sie bis dahin lautlos verschluckt.
+!clients/*.json
 get_token.py
 
 # Baustellen-Voice-Assistant: zur Laufzeit generierte Regieberichte

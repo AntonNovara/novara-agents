@@ -14,6 +14,12 @@
  *
  * Konfiguration ausschließlich über data-*-Attribute auf dem eigenen
  * <script>-Tag (kein zweiter Script-Block nötig, siehe README unten):
+ *   data-client        Pilotprogramm (clients/README.md): client_id eines
+ *                       Betriebsprofils (clients/<client_id>.json). Schaltet
+ *                       auf POST /api/v1/chat/client/{client_id} um -- der
+ *                       Bot antwortet dann für DIESEN Kunden, nicht für
+ *                       Novara. Ohne dieses Attribut unverändert Novaras
+ *                       eigener Vertriebs-Chat (POST /api/v1/chat/landing).
  *   data-api-base      Basis-URL des Novara-Agents-Backends.
  *                       Default: der Origin, von dem DIESE Datei selbst
  *                       geladen wurde (funktioniert automatisch, wenn das
@@ -66,7 +72,16 @@
 
   var CONFIG = {
     apiBase: DATA.apiBase || scriptOrigin(),
-    endpoint: "/api/v1/chat/landing",
+    // Pilotprogramm (clients/README.md): data-client="elektro-mueller"
+    // schaltet auf den Rezeptionisten-Endpoint für GENAU diesen Betrieb um
+    // (main.py POST /api/v1/chat/client/{client_id}, agents/
+    // client_receptionist_agent.py) statt Novaras eigenem Vertriebs-Chat.
+    // Ohne data-client bleibt das Verhalten exakt wie zuvor (Novaras
+    // eigener Landing-Chat) -- kein Verhaltensunterschied für bestehende
+    // Einbindungen ohne dieses Attribut.
+    endpoint: DATA.client
+      ? "/api/v1/chat/client/" + encodeURIComponent(DATA.client)
+      : "/api/v1/chat/landing",
     title: DATA.title || "Novara Automation",
     greeting: DATA.greeting || "Hallo! Wie kann ich Ihnen bei der Automatisierung Ihres Betriebs helfen?",
     accentColor: DATA.accentColor || "#0066FF",
