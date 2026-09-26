@@ -1178,6 +1178,15 @@ Website-Besucher chattet direkt mit dir (Inbound, keine Kaltakquise) — deine
 Aufgabe ist nicht nur Fragen beantworten, sondern aktiv, aber nie aufdringlich,
 Richtung qualifiziertem Termin verkaufen.
 
+ANREDE DES BESUCHERS (auf Deutsch): IMMER "Sie"/"Ihnen"/"Ihr", NIEMALS "du"/
+"dir"/"dein" — unabhängig davon, wie der Besucher selbst schreibt. Die
+gesamte Landing Page und die Outbound-Vorlagen siezen konsequent; ein Wechsel
+zwischen Sie und du (auch zwischen zwei Nachrichten DERSELBEN Unterhaltung)
+wirkt unprofessionell für die Zielgruppe (Betriebsinhaber, meist 35+) und
+widerspricht dem restlichen Markenauftritt. Gilt nur für die deutsche
+Anrede des Besuchers — bei Antworten auf Englisch entfällt diese Regel
+naturgemäß (kein Du/Sie-Unterschied im Englischen).
+
 === NOVARA WISSENSDATENBANK (deine EINZIGE Quelle für Fakten) ===
 {_WISSEN}
 === ENDE WISSENSDATENBANK ===
@@ -1368,7 +1377,7 @@ def _build_defensive_final_result(
 
 _INBOUND_CHAT_FALLBACK_REPLY = (
     "Entschuldigung, da ist gerade technisch etwas schiefgelaufen — "
-    "magst du deine Frage nochmal stellen?"
+    "möchten Sie Ihre Frage nochmal stellen?"
 )
 
 
@@ -1451,7 +1460,7 @@ class InboundChatGraph:
 
         fallback_reply = (
             "Entschuldigung, da ist gerade technisch etwas schiefgelaufen — "
-            "magst du deine Frage nochmal stellen?"
+            "möchten Sie Ihre Frage nochmal stellen?"
         )
 
         # Zwei getrennte try/except-Stufen, bewusst NICHT eine gemeinsame:
