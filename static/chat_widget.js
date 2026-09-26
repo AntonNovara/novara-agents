@@ -68,7 +68,7 @@
     apiBase: DATA.apiBase || scriptOrigin(),
     endpoint: "/api/v1/chat/landing",
     title: DATA.title || "Novara Automation",
-    greeting: DATA.greeting || "Hallo! Wie kann ich dir bei der Automatisierung deines Betriebs helfen?",
+    greeting: DATA.greeting || "Hallo! Wie kann ich Ihnen bei der Automatisierung Ihres Betriebs helfen?",
     accentColor: DATA.accentColor || "#0066FF",
     avatarSrc: DATA.avatarSrc || "",
     visitorName: DATA.visitorName || "",
@@ -301,7 +301,7 @@
     link.target = "_blank";
     link.rel = "noopener noreferrer";
     link.textContent = "→ Kostenloses Erstgespräch buchen";
-    div.appendChild(document.createTextNode("Klingt, als könnten wir dir helfen! "));
+    div.appendChild(document.createTextNode("Klingt, als könnten wir Ihnen helfen! "));
     div.appendChild(link);
     panel.insertBefore(div, panel.querySelector("#novara-chat-input-row"));
   }
@@ -504,7 +504,7 @@
         if (!result.ok || !data.success) {
           renderMessage(
             "bot",
-            "Entschuldigung, deine Nachricht konnte gerade nicht verarbeitet werden. Bitte versuch es später erneut."
+            "Entschuldigung, Ihre Nachricht konnte gerade nicht verarbeitet werden. Bitte versuchen Sie es später erneut."
           );
           return;
         }
@@ -520,7 +520,7 @@
         typingEl.remove();
         renderMessage(
           "bot",
-          "Verbindungsfehler. Bitte überprüfe deine Internetverbindung und versuch es erneut."
+          "Verbindungsfehler. Bitte überprüfen Sie Ihre Internetverbindung und versuchen Sie es erneut."
         );
       })
       .finally(function () {
