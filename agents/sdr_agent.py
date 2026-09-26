@@ -174,6 +174,37 @@ _GREETING_WITH_NAME = re.compile(
 
 UNKNOWN_CONTACT_NAME = "Unbekannt"
 
+# Bedarfs-Evidenz (Outbound): ein Lead wird nur angeschrieben, wenn ENTWEDER der Lead-Text ein
+# Problem beschreibt, das Novara löst, ODER die Website-Prüfung eine echte Lücke bei der
+# Anfragen-Erreichbarkeit zeigt. Branche allein (ICP) reicht nicht -- ein passender Betrieb
+# ohne erkennbaren Schmerz bekäme sonst einen Pitch für ein Problem, das er evtl. nicht hat.
+# Bewusst per Regex über den ORIGINAL-Text, nicht über die LLM-`pain_points`: das LLM füllt
+# diese Liste auch ohne Beleg aus der Wissensdatenbank auf.
+_PAIN_RE = re.compile(
+    r"(verpass|nicht erreichbar|niemand (nimmt|geht)|geht (keiner|niemand) ran|klingelt|"
+    r"rückruf|rückmeldung|zurückgerufen|warten (tage|lange)|"
+    r"von hand|händisch|manuell|excel|zettel|papier|abends[^.]{0,30}(angebot|schreib|erstell)|"
+    r"(anfragen|nachrichten|whatsapp)[^.]{0,40}(untergehen|gehen unter|verloren|liegen|übersehen)|"
+    r"kein(e)? (crm|system|terminbuchung|online)|(keine|wenig|zu wenig) zeit|"
+    r"missed call|manual|unanswered)",
+    re.IGNORECASE,
+)
+_NEED_CHECK_IDS = {"whatsapp", "tel", "form"}  # Lücken, die Novaras Angebot direkt adressiert
+
+
+def _need_evidence(state: "SDRState") -> list[str]:
+    """Belege für echten Bedarf; leere Liste = kein erkennbarer Bedarf."""
+    evidence: list[str] = []
+    m = _PAIN_RE.search(state.get("input_text") or "")
+    if m:
+        evidence.append(f"Lead-Text nennt Problem ('{m.group(0).strip()}')")
+    audit = state.get("audit") or {}
+    if audit and not audit.get("error"):
+        gaps = [c["label"] for c in audit.get("checks", []) if not c["passed"] and c["id"] in _NEED_CHECK_IDS]
+        if gaps:
+            evidence.append("Website-Lücke: " + ", ".join(gaps))
+    return evidence
+
 
 def _contact_display_name(state: "SDRState", top: dict) -> str:
     """Name des Kontakts für CRM/Customer-State/Ergebnis. Bei einem vom LLM erfundenen
@@ -248,6 +279,43 @@ def _strip_markdown_fence(text: str) -> str:
     stripped = text.strip()
     match = re.match(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", stripped, re.DOTALL)
     return match.group(1).strip() if match else stripped
+
+
+_JSON_KEYS = "company_name|industry|company_size|pain_points|icp_score|icp_rationale|language|contact_name"
+
+
+def _salvage_broken_json(text: str) -> dict:
+    """
+    Rettet Felder aus einer JSON-artigen LLM-Antwort, die als JSON ungültig ist -- typisch:
+    ein gerades " mitten im reply-Text (z. B. „Der Autonome Betrieb" mit deutschem Öffnungs-
+    und ASCII-Schlusszeichen). Ohne das würde der Besucher den ROHEN JSON-Text samt interner
+    Felder (icp_rationale, ...) im Chat sehen. Nur Best-Effort für die einfachen Felder;
+    leer, wenn nicht einmal ein reply gefunden wird.
+    """
+    body = _strip_markdown_fence(text)
+    m = re.search(r'"reply"\s*:\s*"', body)
+    if not m:
+        return {}
+    rest = body[m.end():]
+    end = re.search(rf'"\s*,\s*"(?:{_JSON_KEYS})"\s*:', rest)
+    reply_raw = rest[: end.start()] if end else rest.rstrip().rstrip("}").rstrip().rstrip('"')
+    reply = reply_raw.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\").strip()
+    if not reply:
+        return {}
+    out: dict = {"reply": reply}
+    score = re.search(r'"icp_score"\s*:\s*(\d{1,3})', body)
+    if score:
+        out["icp_score"] = int(score.group(1))
+    for key in ("company_name", "industry", "language"):
+        f = re.search(rf'"{key}"\s*:\s*"([^"\n]*)"', body)
+        if f:
+            out[key] = f.group(1)
+    return out
+
+
+def _looks_like_json(text: str) -> bool:
+    body = _strip_markdown_fence(text or "")
+    return body.startswith("{") or '"reply"' in body
 
 
 def _parse_llm_json(text: str) -> dict:
@@ -335,6 +403,10 @@ class SDRState(TypedDict):
     # set by audit_prospect (leer, wenn keine Website im Input oder Audit fehlgeschlagen)
     website_url: str
     audit: dict
+
+    # set by need_check
+    need_evidence: list[str]   # Belege für echten Bedarf (leer -> disqualifiziert)
+    need_checked: bool         # True, sobald need_check gelaufen ist (für die Ablehnungsmeldung)
 
     # set by compose_outreach
     outreach_text: str
@@ -639,6 +711,13 @@ class SDRGraph:
             return {**state, "website_url": url, "audit": {"error": result.error, "audit_id": result.audit_id}}
         return {**state, "website_url": url, "audit": result.to_dict()}
 
+    # ── Node: need_check ─────────────────────────────────────────────────────
+
+    def need_check(self, state: SDRState) -> SDRState:
+        logger.info("Node: need_check", extra={"session": state["session_id"]})
+        evidence = _need_evidence(state)
+        return {**state, "need_evidence": evidence, "need_checked": True, "qualified": bool(evidence)}
+
     # ── Node: compose_outreach ───────────────────────────────────────────────
 
     def compose_outreach(self, state: SDRState) -> SDRState:
@@ -791,7 +870,11 @@ class SDRGraph:
             identifiers=identifiers,
             first_channel=state["outreach_channel"],
             first_success=bool(crm_result.get("success")),
-            first_reason=crm_result.get("message", ""),
+            first_reason=(
+                crm_result.get("message", "")
+                if identifiers.get(state["outreach_channel"])
+                else "Entwurf im CRM gespeichert, KEINE Adresse bekannt -- manuell versenden"
+            ),
         )
         return {**state, "sequence_id": seq.sequence_id}
 
@@ -830,6 +913,7 @@ class SDRGraph:
                 "message": state["outreach_text"],
                 "guard_violations": state.get("outreach_guard_violations", []),
             },
+            "need_evidence": state.get("need_evidence", []),
             "website_audit": (
                 {"url": state.get("website_url", ""), "score": state["audit"].get("score"),
                  "audit_id": state["audit"].get("audit_id"), "error": state["audit"].get("error", "")}
@@ -898,10 +982,16 @@ class SDRGraph:
             "lead_score": state["lead_score"],
             "score_rationale": state["score_rationale"],
             "message": (
-                f"Lead '{state['company_name']}' disqualifiziert "
-                f"(Score {state['lead_score']}, min. {QUALIFICATION_THRESHOLD}; ICP {state['icp_score']}, "
-                f"min. {OUTBOUND_MIN_ICP} für Outbound). "
+                f"Lead '{state['company_name']}' disqualifiziert: kein erkennbarer Bedarf "
+                "(weder im Lead-Text noch auf der Website ein Problem, das Novara löst). "
                 "Kein CRM-Eintrag, keine Outreach-Nachricht erstellt."
+                if state.get("need_checked") and not state.get("need_evidence")
+                else (
+                    f"Lead '{state['company_name']}' disqualifiziert "
+                    f"(Score {state['lead_score']}, min. {QUALIFICATION_THRESHOLD}; ICP {state['icp_score']}, "
+                    f"min. {OUTBOUND_MIN_ICP} für Outbound). "
+                    "Kein CRM-Eintrag, keine Outreach-Nachricht erstellt."
+                )
             ),
         }
         return {**state, "final_result": final, "error": None}
@@ -936,6 +1026,7 @@ class SDRGraph:
         graph.add_node("score_lead", self.score_lead)
         graph.add_node("check_consent", self.check_consent)
         graph.add_node("audit_prospect", self.audit_prospect)
+        graph.add_node("need_check", self.need_check)
         graph.add_node("compose_outreach", self.compose_outreach)
         graph.add_node("write_to_crm", self.write_to_crm)
         graph.add_node("schedule_sequence", self.schedule_sequence)
@@ -963,7 +1054,12 @@ class SDRGraph:
                 "finalize_opted_out": "finalize_opted_out",
             },
         )
-        graph.add_edge("audit_prospect", "compose_outreach")
+        graph.add_edge("audit_prospect", "need_check")
+        graph.add_conditional_edges(
+            "need_check",
+            lambda st: "compose_outreach" if st["qualified"] else "finalize_disqualified",
+            {"compose_outreach": "compose_outreach", "finalize_disqualified": "finalize_disqualified"},
+        )
         graph.add_edge("compose_outreach", "write_to_crm")
         graph.add_edge("write_to_crm", "schedule_sequence")
         graph.add_edge("schedule_sequence", "finalize")
@@ -995,6 +1091,8 @@ class SDRGraph:
             "consent_reason": "",
             "website_url": "",
             "audit": {},
+            "need_evidence": [],
+            "need_checked": False,
             "outreach_text": "",
             "outreach_subject": "",
             "crm_result": {},
@@ -1148,7 +1246,9 @@ Gespräch — erfinde nie einen Namen oder eine Adresse, die nicht genannt wurde
 Gib AUSSCHLIESSLICH valides JSON zurück (kein Text davor/danach):
 {{
   "reply": string (deine Chat-Antwort an den Besucher, in der Sprache des Besuchers,
-                   2-5 Sätze, kein Technik-Jargon wie "LangGraph" oder "Agent"),
+                   2-5 Sätze, kein Technik-Jargon wie "LangGraph" oder "Agent";
+                   KEINE geraden Anführungszeichen " im Text -- sie zerstören das JSON;
+                   Paketnamen ohne Anführungszeichen schreiben),
   "company_name": string (bereits bekannter oder neu genannter Firmenname, sonst ""),
   "industry": string (z.B. "Elektrikerbetrieb", "Installateur", "Malerbetrieb", ..., sonst ""),
   "company_size": integer oder null,
@@ -1389,7 +1489,22 @@ class InboundChatGraph:
                 "receptionist_node: LLM-Antwort war kein valides JSON, nutze Rohtext als Antwort: %s",
                 exc,
             )
-            raw_reply = _strip_markdown_fence(response.content) if isinstance(response.content, str) else ""
+            content = response.content if isinstance(response.content, str) else ""
+            salvaged = _salvage_broken_json(content)
+            if salvaged:
+                logger.info("receptionist_node: reply aus kaputtem JSON gerettet")
+                return {
+                    **state,
+                    "reply_text": salvaged["reply"],
+                    "company_name": salvaged.get("company_name") or state["company_name"],
+                    "industry": salvaged.get("industry") or state["industry"],
+                    "icp_score": max(state["icp_score"], salvaged.get("icp_score", 0)),
+                    "language": salvaged.get("language") or state["language"],
+                }
+            # Sieht nach JSON aus, ließ sich aber nicht retten: NIE rohes JSON an den Besucher.
+            if _looks_like_json(content):
+                return {**state, "reply_text": fallback_reply}
+            raw_reply = _strip_markdown_fence(content)
             return {**state, "reply_text": raw_reply or fallback_reply}
 
         new_score = int(data.get("icp_score", state["icp_score"]))

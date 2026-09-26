@@ -3714,10 +3714,10 @@ def test_sdr_prospect_audit_integration() -> None:
                 fail("Disqualifizierter Lead löste Audit aus", str((calls, fr.get("qualified"))))
 
             calls.clear(); behaviour["mode"] = "raise"
-            fr, llm = run("Testbetrieb Alpha, Elektriker Wien, www.testbetrieb-alpha.at", 90)
+            fr, llm = run("Testbetrieb Alpha, Elektriker Wien, www.testbetrieb-alpha.at, verpasst Anrufe", 90)
             raised_ok = bool(fr.get("outreach", {}).get("message")) and fr["website_audit"] == {}
             calls.clear(); behaviour["mode"] = "error"
-            fr2, llm2 = run("Testbetrieb Alpha, Elektriker Wien, www.testbetrieb-alpha.at", 90)
+            fr2, llm2 = run("Testbetrieb Alpha, Elektriker Wien, www.testbetrieb-alpha.at, verpasst Anrufe", 90)
             if raised_ok and fr2["website_audit"].get("error") == "HTTP 500" and "Website-Check" not in llm2.outreach_contexts[0] \
                     and fr2["outreach"]["message"]:
                 ok("Audit wirft / Website nicht abrufbar: Outreach wird trotzdem erzeugt, kein Faktenblock, Fehler in final_result")
@@ -3773,7 +3773,7 @@ def test_sdr_generated_contact_crm() -> None:
 
         def run(company, tag, extra=""):
             crm = _CapturingCRM()
-            res = SDRGraph(_LLM(company), LeadDatabase(), crm).run(f"{company}, Elektriker Wien, 6 MA ({tag}) {extra}", f"t-crm-{tag}")
+            res = SDRGraph(_LLM(company), LeadDatabase(), crm).run(f"{company}, Elektriker Wien, 6 MA ({tag}) verpasst Anrufe {extra}", f"t-crm-{tag}")
             return crm.records[0], res.get("final_result", res)
 
         orig_live, orig_audit = settings.sdr_crm_live_sheet, pa.run_audit
@@ -3858,10 +3858,10 @@ def test_sdr_crm_website_column() -> None:
         settings.sdr_crm_live_sheet = False  # niemals ins echte CRM-Sheet schreiben
         pa.run_audit = fake_audit
         try:
-            ok_rec = run("Testbetrieb Omega, Elektriker Wien, 5 MA, omega-elektro.at")
+            ok_rec = run("Testbetrieb Omega, Elektriker Wien, 5 MA, omega-elektro.at, verpasst Anrufe")
             mode["m"] = "error"
-            err_rec = run("Testbetrieb Omega, Elektriker Wien, 5 MA, omega-elektro.at")
-            none_rec = run("Testbetrieb Omega, Elektriker Wien, 5 MA, office@omega-elektro.at")
+            err_rec = run("Testbetrieb Omega, Elektriker Wien, 5 MA, omega-elektro.at, verpasst Anrufe")
+            none_rec = run("Testbetrieb Omega, Elektriker Wien, 5 MA, office@omega-elektro.at, verpasst Anrufe")
             row = _lead_record_to_sheet_row(ok_rec)
             row_none = _lead_record_to_sheet_row(none_rec)
             if (ok_rec.website == "https://www.omega-elektro.at/start" and row["website"] == ok_rec.website
@@ -3874,6 +3874,184 @@ def test_sdr_crm_website_column() -> None:
             settings.sdr_crm_live_sheet, pa.run_audit = orig_live, orig_audit
     except Exception:
         fail("CRM-Website — Exception")
+        traceback.print_exc()
+
+
+# ── Bedarfs-Gate ─────────────────────────────────────────────────────────────
+
+def test_sdr_need_gate() -> None:
+    section("TEST — SDR: nur Leads mit erkennbarem Bedarf (Lead-Text ODER Website-Lücke)")
+    try:
+        import json as _json
+        from langchain_core.messages import AIMessage
+        from agents.sdr_agent import SDRGraph, _PAIN_RE
+        from core.config import settings
+        from core.llm import _extract_text
+        from tools import prospect_audit as pa
+        from tools.crm_integration import CRMIntegrationSDR
+        from tools.lead_database import LeadDatabase
+
+        class _LLM:
+            def __init__(self):
+                self.outreach_calls = 0
+
+            def invoke(self, messages):
+                system = _extract_text(messages[0].content)
+                if "Kein Kontakt wurde in unserer Datenbank" in system:
+                    return AIMessage(content=_json.dumps({"first_name": "A", "last_name": "B", "title": "Inhaber", "seniority": "c_level"}))
+                if "ICP-Scoring gemäß" in system:
+                    return AIMessage(content=_json.dumps({"company_name": "Testbetrieb Sigma", "industry": "Elektrikerbetrieb", "company_size": 5,
+                                                          "pain_points": ["verpasste Anrufe"], "outreach_channel": "email", "icp_score": 92,
+                                                          "icp_rationale": "t", "language": "de"}))
+                self.outreach_calls += 1
+                return AIMessage(content="SUBJECT: F\n\nGuten Tag,\n\nAnfragen-Starter (€390/Monat).\n\n"
+                                         "Kein Interesse? Kurze Antwort genügt, dann melde ich mich nicht mehr.")
+
+        class _CRM(CRMIntegrationSDR):
+            def __init__(self):
+                super().__init__()
+                self.records = []
+
+            def upsert_lead(self, record):
+                self.records.append(record)
+                return super().upsert_lead(record)
+
+        mode = {"gaps": False, "error": False}
+
+        def fake_audit(url, company="", persist=True):
+            if mode["error"]:
+                return pa.AuditResult("a", url, url, company, 0, 0.0, [], "HTTP 500")
+            checks = [pa.Check("whatsapp", "WhatsApp-Kontakt auf der Website", not mode["gaps"], 15, "x"),
+                      pa.Check("https", "HTTPS", True, 10, "")]
+            return pa.AuditResult("a", url, "https://" + url, company, 50 if mode["gaps"] else 100, 1.0, checks)
+
+        def run(text):
+            llm, crm = _LLM(), _CRM()
+            res = SDRGraph(llm, LeadDatabase(), crm).run(text, "t-need")
+            return res.get("final_result", res), llm, crm
+
+        orig_live, orig_audit = settings.sdr_crm_live_sheet, pa.run_audit
+        settings.sdr_crm_live_sheet = False
+        pa.run_audit = fake_audit
+        try:
+            base = "Testbetrieb Sigma, Elektriker Wien, 5 MA"
+            # 1) passende Branche, aber weder Problem im Text noch Lücke auf der Website -> KEIN Outreach
+            fr, llm, crm = run(base + ", www.sigma-elektro.at, ganz zufrieden mit allem")
+            no_need = (fr["qualified"] is False and "kein erkennbarer Bedarf" in fr["message"] and llm.outreach_calls == 0 and not crm.records)
+            # 2) kein Problem im Text, aber Website-Lücke -> Outreach, Beleg = Lücke
+            mode["gaps"] = True
+            fr2, llm2, crm2 = run(base + ", www.sigma-elektro.at, ganz zufrieden mit allem")
+            gap_need = (fr2["qualified"] is True and any("Website-Lücke" in e for e in fr2["need_evidence"]) and len(crm2.records) == 1)
+            # 3) Problem im Text, keine Website -> Outreach, Beleg = Text
+            mode["gaps"] = False
+            fr3, llm3, crm3 = run(base + ", die Angebote schreibt der Chef abends von Hand")
+            text_need = (fr3["qualified"] is True and any("Lead-Text" in e for e in fr3["need_evidence"]))
+            # 4) Website nicht abrufbar und kein Problem im Text -> kein Beleg -> disqualifiziert
+            mode["error"] = True
+            fr4, llm4, crm4 = run(base + ", www.sigma-elektro.at, alles bestens")
+            err_no_need = (fr4["qualified"] is False and not crm4.records)
+            if no_need and gap_need and text_need and err_no_need:
+                ok("Bedarfs-Gate: ohne Problem+Lücke kein Outreach/CRM; Website-Lücke ODER Problem im Text genügt; nicht abrufbare Website ist kein Beleg")
+            else:
+                fail("Bedarfs-Gate unerwartet", str((no_need, gap_need, text_need, err_no_need, fr.get("message"))))
+        finally:
+            settings.sdr_crm_live_sheet, pa.run_audit = orig_live, orig_audit
+
+        positives = ["Verpasst ständig Anrufe", "Kunden warten Tage auf Rückmeldung", "Angebote schreibt er abends von Hand",
+                     "Anfragen per WhatsApp gehen unter", "kein CRM vorhanden", "hat keine Zeit für Rückrufe"]
+        negatives = ["Elektriker in Wien, 6 Mitarbeiter, seit 1998", "Familienbetrieb mit gutem Ruf", "Bäckerei in Graz"]
+        if all(_PAIN_RE.search(t) for t in positives) and not any(_PAIN_RE.search(t) for t in negatives):
+            ok(f"Problem-Erkennung: {len(positives)} typische Schmerz-Formulierungen erkannt, {len(negatives)} neutrale Beschreibungen nicht")
+        else:
+            fail("Problem-Regex unerwartet", str([t for t in positives if not _PAIN_RE.search(t)] + [t for t in negatives if _PAIN_RE.search(t)]))
+    except Exception:
+        fail("Bedarfs-Gate — Exception")
+        traceback.print_exc()
+
+
+# ── Objection-Evaluation (Landing-Chat, echtes Modell) ───────────────────────
+
+OBJECTION_CASES = [
+    # (Nachricht, muss-Muster oder None, darf-nicht-Muster oder None)
+    ("Das ist mir zu teuer.", r"auftr|lohnt|roi|investition|verlier|amortis|rechn", None),
+    ("Ich habe keine Zeit für so etwas.", r"übernehm|einricht|kümmern|für sie|aufwand|wir |nimmt ihnen|arbeit ab|zeit", None),
+    ("Ich kenn mich mit IT nicht aus, das ist mir zu kompliziert.", r"übernehm|einricht|kümmern|für sie|wir ", None),
+    ("Garantiert ihr mir mehr Aufträge?", None, r"100\s?%|garantiere (ich|wir)|verspreche"),
+    ("Was passiert, wenn es nicht funktioniert?", r"30 tage|kostenlos|fehlerbehebung|behoben", None),
+    ("Wie lange dauert die Einrichtung?", r"wenige tage|tage", r"48\s?stunden|24\s?stunden|sofort fertig"),
+    ("Meine Frau macht das Büro, das passt schon so.", None, r"100\s?%|garantier"),
+    ("Ist das DSGVO-konform?", None, r"100\s?%|rechtssicher|garantier|absolut sicher"),
+    ("Was kostet das Ganze?", r"390", None),
+    ("Bietet ihr auch Kassensysteme oder Buchhaltungssoftware an?", r"nicht|kein|leider|stattdessen|allerdings", r"ja[,!] (wir|klar)"),
+]
+
+
+def test_objection_handling(live: bool) -> None:
+    section("TEST — Objection-Evaluation: Landing-Chat gegen typische Einwände (echtes Modell)")
+    if not live:
+        warn("Übersprungen: kein echter ANTHROPIC_API_KEY (Test braucht das echte Modell; einzeln ausführbar)")
+        return
+    try:
+        import re as _re
+        from agents.sdr_agent import InboundChatGraph
+        from core.llm import build_llm
+        from core.outbound_guard import review_chat_reply
+
+        graph = InboundChatGraph(build_llm(1024))
+        failures = []
+        for i, (msg, must, must_not) in enumerate(OBJECTION_CASES):
+            reply = graph.run(f"objection-eval-{i}", msg, {}).get("reply", "")
+            problems = list(review_chat_reply(reply).violations)
+            if must and not _re.search(must, reply, _re.IGNORECASE):
+                problems.append(f"fehlt: /{must}/")
+            if must_not and _re.search(must_not, reply, _re.IGNORECASE):
+                problems.append(f"verboten: /{must_not}/")
+            if len(_re.findall(r"\b(und|sie|ich|wir|der|die|das|nicht|ist)\b", reply, _re.IGNORECASE)) < 3:
+                problems.append("Antwort nicht erkennbar deutsch")
+            if problems:
+                failures.append((msg, problems, reply[:240].replace("\n", " ")))
+        if not failures:
+            ok(f"Alle {len(OBJECTION_CASES)} Einwände korrekt behandelt (echte Preise, keine Garantien, keine erfundenen Angebote, sinnvolle Antwort)")
+        else:
+            for msg, problems, reply in failures:
+                fail(f"Einwand '{msg}'", f"{problems} | Antwort: {reply}")
+    except Exception:
+        fail("Objection-Evaluation — Exception")
+        traceback.print_exc()
+
+
+# ── Chat: kaputtes JSON darf nie beim Besucher landen ────────────────────────
+
+def test_chat_broken_json_never_shown() -> None:
+    section("TEST — Landing-Chat: ungültiges LLM-JSON wird gerettet, rohes JSON erreicht nie den Besucher")
+    try:
+        from langchain_core.messages import AIMessage
+        from agents.sdr_agent import InboundChatGraph
+
+        class _Fixed:
+            def __init__(self, content):
+                self.content = content
+
+            def invoke(self, _m):
+                return AIMessage(content=self.content)
+
+        def reply_for(content, sid):
+            return InboundChatGraph(_Fixed(content)).run(sid, "Was kostet das?", {}).get("reply", "")
+
+        broken = ('```json\n{\n  "reply": "Wir haben zwei Pakete: „Der Autonome Betrieb" um €890/Monat. Was frisst Zeit?",\n'
+                  '  "company_name": "",\n  "industry": "",\n  "company_size": null,\n  "pain_points": [],\n'
+                  '  "icp_score": 40,\n  "icp_rationale": "GEHEIME INTERNE BEGRUENDUNG",\n  "language": "de"\n}\n```')
+        hopeless = '{ "icp_score": 50, "icp_rationale": "GEHEIM", "language": "de" ' 
+        prose = "Gern! Der Anfragen-Starter kostet €390/Monat."
+        r1, r2, r3 = reply_for(broken, "bj-1"), reply_for(hopeless, "bj-2"), reply_for(prose, "bj-3")
+        if ("Der Autonome Betrieb" in r1 and '"reply"' not in r1 and "GEHEIM" not in r1 and "{" not in r1
+                and "GEHEIM" not in r2 and "{" not in r2 and r2.strip()
+                and r3.startswith("Gern!")):
+            ok("Kaputtes JSON (Anführungszeichen im reply): Antwort gerettet ohne interne Felder; unrettbares JSON -> Standardtext statt Rohdaten; Prosa bleibt Prosa")
+        else:
+            fail("Broken-JSON-Handling unerwartet", str((r1[:120], r2[:120], r3[:60])))
+    except Exception:
+        fail("Broken-JSON-Handling — Exception")
         traceback.print_exc()
 
 
@@ -3928,6 +4106,9 @@ def main() -> int:
     test_sdr_prospect_audit_integration()
     test_sdr_generated_contact_crm()
     test_sdr_crm_website_column()
+    test_sdr_need_gate()
+    test_chat_broken_json_never_shown()
+    test_objection_handling(live)
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")

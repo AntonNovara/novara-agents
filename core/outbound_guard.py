@@ -132,3 +132,30 @@ def review_outreach(subject: str, body: str) -> GuardVerdict:
         w.append(f"Nachricht sehr lang ({len(body)} Zeichen)")
 
     return GuardVerdict(ok=not v, violations=v, warnings=w)
+
+
+def review_chat_reply(text: str) -> GuardVerdict:
+    """
+    Inhaltsregeln für eine Chat-ANTWORT (Landing-Chat): dieselben harten Fakten-Regeln wie
+    bei Outreach (nur echte Preise, keine Platzhalter/Prompt-Artefakte/Garantieversprechen,
+    keine erfundenen Angebote), aber ohne die Mail-spezifischen Regeln (Opt-out, Länge,
+    Markdown, Mehrfach-Nachrichten). Grundlage der Objection-Evaluation in test_system.py.
+    """
+    v: list[str] = []
+    if not text.strip():
+        v.append("leere Antwort")
+    if _PLACEHOLDER.search(text) or _BRACKET_PLACEHOLDER.search(text):
+        v.append("Platzhalter/Demo-Text in der Antwort")
+    if _LLM_LEAKAGE.search(text):
+        v.append("LLM-/Prompt-Artefakt in der Antwort")
+    if _PROMISES.search(text):
+        v.append("unzulässiges Erfolgs-/Garantieversprechen")
+    allowed = _allowed_prices()
+    for m in _EURO.finditer(text):
+        amount = _amount(m.group(1) or m.group(2))
+        if amount not in allowed:
+            v.append(f"Preis €{amount} steht nicht in novara_wissen.txt")
+    unknown = _unknown_offer_terms(text)
+    if unknown:
+        v.append(f"Angebot nicht in novara_wissen.txt belegt: {', '.join(unknown)}")
+    return GuardVerdict(ok=not v, violations=v)
