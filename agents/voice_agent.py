@@ -74,10 +74,13 @@ und agierst als erfahrener SDR (Sales Development Representative).
 Du nimmst eingehende Anrufe entgegen und sprichst Österreichisch/Deutsch.
 
 PFLICHT-OFFENLEGUNG (EU AI Act Art. 50, in Kraft seit 2. August 2026):
-Zu Beginn JEDES Gesprächs musst du sinngemäß offenlegen, dass du ein
-KI-System bist, bevor du mit der eigentlichen Qualifizierung beginnst —
-zum Beispiel: "{AI_DISCLOSURE_DE.format(client_name=_CLIENT_NAME)}"
-(natürlich in gesprochener, kurzer Form, nicht als vorgelesener Rechtstext).
+Die Offenlegung "{AI_DISCLOSURE_DE.format(client_name=_CLIENT_NAME)}" wird
+bereits AUTOMATISCH und WORTGLEICH vor deiner allerersten Antwort in diesem
+Anruf eingefügt (Code, nicht Prompt — siehe _with_disclosure_prefix()).
+Wiederhole sie deshalb NIE selbst und erwähne auch nicht sinngemäß, dass du
+ein KI-System bist — das würde die Offenlegung verdoppeln. Beginne deine
+allererste Antwort direkt mit der eigentlichen Begrüßung, z. B. "Wie kann
+ich Ihnen heute weiterhelfen?".
 
 === NOVARA WISSENSDATENBANK ===
 {_WISSEN}
@@ -90,7 +93,10 @@ GESPRÄCHSREGELN (STRIKT EINHALTEN):
    (ODER, falls das natürlicher ins Gespräch passt, der größte aktuelle
    Engpass) → größtes Problem.
 4. Bestandskunde mit Problem? Beantworte aus der Wissensdatenbank oder biete Rückruf an.
-5. Terminwunsch? Sage: "Ich schicke Ihnen gleich den Buchungslink per SMS."
+5. Terminwunsch? Frage zuerst nach der Telefonnummer (wird für den
+   Kalendereintrag gebraucht) und sage dann: "Ich trage den Termin ein,
+   wir bestätigen ihn kurz per WhatsApp." Verspreche NIE eine SMS — es gibt
+   keinen SMS-Versand in diesem System, nur WhatsApp.
 6. Preise ERST nennen wenn Qualifizierung abgeschlossen (Firma + Mitarbeiterzahl bekannt).
 7. KEIN Technik-Jargon: kein "KI", kein "Automatisierungssoftware", kein "LangGraph"
    (Ausnahme: die Pflicht-Offenlegung oben zu Gesprächsbeginn).
@@ -113,7 +119,7 @@ EINWANDBEHANDLUNG (kurz, in maximal 2 Sätzen, wie im restlichen Gespräch):
 INTENT-ERKENNUNG:
 - Interesse / erstes Mal → Neukunde qualifizieren
 - "Ich bin bereits Kunde" / Problem schildern → Support-Modus
-- Termin buchen → Buchungslink per SMS ankündigen
+- Termin buchen → Telefonnummer erfragen, dann Bestätigung per WhatsApp ankündigen (Regel 5)
 - Unklar → Frage: "Sind Sie bereits Kunde bei uns oder rufen Sie zum ersten Mal an?"
 """
 
@@ -353,8 +359,24 @@ class VoiceAgent:
                     messages=anthropic_messages,
                     max_tokens=300,
                 ) as stream:
+                    # Anthropic liefert Text in Sub-Wort-Fragmenten (Token-
+                    # Grenzen, nicht Wort-Grenzen) -- roh weitergereicht kann
+                    # Vapis TTS ein einzelnes Zeichen/Fragment (z. B. "V")
+                    # bereits als eigene, hörbare "Phantom"-Äußerung
+                    # synthetisieren, bevor der Rest des Wortes ankommt. Statt
+                    # jedes Chunk direkt durchzureichen, puffern wir bis zur
+                    # nächsten Wortgrenze (Leerzeichen/Satzzeichen) und geben
+                    # erst dann zusammenhängende Wörter aus -- Text bleibt
+                    # dabei unverändert, nur die Chunk-Grenzen verschieben sich.
+                    buffer = ""
                     for text in stream.text_stream:
-                        yield _sse_chunk(completion_id, created, model, {"content": text}, None)
+                        buffer += text
+                        cut = max(buffer.rfind(" "), buffer.rfind("\n"))
+                        if cut != -1:
+                            yield _sse_chunk(completion_id, created, model, {"content": buffer[: cut + 1]}, None)
+                            buffer = buffer[cut + 1 :]
+                    if buffer:
+                        yield _sse_chunk(completion_id, created, model, {"content": buffer}, None)
             except Exception as exc:
                 log.error(
                     "Anthropic stream() fehlgeschlagen – Fallback ausgegeben",
