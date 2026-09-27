@@ -1667,6 +1667,18 @@ async def quote_draft_create(req: QuoteDraftRequest):
     }
 
 
+@app.get("/api/v1/tools/quote-draft/{quote_id}", tags=["Angebote"], dependencies=[Depends(require_api_key)])
+async def quote_draft_get(quote_id: str):
+    """Volle Positions-Aufschlüsselung eines Angebots -- zum manuellen Prüfen
+    der Preislogik, unabhängig davon, ob die WhatsApp-Zustellung geklappt hat."""
+    from tools import quote_store
+
+    found = quote_store.get_quote(quote_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="Angebot nicht gefunden")
+    return found
+
+
 @app.get("/api/v1/quotes/{quote_id}/approve", tags=["Angebote"], response_class=PlainTextResponse)
 async def quote_approve(quote_id: str, token: str = ""):
     """Klick-Link aus der WhatsApp-Nachricht an den Elektriker. Setzt das

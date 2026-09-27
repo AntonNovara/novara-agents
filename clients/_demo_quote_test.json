@@ -1,0 +1,24 @@
+{
+  "client_id": "_demo_quote_test",
+  "firmenname": "Demo Elektro Wien GmbH",
+  "branche": "Elektrikerbetrieb",
+  "servicegebiet": "Wien und Umgebung",
+  "leistungen": [
+    "Elektroinstallation Neubau & Sanierung",
+    "Wallbox-Installation",
+    "Steckdosen & Schalter setzen",
+    "Störungsbehebung / Notdienst",
+    "E-Check / Prüfungen"
+  ],
+  "notdienst_regel": "",
+  "buchungslink": "",
+  "haeufige_fragen": [],
+  "ansprechpartner": "Demo Test",
+  "telefonnummer": "+4917632320243",
+  "ton": "freundlich, professionell, per Sie",
+  "preise_oeffentlich": false,
+  "preishinweise": "",
+  "stundensatz_eur": 65.0,
+  "anfahrtspauschale_eur": 25.0,
+  "materialaufschlag_pct": 15.0
+}
