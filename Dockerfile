@@ -23,6 +23,18 @@ COPY utils/ utils/
 COPY static/ static/
 COPY main.py .
 COPY novara_wissen.txt .
+# clients/*.json (Pilotkunden-Betriebsprofile, core/client_profiles.py) --
+# FEHLTE hier bisher komplett: main.py::_build_client_agents() und
+# agents/quote_agent.py::load_client_profile() lasen also in Produktion
+# NIE ein echtes Profil, sondern immer nur "Datei nicht gefunden" -- der
+# Docker-Build-Kontext hatte den ganzen Ordner nie gesehen. Gefunden beim
+# ersten echten End-to-End-Test von POST /api/v1/tools/quote-draft gegen
+# Produktion (404 "Kein Betriebsprofil", obwohl die Datei im Repo lag und
+# gepusht war). "clients=[] in boot logs" aus einer früheren Session war
+# also NIE ein Beleg dafür, dass das Pilotprogramm korrekt mit null echten
+# Profilen lief -- das Verhalten wäre mit und ohne diesen Fix identisch
+# gewesen, solange kein echtes Profil existierte.
+COPY clients/ clients/
 
 # Railway injects $PORT at runtime
 ENV PORT=8000
