@@ -1695,8 +1695,9 @@ async def quote_approve(quote_id: str, token: str = ""):
 
     quote = quote_store.get_quote(quote_id)
     kontakt = (quote or {}).get("kunde_kontakt", "")
+    has_valid_number = bool(kontakt) and bool(re.match(r"^\+?[0-9 ()-]{6,20}$", kontakt.strip()))
     delivered = False
-    if kontakt and re.match(r"^\+?[0-9 ()-]{6,20}$", kontakt.strip()):
+    if has_valid_number:
         pdf_path = Path(quote["pdf_path"])
         if pdf_path.is_file():
             delivered = await _send_whatsapp_pdf(kontakt.strip(), pdf_path, "Ihr Angebot, wie besprochen.")
@@ -1705,9 +1706,15 @@ async def quote_approve(quote_id: str, token: str = ""):
 
     if delivered:
         return "Angebot freigegeben und per WhatsApp an den Kunden verschickt. Danke!"
+    if not has_valid_number:
+        return (
+            "Angebot freigegeben. Keine gültige Telefonnummer beim Kunden hinterlegt -- "
+            "bitte manuell weiterleiten."
+        )
     return (
-        "Angebot freigegeben. Der Kunde konnte nicht automatisch per WhatsApp erreicht werden "
-        "(keine gültige Nummer hinterlegt) -- bitte manuell weiterleiten."
+        "Angebot freigegeben, aber die WhatsApp-Zustellung an den Kunden ist gerade "
+        "fehlgeschlagen (z. B. WhatsApp-Testmodus-Einschränkung oder Netzwerkfehler) -- "
+        "bitte manuell weiterleiten. Details dazu stehen in den Server-Logs."
     )
 
 
