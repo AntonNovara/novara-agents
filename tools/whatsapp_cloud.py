@@ -134,6 +134,29 @@ def parse_incoming(payload: dict[str, Any]) -> list[IncomingMessage]:
     return result
 
 
+def parse_statuses(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Zustellstatus-Events (sent/delivered/read/failed) desselben Webhooks,
+    der auch parse_incoming() liest. Bisher komplett ignoriert -- main.py
+    antwortete nur mit 200, ohne den Inhalt je zu sehen. Das machte einen
+    fehlgeschlagenen Versand (z. B. agents/quote_agent.py-Angebot an einen
+    Elektriker) unsichtbar: der Graph-API-Call für /messages liefert 200 +
+    eine message_id zurück, sobald Meta die Nachricht ANNIMMT -- ob sie
+    wirklich zugestellt wird, kommt separat und asynchron über GENAU dieses
+    Feld rein. Gibt id/status/recipient_id/errors zurück -- keine
+    Nachrichteninhalte, nur Meta-eigene Zustellmetadaten."""
+    result: list[dict[str, Any]] = []
+    for entry in payload.get("entry") or []:
+        for change in entry.get("changes") or []:
+            for status in (change.get("value") or {}).get("statuses") or []:
+                result.append({
+                    "message_id": str(status.get("id") or ""),
+                    "status": str(status.get("status") or ""),
+                    "recipient_id": str(status.get("recipient_id") or ""),
+                    "errors": status.get("errors") or [],
+                })
+    return result
+
+
 def download_media(media_id: str) -> tuple[bytes, str]:
     """Lädt eine Media-Datei (z. B. Sprachnachricht). Wirft bei Fehlern --
     der Aufrufer (main.py) fängt das mit der passenden Fehlermeldung an den

@@ -1537,6 +1537,22 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
             continue
         background_tasks.add_task(_process_whatsapp_message, msg)
         accepted += 1
+
+    # Zustellstatus (sent/delivered/read/failed) -- bisher stillschweigend
+    # verworfen, siehe tools/whatsapp_cloud.py::parse_statuses()-Docstring.
+    # Nur "failed" laut, der Rest (sent/delivered/read) als INFO -- sonst
+    # verschwindet ein echter Fehlschlag im Rauschen von drei Erfolgs-
+    # Events pro Nachricht (sent, delivered, read kommen typischerweise
+    # als separate Webhook-Aufrufe).
+    for status in whatsapp_cloud.parse_statuses(payload):
+        log_fn = log.error if status["status"] == "failed" else log.info
+        log_fn(
+            "WhatsApp-Zustellstatus",
+            message_id=status["message_id"],
+            status=status["status"],
+            errors=status["errors"],
+        )
+
     return {"status": "received", "messages": accepted}
 
 
