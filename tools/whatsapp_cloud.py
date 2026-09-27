@@ -229,3 +229,50 @@ def send_document(to: str, media_id: str, filename: str, caption: str = "", phon
         {"type": "document", "document": {"id": media_id, "filename": filename, "caption": caption[:1024]}},
         phone_number_id,
     )
+
+
+def send_template_document(
+    to: str,
+    template_name: str,
+    language_code: str,
+    media_id: str,
+    filename: str,
+    body_params: list[str],
+    phone_number_id: str = "",
+) -> bool:
+    """Schickt ein genehmigtes WhatsApp-Template mit Dokument-Header --
+    funktioniert im Gegensatz zu send_document() auch AUSSERHALB des
+    24h-Kundenservice-Fensters (Meta-Fehler 131047 "Re-engagement
+    message"), weil Templates von Meta vorab für genau diesen Zweck
+    genehmigt werden (siehe agents/quote_agent.py-Nutzung: Elektriker-
+    Benachrichtigung über ein neues Angebot, unabhängig davon, wann er
+    zuletzt mit dem Bot geschrieben hat).
+
+    `template_name`/`language_code` müssen exakt einem in der Meta-
+    WhatsApp-Verwaltung genehmigten Template entsprechen (Status
+    "APPROVED", nicht mehr "PENDING") -- sonst schlägt der Versand fehl,
+    sichtbar über den neuen WhatsApp-Zustellstatus-Log (main.py
+    whatsapp_webhook, tools.whatsapp_cloud.parse_statuses()).
+    `body_params` müssen in der exakten Reihenfolge der {{1}}, {{2}}, ...
+    Platzhalter im genehmigten Template-Text stehen."""
+    return _post_message(
+        to,
+        {
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": language_code},
+                "components": [
+                    {
+                        "type": "header",
+                        "parameters": [{"type": "document", "document": {"id": media_id, "filename": filename}}],
+                    },
+                    {
+                        "type": "body",
+                        "parameters": [{"type": "text", "text": p} for p in body_params],
+                    },
+                ],
+            },
+        },
+        phone_number_id,
+    )

@@ -1666,11 +1666,13 @@ async def quote_draft_create(req: QuoteDraftRequest):
     if profile.telefonnummer:
         summe = result.get("gesamtsumme_eur")
         summe_text = f"{summe:.2f} EUR" if isinstance(summe, (int, float)) else "Summe nach Aufwand"
-        caption = (
-            f"Neuer Angebots-Entwurf für {result.get('kunde_name') or 'einen Kunden'} ({summe_text}).\n"
-            f"Freigeben und an den Kunden senden: {approval_url}"
+        sent_to_electrician = await _send_whatsapp_quote_template(
+            profile.telefonnummer,
+            Path(result["pdf_path"]),
+            kunde_name=result.get("kunde_name") or "einen Kunden",
+            summe_text=summe_text,
+            approval_url=approval_url,
         )
-        sent_to_electrician = await _send_whatsapp_pdf(profile.telefonnummer, Path(result["pdf_path"]), caption)
 
     return {
         "quote_id": quote_id,
@@ -1761,6 +1763,45 @@ async def _send_whatsapp_pdf(to: str, pdf_path: Path, caption: str) -> bool:
         return await loop.run_in_executor(None, whatsapp_cloud.send_document, to, media_id, pdf_path.name, caption, "")
     except Exception as exc:
         log.error("Angebot: WhatsApp-PDF-Versand fehlgeschlagen", to=to[-4:], error=str(exc), exc_info=True)
+        return False
+
+
+# Meta-genehmigtes Template für die Elektriker-Benachrichtigung (siehe
+# tools/whatsapp_cloud.py::send_template_document()-Docstring) -- angelegt
+# 27.09.2026 in der Meta WhatsApp-Verwaltung, Status zum Anlegezeitpunkt
+# "PENDING". Erst nutzbar, sobald Meta auf "APPROVED" wechselt (kann
+# Minuten bis ~1 Tag dauern) -- bis dahin schlägt der Versand fehl,
+# sichtbar über den WhatsApp-Zustellstatus-Log weiter oben.
+_QUOTE_TEMPLATE_NAME = "angebot_freigabe_hinweis"
+_QUOTE_TEMPLATE_LANGUAGE = "de"
+
+
+async def _send_whatsapp_quote_template(
+    to: str, pdf_path: Path, kunde_name: str, summe_text: str, approval_url: str
+) -> bool:
+    """Wie _send_whatsapp_pdf(), aber über ein genehmigtes Template --
+    funktioniert auch außerhalb des 24h-Kundenservice-Fensters (Meta-Fehler
+    131047 "Re-engagement message", siehe Modul-Kommentar oben). Für genau
+    diesen Anwendungsfall gebaut: der Elektriker chattet nicht ständig mit
+    dem Bot, wenn gerade eine Kundenanfrage reinkommt -- eine Angebots-
+    Benachrichtigung landet praktisch immer außerhalb des Fensters."""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    try:
+        pdf_bytes = pdf_path.read_bytes()
+        media_id = await loop.run_in_executor(None, whatsapp_cloud.upload_media, pdf_bytes, pdf_path.name, "application/pdf", "")
+        if not media_id:
+            return False
+        return await loop.run_in_executor(
+            None,
+            whatsapp_cloud.send_template_document,
+            to, _QUOTE_TEMPLATE_NAME, _QUOTE_TEMPLATE_LANGUAGE, media_id, pdf_path.name,
+            [kunde_name, summe_text, approval_url],
+            "",
+        )
+    except Exception as exc:
+        log.error("Angebot: WhatsApp-Template-Versand fehlgeschlagen", to=to[-4:], error=str(exc), exc_info=True)
         return False
 
 
