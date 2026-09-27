@@ -189,6 +189,19 @@ class Settings(BaseSettings):
     missed_call_whatsapp_number: str = Field(default="", alias="MISSED_CALL_WHATSAPP_NUMBER")
     missed_call_business_name: str = Field(default="", alias="MISSED_CALL_BUSINESS_NAME")
 
+    # Voice Agent (agents/voice_agent.py, main.py POST /api/v1/voice/chat/... und
+    # /api/v1/voice/webhook): Vapi als Telefonie-Frontend, Custom-LLM-Backend.
+    # Bis 27.09.2026 liefen beide Endpunkte OHNE jede Authentifizierung -- siehe
+    # CLAUDE.md-Eintrag vom 19.08.2026, der genau diesen Zustand als sofort neu
+    # zu bewertendes Risiko markiert hatte, sobald der Railway-Service wieder
+    # läuft (was er seit der September-Infra-Arbeit durchgehend tut). Ohne
+    # gesetzten VAPI_SERVER_SECRET lehnen beide Endpunkte JEDE Anfrage ab
+    # (fail-closed, gleiches Prinzip wie telnyx_public_key oben). Vapi schickt
+    # das Secret als "Authorization: Bearer <secret>" (Vapis Standard-Bearer-
+    # Token-Mechanismus, im Vapi-Dashboard als Credential auf die Server-URL /
+    # Custom-LLM-URL konfiguriert).
+    vapi_server_secret: SecretStr = Field(default="", alias="VAPI_SERVER_SECRET")
+
     # Baustellen-Voice-Assistant (main.py _transcribe_audio()): Groq-API-Key
     # für Speech-to-Text (whisper-large-v3) von WhatsApp-Sprachnachrichten.
     # Ohne Key liefert _transcribe_audio() None (fail-safe, kein Absturz) --

@@ -5,6 +5,7 @@ Alle Agenten werden über /api/v1/agents/{agent_type}/process angesprochen.
 API-Key-Authentifizierung über X-API-Key Header (aus .env).
 Strukturiertes JSON-Logging für alle Requests (DSGVO-Audit-Trail).
 """
+import hmac
 import json
 import logging
 import os
@@ -838,14 +839,40 @@ async def client_chat(request: Request, client_id: str, payload: ClientChatReque
 # Vapi hängt an die konfigurierte Custom-LLM-URL automatisch /chat/completions an.
 # Wenn du in Vapi als URL https://<host>/api/v1/voice/chat einträgst,
 # ruft Vapi tatsächlich POST /api/v1/voice/chat/chat/completions auf.
+#
+# Fail-closed wie der Telnyx-Webhook: ohne VAPI_SERVER_SECRET wird JEDE Anfrage
+# abgelehnt (siehe core/config.py, Feld vapi_server_secret, für den Hintergrund
+# -- dieser Pfad lief bis 27.09.2026 komplett unauthentifiziert und öffentlich).
+def _verify_vapi_secret(request: Request) -> bool:
+    expected = settings.vapi_server_secret.get_secret_value()
+    if not expected:
+        log.error("Vapi-Endpunkt abgelehnt: VAPI_SERVER_SECRET nicht gesetzt")
+        return False
+    auth_header = request.headers.get("Authorization", "")
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        log.warning("Vapi-Endpunkt abgelehnt: fehlender/ungültiger Authorization-Header")
+        return False
+    if not hmac.compare_digest(token, expected):
+        log.warning("Vapi-Endpunkt abgelehnt: falsches Server-Secret")
+        return False
+    return True
+
 
 @app.post(
     "/api/v1/voice/chat/chat/completions",
     tags=["Voice"],
     summary="Vapi Custom LLM – OpenAI-kompatibler Endpunkt (streaming + non-streaming)",
+    responses={401: {"description": "Fehlendes/ungültiges Authorization-Bearer-Secret"}},
 )
 async def voice_chat_completions(request: Request):
     import asyncio
+
+    if not _verify_vapi_secret(request):
+        return JSONResponse(
+            status_code=401,
+            content={"error": {"message": "Invalid or missing server secret", "type": "invalid_request_error"}},
+        )
 
     # JSON-Parse absichern — Vapi schickt manchmal kaputte Bodies
     try:
@@ -1002,8 +1029,14 @@ def _run_booking(params: dict) -> str:
     "/api/v1/voice/webhook",
     tags=["Voice"],
     summary="Vapi Server Webhook (end-of-call-report, function-call, tool-calls)",
+    responses={401: {"description": "Fehlendes/ungültiges Authorization-Bearer-Secret"}},
 )
 async def voice_webhook(request: Request):
+    # Sicherheitsgrenze muss ein echter 401 bleiben (gleiches Prinzip wie beim
+    # WhatsApp-Webhook oben, dort per X-Hub-Signature-256).
+    if not _verify_vapi_secret(request):
+        raise HTTPException(status_code=401, detail="Invalid or missing server secret")
+
     # ── JSON-Parse (Vapi schickt manchmal kaputte Bodies) ─────────────────────
     try:
         body = await request.json()
