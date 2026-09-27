@@ -39,12 +39,13 @@ from agents.field_worker_agent import FieldWorkerAgent
 from agents.guardian_agent import GuardianAgent
 from agents.onboarding_agent import OnboardingAgent
 from agents.operations_agent import OperationsAgent
+from agents.quote_agent import QuoteAgent
 from agents.sales_copilot_agent import SalesCopilotAgent
 from agents.sdr_agent import SDRAgent
 from agents.support_agent import SupportAgent
 from agents.voice_agent import VoiceAgent
 from core import consent, lead_capture
-from core.client_profiles import ClientProfileInvalidError, ClientProfileNotFoundError
+from core.client_profiles import ClientProfileInvalidError, ClientProfileNotFoundError, load_client_profile
 from core.config import settings
 from core.security import OutputBlockedError, SecurityLayer
 from tools import lead_notifier, sequence_scheduler, telnyx_voice, whatsapp_cloud
@@ -103,6 +104,7 @@ def _build_registry() -> dict:
         "field-worker": FieldWorkerAgent(),
         "onboarding":   OnboardingAgent(),
         "operations":   OperationsAgent(),
+        "quote":        QuoteAgent(),
         "sales-copilot": SalesCopilotAgent(),
         "sdr":          SDRAgent(),
         "support":      SupportAgent(),
@@ -1594,6 +1596,137 @@ async def prospect_audit_get(audit_id: str):
     if found is None:
         raise HTTPException(status_code=404, detail="Audit nicht gefunden")
     return found
+
+
+# ── Angebots-Generator (Pain 2) ─────────────────────────────────────────────────
+# Phase 1: nur WhatsApp-Text/Sprachnachricht als Eingang (E-Mail folgt Phase 2).
+# Dieser Endpunkt ist der interne Test-/Auslöse-Weg (API-Key, wie prospect-
+# audit oben) -- die automatische Erkennung "ist das ein Angebots-Wunsch?"
+# direkt im bestehenden WhatsApp-Webhook (main.py whatsapp_webhook, aktuell
+# fest auf field_worker_agent verdrahtet) ist bewusst NICHT Teil dieser Runde:
+# es gibt noch kein einziges echtes Pilotkunden-Profil mit Preisdaten (nur
+# clients/_vorlage.json), an dem sich das sinnvoll testen ließe -- und ein
+# blinder Klassifikations-Branch in den EINZIGEN, bereits live verifizierten
+# WhatsApp-Pfad einzubauen, ohne ihn testen zu können, wäre ein unnötiges
+# Regressionsrisiko für den Baustellen-Assistenten. Sobald ein echtes Profil
+# existiert, ist das der nächste Schritt.
+
+class QuoteDraftRequest(BaseModel):
+    client_id: str = Field(..., min_length=1, max_length=64)
+    request_text: str = Field(..., min_length=1, max_length=8000)
+
+
+@app.post("/api/v1/tools/quote-draft", tags=["Angebote"], dependencies=[Depends(require_api_key)])
+async def quote_draft_create(req: QuoteDraftRequest):
+    """Erstellt einen Angebots-Entwurf aus Freitext und schickt ihn zur
+    Freigabe per WhatsApp an den Elektriker (profile.telefonnummer) -- NIE
+    direkt an den Endkunden. main.py POST /api/v1/quotes/{id}/approve schaltet
+    danach den echten Versand frei."""
+    import asyncio
+
+    try:
+        profile = load_client_profile(req.client_id)
+    except ClientProfileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Kein Betriebsprofil für '{req.client_id}'")
+
+    quote_agent = _AGENT_REGISTRY.get("quote")
+    if quote_agent is None:
+        raise HTTPException(status_code=503, detail="Angebots-Agent nicht verfügbar")
+
+    loop = asyncio.get_running_loop()
+    response = await loop.run_in_executor(
+        None,
+        quote_agent.process,
+        AgentRequest(text=req.request_text, metadata={"client_id": req.client_id}),
+    )
+    if not response.success:
+        raise HTTPException(status_code=422, detail=response.error or "Angebot konnte nicht erstellt werden")
+
+    result = response.result
+    quote_id = result["quote_id"]
+    approval_url = f"{settings.public_base_url}/api/v1/quotes/{quote_id}/approve?token={result['approval_token']}"
+
+    sent_to_electrician = False
+    if profile.telefonnummer:
+        summe = result.get("gesamtsumme_eur")
+        summe_text = f"{summe:.2f} EUR" if isinstance(summe, (int, float)) else "Summe nach Aufwand"
+        caption = (
+            f"Neuer Angebots-Entwurf für {result.get('kunde_name') or 'einen Kunden'} ({summe_text}).\n"
+            f"Freigeben und an den Kunden senden: {approval_url}"
+        )
+        sent_to_electrician = await _send_whatsapp_pdf(profile.telefonnummer, Path(result["pdf_path"]), caption)
+
+    return {
+        "quote_id": quote_id,
+        "status": "pending_approval",
+        "approval_url": approval_url,
+        "sent_to_electrician": sent_to_electrician,
+        "kunde_name": result.get("kunde_name"),
+        "gesamtsumme_eur": result.get("gesamtsumme_eur"),
+        "hat_offene_positionen": result.get("hat_offene_positionen"),
+    }
+
+
+@app.get("/api/v1/quotes/{quote_id}/approve", tags=["Angebote"], response_class=PlainTextResponse)
+async def quote_approve(quote_id: str, token: str = ""):
+    """Klick-Link aus der WhatsApp-Nachricht an den Elektriker. Setzt das
+    Angebot auf "approved" und schickt es SOFORT an den Kunden (kunde_kontakt)
+    weiter, falls das wie eine Telefonnummer aussieht -- sonst bleibt es
+    "approved" und muss manuell verschickt werden (E-Mail-Kontakte sind
+    Phase 2, siehe Modul-Kommentar oben)."""
+    from tools import quote_store
+
+    ok, reason = quote_store.approve(quote_id, token)
+    if not ok:
+        status_code = 404 if reason in ("not_found", "invalid_token") else 409
+        raise HTTPException(status_code=status_code, detail=reason)
+
+    quote = quote_store.get_quote(quote_id)
+    kontakt = (quote or {}).get("kunde_kontakt", "")
+    delivered = False
+    if kontakt and re.match(r"^\+?[0-9 ()-]{6,20}$", kontakt.strip()):
+        pdf_path = Path(quote["pdf_path"])
+        if pdf_path.is_file():
+            delivered = await _send_whatsapp_pdf(kontakt.strip(), pdf_path, "Ihr Angebot, wie besprochen.")
+        if delivered:
+            quote_store.mark_sent(quote_id)
+
+    if delivered:
+        return "Angebot freigegeben und per WhatsApp an den Kunden verschickt. Danke!"
+    return (
+        "Angebot freigegeben. Der Kunde konnte nicht automatisch per WhatsApp erreicht werden "
+        "(keine gültige Nummer hinterlegt) -- bitte manuell weiterleiten."
+    )
+
+
+@app.get("/api/v1/quotes/{quote_id}/reject", tags=["Angebote"], response_class=PlainTextResponse)
+async def quote_reject(quote_id: str, token: str = ""):
+    from tools import quote_store
+
+    ok, reason = quote_store.reject(quote_id, token)
+    if not ok:
+        status_code = 404 if reason in ("not_found", "invalid_token") else 409
+        raise HTTPException(status_code=status_code, detail=reason)
+    return "Angebot verworfen -- es wird nicht an den Kunden geschickt."
+
+
+async def _send_whatsapp_pdf(to: str, pdf_path: Path, caption: str) -> bool:
+    """Schickt ein PDF an eine beliebige Nummer (nicht an den Absender einer
+    eingehenden Nachricht -- siehe _whatsapp_reply() weiter oben, das dafür
+    ein IncomingMessage-Objekt braucht). Wirft nie, gibt nur zurück, ob es
+    geklappt hat -- Aufrufer entscheidet über die Nutzerkommunikation."""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    try:
+        pdf_bytes = pdf_path.read_bytes()
+        media_id = await loop.run_in_executor(None, whatsapp_cloud.upload_media, pdf_bytes, pdf_path.name, "application/pdf", "")
+        if not media_id:
+            return False
+        return await loop.run_in_executor(None, whatsapp_cloud.send_document, to, media_id, pdf_path.name, caption, "")
+    except Exception as exc:
+        log.error("Angebot: WhatsApp-PDF-Versand fehlgeschlagen", to=to[-4:], error=str(exc), exc_info=True)
+        return False
 
 
 class SequenceStepResult(BaseModel):

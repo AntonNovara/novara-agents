@@ -19,5 +19,8 @@
   "telefonnummer": "+43 664 0000000",
   "ton": "freundlich, professionell, per Sie",
   "preise_oeffentlich": false,
-  "preishinweise": ""
+  "preishinweise": "",
+  "stundensatz_eur": 65.0,
+  "anfahrtspauschale_eur": 25.0,
+  "materialaufschlag_pct": 15.0
 }

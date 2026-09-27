@@ -62,6 +62,15 @@ class Settings(BaseSettings):
         default="https://calendar.app.google/Dqmz7HkW2XNktT6q6", alias="DEMO_BOOKING_URL"
     )
 
+    # Basis-URL dieses Deployments -- für absolute Links, die main.py selbst
+    # verschickt (z. B. der Angebots-Freigabe-Link per WhatsApp,
+    # agents/quote_agent.py). Default ist die bekannte Railway-Produktions-URL
+    # (gleiche wie überall sonst im Code/CLAUDE.md hartkodiert referenziert);
+    # als Env-Var überschreibbar, falls sich das je ändert.
+    public_base_url: str = Field(
+        default="https://novara-agents-production.up.railway.app", alias="PUBLIC_BASE_URL"
+    )
+
     # Google Calendar (book_appointment tool)
     google_client_id: SecretStr = Field(default="", alias="GOOGLE_CLIENT_ID")
     google_client_secret: SecretStr = Field(default="", alias="GOOGLE_CLIENT_SECRET")

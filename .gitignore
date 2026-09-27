@@ -27,3 +27,8 @@ static/reports/
 # core/db.py -- lokaler SQLite-Fallback ohne DATABASE_URL (Dev/Tests).
 # Produktion nutzt Railways Postgres-Plugin (DATABASE_URL-Env-Var).
 novara_dev.db
+
+# Angebots-Generator: zur Laufzeit generierte PDFs (agents/quote_agent.py) --
+# enthalten Kundendaten, nie committen, nur auf Railways ephemerem
+# Dateisystem relevant (gleiches Prinzip wie static/reports/ oben).
+quotes_tmp/

@@ -30,7 +30,7 @@ import re
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
@@ -260,4 +260,167 @@ def generate_regiebericht(
 
     pdf.output(str(out_path))
     logger.info("Regiebericht erstellt", extra={"path": str(out_path)})
+    return out_path
+
+
+# ── Angebot (agents/quote_agent.py) ─────────────────────────────────────────────
+
+class _AngebotPDF(FPDF):
+    """Kopf-/Fußzeile für Angebote. Platzhalter-Logobox oben links (Phase 1 --
+    echtes Kundenlogo folgt, sobald die Pilotkunden eines liefern), Firmenname
+    + Unternehmensfarbe kommen aus core/client_profiles.py."""
+
+    def __init__(self, *args: Any, firmenname: str, brand_color: tuple[int, int, int], **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._firmenname = firmenname
+        self._brand_color = brand_color
+
+    def header(self) -> None:  # noqa: D102
+        # Logo-Platzhalter: leeres Rechteck oben links, ersetzt später durch
+        # pdf.image(logo_path, ...) sobald ein echtes Kundenlogo vorliegt.
+        self.set_draw_color(200, 200, 200)
+        self.rect(self.l_margin, self.t_margin, 30, 18)
+        self.set_font("helvetica", "", 6.5)
+        self.set_text_color(180, 180, 180)
+        self.set_xy(self.l_margin, self.t_margin + 7)
+        self.cell(30, 4, "LOGO", align="C")
+
+        self.set_xy(self.l_margin + 36, self.t_margin)
+        self.set_font("helvetica", "B", 18)
+        self.set_text_color(*self._brand_color)
+        self.cell(0, 10, _clean_text("Angebot"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.set_x(self.l_margin + 36)
+        self.set_font("helvetica", "", 10)
+        self.set_text_color(*_MUTED_GREY)
+        self.cell(0, 6, _clean_text(self._firmenname), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        self.set_y(max(self.get_y(), self.t_margin + 20))
+        self.set_draw_color(200, 200, 200)
+        self.set_line_width(0.3)
+        self.line(self.l_margin, self.get_y() + 2, self.w - self.r_margin, self.get_y() + 2)
+        self.ln(10)
+
+    def footer(self) -> None:  # noqa: D102
+        self.set_y(-15)
+        self.set_font("helvetica", "I", 8)
+        self.set_text_color(*_MUTED_GREY)
+        self.cell(0, 10, f"Seite {self.page_no()}/{{nb}}", align="C")
+
+
+def generate_angebot(
+    firmenname: str,
+    kunde_name: str,
+    positionen: list[dict[str, Any]],
+    gesamtsumme: Optional[float],
+    hat_offene_positionen: bool,
+    output_path: Union[str, Path] = "Angebot.pdf",
+    brand_color: tuple[int, int, int] = _BRAND_BLUE,
+    angebotsnummer: str = "",
+) -> Path:
+    """
+    Erzeugt ein Angebots-PDF aus bereits DETERMINISTISCH bepreisten Positionen
+    (agents/quote_agent.py::price_positions -- niemals aus vom LLM erfundenen
+    Preisen, siehe dortigen Docstring).
+
+    `positionen`: Liste von dicts mit
+      - beschreibung: str
+      - menge: float | int | str
+      - einheit: str            -- z. B. "Std.", "Stk.", "Pauschal"
+      - einzelpreis_eur: float | None   -- None -> "nach Aufwand" statt Betrag
+      - gesamtpreis_eur: float | None
+
+    `gesamtsumme`: Summe aller Positionen MIT bekanntem Preis (None-Positionen
+    fließen nicht ein) -- `hat_offene_positionen=True` ergänzt automatisch den
+    Hinweis, dass die Summe unvollständig ist.
+
+    Gibt den Pfad der geschriebenen Datei zurück. Kein eigenes try/except --
+    Aufrufer entscheidet über die Fehlerkommunikation (gleiches Prinzip wie
+    generate_regiebericht() oben).
+    """
+    pdf = _AngebotPDF(format="A4", unit="mm", firmenname=firmenname, brand_color=brand_color)
+    pdf.alias_nb_pages()
+    pdf.set_auto_page_break(auto=True, margin=22)
+    pdf.set_margins(left=20, top=20, right=20)
+    pdf.add_page()
+
+    datum = datetime.now(timezone.utc).strftime("%d.%m.%Y")
+    _write_field(pdf, "Datum:", datum)
+    if angebotsnummer:
+        _write_field(pdf, "Angebotsnr.:", angebotsnummer)
+    _write_field(pdf, "Kunde:", kunde_name or "-")
+
+    pdf.ln(4)
+    pdf.set_font("helvetica", "B", 11)
+    pdf.set_text_color(*_TEXT_DARK)
+    pdf.cell(0, 8, _clean_text("Leistungen"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(2)
+
+    # Summe MUSS <= nutzbare Breite sein (A4 210mm - 20mm links - 20mm rechts
+    # = 170mm) -- 190mm lief beim ersten Test sichtbar über den rechten Rand
+    # hinaus (verifiziert per PDF-Rendering-Check vor diesem Fix).
+    col_widths = (73, 18, 22, 27, 27)  # Beschreibung, Menge, Einheit, Einzelpreis, Gesamt -- Summe 167mm
+    headers = ("Position", "Menge", "Einheit", "Einzelpreis", "Gesamt")
+
+    pdf.set_font("helvetica", "B", 9.5)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.set_text_color(*_TEXT_DARK)
+    for width, header in zip(col_widths, headers):
+        pdf.cell(width, 8, _clean_text(header), border=1, align="C", fill=True)
+    pdf.ln()
+
+    pdf.set_font("helvetica", "", 9.5)
+    for pos in positionen:
+        einzelpreis = pos.get("einzelpreis_eur")
+        gesamt = pos.get("gesamtpreis_eur")
+        einzelpreis_text = f"{einzelpreis:.2f} EUR" if isinstance(einzelpreis, (int, float)) else "nach Aufwand"
+        gesamt_text = f"{gesamt:.2f} EUR" if isinstance(gesamt, (int, float)) else "-"
+
+        y_before = pdf.get_y()
+        x_before = pdf.get_x()
+        pdf.multi_cell(col_widths[0], 6, _clean_text(pos.get("beschreibung") or "-"), border=1)
+        row_height = pdf.get_y() - y_before
+        pdf.set_xy(x_before + col_widths[0], y_before)
+        pdf.cell(col_widths[1], row_height, _clean_text(str(pos.get("menge") or "-")), border=1, align="C")
+        pdf.cell(col_widths[2], row_height, _clean_text(pos.get("einheit") or "-"), border=1, align="C")
+        pdf.cell(col_widths[3], row_height, einzelpreis_text, border=1, align="R")
+        pdf.cell(col_widths[4], row_height, gesamt_text, border=1, align="R")
+        pdf.set_xy(x_before, y_before + row_height)
+
+    pdf.ln(6)
+    pdf.set_font("helvetica", "B", 11)
+    summe_text = f"{gesamtsumme:.2f} EUR" if isinstance(gesamtsumme, (int, float)) else "nach Aufwand"
+    label = "Zwischensumme (bekannte Positionen):" if hat_offene_positionen else "Gesamtsumme:"
+    pdf.cell(0, 8, _clean_text(f"{label} {summe_text}"), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
+
+    if hat_offene_positionen:
+        pdf.set_font("helvetica", "I", 9)
+        pdf.set_text_color(*_MUTED_GREY)
+        pdf.multi_cell(
+            0, 5,
+            _clean_text(
+                "Einzelne Positionen sind als \"nach Aufwand\" markiert und in der Summe "
+                "oben NICHT enthalten -- der Endpreis dafür wird erst nach Besichtigung/"
+                "Ausführung final feststehen."
+            ),
+        )
+
+    pdf.ln(8)
+    pdf.set_font("helvetica", "I", 8.5)
+    pdf.set_text_color(*_MUTED_GREY)
+    pdf.multi_cell(
+        0, 5,
+        _clean_text(
+            "Dieses Angebot wurde mit Unterstützung eines KI-Systems erstellt und vom "
+            f"Betrieb ({firmenname}) vor Versand geprüft und freigegeben. Alle Preise "
+            "basieren auf den hinterlegten Stundensätzen/Pauschalen, keine Preise wurden "
+            "automatisch erfunden."
+        ),
+    )
+
+    out_path = Path(output_path)
+    if out_path.parent != Path("."):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pdf.output(str(out_path))
+    logger.info("Angebot erstellt", extra={"path": str(out_path)})
     return out_path

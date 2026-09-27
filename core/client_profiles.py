@@ -56,6 +56,15 @@ class ClientProfile(BaseModel):
     preise_oeffentlich: bool = False
     preishinweise: str = ""
 
+    # Angebots-Generator (agents/quote_agent.py): STRIKT deterministische
+    # Preisgrundlage -- das LLM darf daraus rechnen, aber NIE eigene Preise
+    # erfinden (gleiche Philosophie wie core/outbound_guard.py: nur Zahlen,
+    # die im Profil stehen). Fehlt ein Feld (None), markiert quote_agent.py
+    # jede betroffene Position als "nach Aufwand" statt zu schätzen.
+    stundensatz_eur: Optional[float] = None
+    anfahrtspauschale_eur: Optional[float] = None
+    materialaufschlag_pct: Optional[float] = None
+
 
 class ClientProfileNotFoundError(Exception):
     """Kein Profil unter clients/<client_id>.json gefunden."""
