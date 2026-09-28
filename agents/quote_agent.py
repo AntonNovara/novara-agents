@@ -13,6 +13,11 @@ Workflow (LangGraph StateGraph):
         ↓              "nach Aufwand" markiert (kein erfundener Preis, exakt
         ↓              wie vom Kunden gefordert -- gleiche Philosophie wie
         ↓              core/outbound_guard.py: nur Zahlen aus echten Daten).
+        ↓              Zusätzlich, falls hinterlegt: client_profile.
+        ↓              materialaufschlag_pct als Pauschal-Posten auf die
+        ↓              bepreiste Lohnsumme (kein Materialpreis-Katalog, kein
+        ↓              vom LLM geschätzter Materialwert -- siehe Kommentar
+        ↓              direkt im Code).
   generate_pdf      ← utils/pdf_generator.py::generate_angebot()
         ↓
   persist           ← tools/quote_store.create_quote() (Status
@@ -180,6 +185,36 @@ class _QuoteGraph:
                 "einzelpreis_eur": einzelpreis,
                 "gesamtpreis_eur": gesamtpreis,
             })
+
+        # Materialaufschlag (BUG-FIX: profile.materialaufschlag_pct existierte
+        # bereits im Schema (core/client_profiles.py), wurde hier aber nie
+        # gelesen -- jedes Angebot bestand nur aus Lohnkosten +
+        # Anfahrtspauschale, ohne jeden Materialanteil. Für einen
+        # Elektrikerbetrieb ist das unrealistisch: praktisch jede Position
+        # (Steckdose setzen, Kabel verlegen, ...) verbraucht Material, das der
+        # Betrieb selbst eingekauft und mit einem Aufschlag weiterverrechnet.
+        #
+        # Kein per-Position-Materialpreis-Katalog existiert (und das LLM darf
+        # laut _SYSTEM_EXTRACT keine Materialkosten erfinden) -- deterministisch
+        # wird daher derselbe Aufschlag, den der Betrieb selbst im Profil
+        # hinterlegt hat, als EIN Pauschal-Posten auf die bereits bepreiste
+        # Lohnsumme draufgerechnet (gleiche Philosophie wie
+        # anfahrtspauschale_eur: nur echte, vom Betrieb gepflegte Zahlen,
+        # nie ein Schätzwert). Kein Lohnanteil bekannt (summe == 0, z. B. weil
+        # jede Position "nach Aufwand" ist) -> kein Materialposten, es gäbe
+        # sonst nichts, worauf sich der Aufschlag bezöge.
+        if profile.materialaufschlag_pct and summe > 0:
+            material_pct = float(profile.materialaufschlag_pct)
+            materialkosten = round(summe * material_pct / 100, 2)
+            if materialkosten > 0:
+                priced.append({
+                    "beschreibung": f"Material (pauschal, {material_pct:g}% vom Arbeitsaufwand)",
+                    "menge": 1,
+                    "einheit": "Pauschal",
+                    "einzelpreis_eur": materialkosten,
+                    "gesamtpreis_eur": materialkosten,
+                })
+                summe += materialkosten
 
         if profile.anfahrtspauschale_eur:
             priced.append({

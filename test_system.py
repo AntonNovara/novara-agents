@@ -4055,6 +4055,63 @@ def test_chat_broken_json_never_shown() -> None:
         traceback.print_exc()
 
 
+def test_quote_agent_material_markup() -> None:
+    section("TEST — Angebots-Generator: Materialaufschlag (materialaufschlag_pct) wird verrechnet")
+    try:
+        import agents.quote_agent as quote_module
+        from core.client_profiles import ClientProfile
+
+        original_loader = quote_module.load_client_profile
+
+        def _run(materialaufschlag_pct, positionen, anfahrt=0.0, stundensatz=60.0):
+            profile = ClientProfile(
+                client_id="test-elektriker",
+                firmenname="Test Elektro GmbH",
+                leistungen=["Elektroinstallation"],
+                stundensatz_eur=stundensatz,
+                anfahrtspauschale_eur=anfahrt,
+                materialaufschlag_pct=materialaufschlag_pct,
+            )
+            quote_module.load_client_profile = lambda client_id: profile
+            graph = quote_module._QuoteGraph()
+            return graph.price_positions({"positionen": positionen, "client_id": "test-elektriker"})
+
+        try:
+            # Fall 1: 3 Std x 60 EUR/Std = 180 EUR Lohn, 20% Materialaufschlag -> 36 EUR Material, Summe 216
+            r1 = _run(20.0, [{"beschreibung": "Steckdosen setzen", "menge": 1, "geschaetzte_stunden": 3}])
+            mat1 = [p for p in r1["priced_positionen"] if "Material" in p["beschreibung"]]
+            case1_ok = (r1["gesamtsumme_eur"] == 216.0 and len(mat1) == 1
+                        and mat1[0]["gesamtpreis_eur"] == 36.0 and mat1[0]["einzelpreis_eur"] == 36.0)
+
+            # Fall 2: kein materialaufschlag_pct im Profil -> kein Materialposten (Vorher-Zustand bleibt für Betriebe ohne diesen Wert unverändert)
+            r2 = _run(None, [{"beschreibung": "Steckdosen setzen", "menge": 1, "geschaetzte_stunden": 3}])
+            case2_ok = (r2["gesamtsumme_eur"] == 180.0
+                        and not any("Material" in p["beschreibung"] for p in r2["priced_positionen"]))
+
+            # Fall 3: Position komplett "nach Aufwand" (keine Stunden-Schätzung) -> kein Lohnanteil bekannt,
+            # also auch kein Materialposten (kein erfundener Bezugswert)
+            r3 = _run(20.0, [{"beschreibung": "Fehlersuche", "menge": 1, "geschaetzte_stunden": None}])
+            case3_ok = (r3["hat_offene_positionen"] is True
+                        and not any("Material" in p["beschreibung"] for p in r3["priced_positionen"]))
+
+            # Fall 4: Materialaufschlag + Anfahrtspauschale zusammen -- Anfahrt bleibt vom Aufschlag unberührt
+            r4 = _run(10.0, [{"beschreibung": "Kabel verlegen", "menge": 1, "geschaetzte_stunden": 2}], anfahrt=25.0)
+            mat4 = [p for p in r4["priced_positionen"] if "Material" in p["beschreibung"]]
+            # Lohn 120 EUR, 10% Material = 12 EUR, + 25 EUR Anfahrt = 157 EUR; Material NICHT auf Anfahrt draufgerechnet
+            case4_ok = r4["gesamtsumme_eur"] == 157.0 and len(mat4) == 1 and mat4[0]["gesamtpreis_eur"] == 12.0
+
+            if case1_ok and case2_ok and case3_ok and case4_ok:
+                ok("Materialaufschlag korrekt auf Lohnsumme verrechnet (eigener Pauschal-Posten); ohne Profil-Wert weiterhin kein Posten; "
+                   "rein 'nach Aufwand' ohne Lohnbezug -> kein Materialposten; Anfahrtspauschale bleibt vom Aufschlag unberührt")
+            else:
+                fail("Materialaufschlag-Logik unerwartet", str((r1, r2, r3, r4)))
+        finally:
+            quote_module.load_client_profile = original_loader
+    except Exception:
+        fail("Angebots-Generator Materialaufschlag — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -4109,6 +4166,7 @@ def main() -> int:
     test_sdr_need_gate()
     test_chat_broken_json_never_shown()
     test_objection_handling(live)
+    test_quote_agent_material_markup()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")
