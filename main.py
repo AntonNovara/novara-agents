@@ -6,6 +6,7 @@ API-Key-Authentifizierung über X-API-Key Header (aus .env).
 Strukturiertes JSON-Logging für alle Requests (DSGVO-Audit-Trail).
 """
 import hmac
+import html
 import json
 import logging
 import os
@@ -16,10 +17,12 @@ import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
 import httpx
+import qrcode
 import structlog
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Security, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from groq import Groq
 from pydantic import BaseModel, Field
 
-from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -45,10 +48,10 @@ from agents.sdr_agent import SDRAgent
 from agents.support_agent import SupportAgent
 from agents.voice_agent import VoiceAgent
 from core import consent, lead_capture
-from core.client_profiles import ClientProfileInvalidError, ClientProfileNotFoundError, load_client_profile
+from core.client_profiles import ClientProfileInvalidError, ClientProfileNotFoundError, client_profile_exists, load_client_profile
 from core.config import settings
 from core.security import OutputBlockedError, SecurityLayer
-from tools import lead_notifier, sequence_scheduler, telnyx_voice, whatsapp_cloud
+from tools import lead_notifier, review_store, sequence_scheduler, telnyx_voice, whatsapp_cloud
 from tools.calendar_integration import GoogleCalendarTool
 from tools.demo_sandbox import is_demo_message, log_demo_lead, strip_demo_marker
 from tools.document_parser import DocumentParser
@@ -834,6 +837,288 @@ async def client_chat(request: Request, client_id: str, payload: ClientChatReque
         should_offer_booking=sanitized.get("should_offer_booking", False),
         booking_url=sanitized.get("booking_url"),
     )
+
+
+# ── Google-Bewertungs-Filter (Pain 3) ─────────────────────────────────────────
+#
+# Ein Kunde scannt einen QR-Code (Rechnung/Visitenkarte/Firmenwagen-Aufkleber)
+# und landet auf GET /r/{client_id} -- eine winzige, framework-lose Sterne-
+# Seite. 4/5 Sterne -> sofortige Weiterleitung zu profile.google_review_url
+# (ECHTER, vom Betrieb kopierter Link, siehe core/client_profiles.py). 1-3
+# Sterne -> KEINE Weiterleitung, stattdessen ein privates Feedback-Formular,
+# dessen Text NIE öffentlich landet, sondern nur per E-Mail an den Betrieb
+# selbst geht (tools/lead_notifier.py::send_review_alert()) -- der
+# Elektriker bekommt so die Chance, ein schlechtes Erlebnis zu klären, BEVOR
+# es eine öffentliche 1-Stern-Rezension wird. Jede Abgabe (auch die
+# weitergeleiteten 4/5-Sterne) wird in tools/review_store.py gespeichert.
+#
+# KEIN LLM in diesem Pfad -- reine deterministische Schranke wie
+# price_positions() im Angebots-Generator, kein erfundener/geschätzter Wert
+# irgendwo.
+#
+# ⚠️ KOMPLIANZ-HINWEIS (bewusst offengelegt, nicht stillschweigend gebaut):
+# Das hier ist "Review Gating" im Sinne von Googles Program-Richtlinien
+# ("Don't discourage or prohibit negative reviews or selectively solicit
+# positive reviews") -- und in den USA seit 2024 durch die FTC explizit
+# verboten (in Österreich/EU keine identische Norm, aber dieselbe Stoßrichtung
+# über das UWG denkbar, siehe die bereits dokumentierte Fake-Testimonial-
+# Lektion in CLAUDE.md/website-Historie). Google kann so erkannte
+# Bewertungsprofile im Extremfall sperren oder Rezensionen entfernen. Novara
+# verhindert technisch KEINE echte Google-Rezension (dafür gibt es keine
+# öffentliche API) -- es lädt nur bei 1-3 Sternen aktiv NICHT zur
+# öffentlichen Abgabe ein. Anton hat diese exakte Ausgestaltung ausdrücklich
+# so angefordert (5-Sterne-Schranke); das Risiko liegt beim jeweiligen
+# Pilotkunden, nicht bei Novara selbst -- sollte aber im Verkaufsgespräch
+# transparent gemacht werden, nicht nur hier im Code stehen.
+
+class ReviewSubmitRequest(BaseModel):
+    rating: int = Field(..., ge=1, le=5)
+    feedback_text: str = Field("", max_length=2_000)
+    kunde_name: str = Field("", max_length=200)
+    kunde_kontakt: str = Field("", max_length=200)
+
+
+class ReviewSubmitResponse(BaseModel):
+    success: bool
+    redirect_url: Optional[str] = None
+    message: str = ""
+    error: Optional[str] = None
+
+
+_REVIEW_PAGE_TEMPLATE = """<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wie war Ihr Erlebnis mit __FIRMENNAME__?</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; padding: 24px 16px; background: #f7f7f8; color: #1a1a1a; display: flex; justify-content: center; }
+  .card { max-width: 420px; width: 100%; background: #fff; border-radius: 16px; padding: 28px 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); text-align: center; }
+  h1 { font-size: 1.25rem; margin: 0 0 8px; }
+  p.sub { color: #666; margin: 0 0 24px; font-size: 0.95rem; }
+  .stars { display: flex; justify-content: center; gap: 6px; margin-bottom: 4px; }
+  .stars button { font-size: 2.4rem; line-height: 1; background: none; border: none; cursor: pointer; color: #d0d0d5; padding: 4px; }
+  .stars button.active { color: #f5a623; }
+  #feedback-block { display: none; text-align: left; margin-top: 16px; }
+  #feedback-block label { display: block; margin: 10px 0 4px; font-size: 0.85rem; color: #444; }
+  #feedback-block textarea { width: 100%; min-height: 100px; border-radius: 10px; border: 1px solid #ddd; padding: 10px; font-size: 0.95rem; font-family: inherit; resize: vertical; }
+  #feedback-block input { width: 100%; border-radius: 8px; border: 1px solid #ddd; padding: 9px; font-size: 0.95rem; }
+  button.submit { margin-top: 18px; width: 100%; padding: 13px; border: none; border-radius: 10px; background: #0066ff; color: #fff; font-size: 1rem; font-weight: 600; cursor: pointer; }
+  button.submit:disabled { background: #b9cdf5; cursor: not-allowed; }
+  #result { margin-top: 18px; font-size: 0.95rem; }
+  #result.error { color: #c00; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Wie war Ihr Erlebnis mit __FIRMENNAME__?</h1>
+    <p class="sub">Ihre ehrliche Einschätzung hilft uns weiter.</p>
+    <div class="stars" id="stars">
+      <button type="button" data-v="1">&#9733;</button>
+      <button type="button" data-v="2">&#9733;</button>
+      <button type="button" data-v="3">&#9733;</button>
+      <button type="button" data-v="4">&#9733;</button>
+      <button type="button" data-v="5">&#9733;</button>
+    </div>
+    <div id="feedback-block">
+      <label for="feedback">Was können wir besser machen? (bleibt privat, geht nicht an Google)</label>
+      <textarea id="feedback" maxlength="2000"></textarea>
+      <label for="name">Ihr Name (optional)</label>
+      <input id="name" maxlength="200">
+      <label for="kontakt">Telefon oder E-Mail, falls wir zurückmelden dürfen (optional)</label>
+      <input id="kontakt" maxlength="200">
+    </div>
+    <button type="button" class="submit" id="submit" disabled>Absenden</button>
+    <div id="result"></div>
+  </div>
+<script>
+(function () {
+  var rating = 0;
+  var stars = document.querySelectorAll('#stars button');
+  var submitBtn = document.getElementById('submit');
+  var feedbackBlock = document.getElementById('feedback-block');
+  var resultEl = document.getElementById('result');
+
+  stars.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      rating = parseInt(btn.getAttribute('data-v'), 10);
+      stars.forEach(function (b) { b.classList.toggle('active', parseInt(b.getAttribute('data-v'), 10) <= rating); });
+      feedbackBlock.style.display = rating <= 3 ? 'block' : 'none';
+      submitBtn.disabled = false;
+      submitBtn.textContent = rating >= 4 ? 'Weiter zu Google' : 'Absenden';
+    });
+  });
+
+  submitBtn.addEventListener('click', function () {
+    if (!rating) return;
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Sende...';
+    resultEl.className = '';
+    fetch('/api/v1/reviews/__CLIENT_ID__', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        rating: rating,
+        feedback_text: document.getElementById('feedback').value,
+        kunde_name: document.getElementById('name').value,
+        kunde_kontakt: document.getElementById('kontakt').value
+      })
+    }).then(function (r) { return r.json(); }).then(function (data) {
+      if (data.success && data.redirect_url) {
+        resultEl.textContent = data.message || 'Danke! Sie werden zu Google weitergeleitet...';
+        window.location.href = data.redirect_url;
+      } else if (data.success) {
+        resultEl.textContent = data.message || 'Danke für Ihr Feedback!';
+        document.getElementById('stars').style.display = 'none';
+        feedbackBlock.style.display = 'none';
+        submitBtn.style.display = 'none';
+      } else {
+        resultEl.textContent = data.error || 'Etwas ist schiefgelaufen, bitte versuchen Sie es erneut.';
+        resultEl.className = 'error';
+        submitBtn.disabled = false;
+        submitBtn.textContent = rating >= 4 ? 'Weiter zu Google' : 'Absenden';
+      }
+    }).catch(function () {
+      resultEl.textContent = 'Verbindungsfehler, bitte versuchen Sie es erneut.';
+      resultEl.className = 'error';
+      submitBtn.disabled = false;
+    });
+  });
+})();
+</script>
+</body>
+</html>"""
+
+
+def _review_page_html(firmenname: str, client_id: str) -> str:
+    """html.escape() gegen einen Firmennamen mit HTML-Sonderzeichen aus einem
+    Betriebsprofil -- kein Nutzereingabe-Risiko hier (das Profil pflegt
+    Anton/der Betrieb selbst), aber billige Verteidigung in der Tiefe."""
+    return (
+        _REVIEW_PAGE_TEMPLATE
+        .replace("__FIRMENNAME__", html.escape(firmenname))
+        .replace("__CLIENT_ID__", html.escape(client_id, quote=True))
+    )
+
+
+@app.get("/r/{client_id}", response_class=HTMLResponse, tags=["Bewertungen"])
+async def review_page(client_id: str):
+    """ÖFFENTLICH, KEIN API-Key -- exakt das Ziel des gedruckten QR-Codes,
+    ein anonymer Kunde ruft das im Browser seines Handys auf."""
+    try:
+        profile = load_client_profile(client_id)
+    except ClientProfileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Kein Betriebsprofil für '{client_id}' gefunden.")
+    except ClientProfileInvalidError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return HTMLResponse(_review_page_html(profile.firmenname, client_id))
+
+
+@app.get("/r/{client_id}/qr.png", tags=["Bewertungen"])
+async def review_qr(client_id: str):
+    """QR-Code, der auf GET /r/{client_id} zeigt -- zum Ausdrucken auf
+    Rechnung/Visitenkarte/Firmenwagen. On-the-fly erzeugt (keine Datei auf
+    Platte), damit ein Wechsel von settings.public_base_url (z. B. eigene
+    Domain statt *.up.railway.app) nie einen bereits gedruckten QR-Code
+    bricht -- der Code zeigt nur auf den Pfad, die eigentliche Umleitung
+    passiert serverseitig."""
+    if not client_profile_exists(client_id):
+        raise HTTPException(status_code=404, detail=f"Kein Betriebsprofil für '{client_id}' gefunden.")
+    url = f"{settings.public_base_url}/r/{client_id}"
+    img = qrcode.make(url)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return Response(content=buf.getvalue(), media_type="image/png")
+
+
+@app.post(
+    "/api/v1/reviews/{client_id}",
+    response_model=ReviewSubmitResponse,
+    tags=["Bewertungen"],
+    responses={
+        404: {"description": "Kein Betriebsprofil für diese client_id"},
+        422: {"description": "Validierungsfehler (rating außerhalb 1-5, Text zu lang)"},
+        429: {"description": "Rate limit überschritten (10 Requests/Minute pro IP)"},
+    },
+)
+@limiter.limit("10/minute")
+async def review_submit(request: Request, client_id: str, payload: ReviewSubmitRequest) -> ReviewSubmitResponse:
+    """
+    ÖFFENTLICH, KEIN API-Key -- gleiche Begründung wie landing_chat()/
+    client_chat() oben (ein Kunde ruft das von unterwegs auf, kein Secret
+    könnte hier verborgen bleiben). Niedrigeres Rate-Limit als die Chat-
+    Endpunkte (10 statt 20/Minute) -- kein LLM-Call, aber ein öffentlicher
+    Schreibpfad in die DB + möglicher E-Mail-Versand soll trotzdem nicht per
+    Skript geflutet werden können.
+
+    Kernlogik (siehe ausführlichen Kompliance-Hinweis im Abschnittskommentar
+    oben): rating >= 4 UND profile.google_review_url gesetzt -> redirect_url
+    wird zurückgegeben, der Kunde landet direkt bei Google. rating <= 3 ->
+    KEINE redirect_url, stattdessen private Benachrichtigung an den Betrieb
+    (tools/lead_notifier.py::notify_review_async()). Jede Abgabe wird
+    gespeichert, unabhängig vom Ausgang.
+    """
+    try:
+        profile = load_client_profile(client_id)
+    except ClientProfileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Kein Betriebsprofil für '{client_id}' gefunden.")
+    except ClientProfileInvalidError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # Freitext ist die einzige vom Kunden frei eingegebene Stelle hier --
+    # dieselbe DLP-Prüfung wie jede andere öffentliche Freitext-Eingabe
+    # (landing_chat(), client_chat()).
+    feedback_text = ""
+    if payload.feedback_text:
+        feedback_dlp = SecurityLayer.check_and_redact(payload.feedback_text)
+        if not feedback_dlp.approved:
+            log.warning("Review-Feedback blocked by DLP", client=client_id, reason=feedback_dlp.blocked_reason)
+            return ReviewSubmitResponse(success=False, error=f"Input blocked by DLP: {feedback_dlp.blocked_reason}")
+        feedback_text = feedback_dlp.redacted_text
+
+    redirect_url: Optional[str] = None
+    redirected = False
+    if payload.rating >= 4:
+        if profile.google_review_url:
+            redirect_url = profile.google_review_url
+            redirected = True
+            message = "Danke! Sie werden zu Google weitergeleitet."
+        else:
+            message = "Danke für Ihre Bewertung!"
+    else:
+        message = "Danke für Ihre offene Rückmeldung -- der Betrieb wurde direkt informiert."
+
+    created = review_store.create_review(
+        client_id=client_id,
+        rating=payload.rating,
+        feedback_text=feedback_text,
+        kunde_name=payload.kunde_name,
+        kunde_kontakt=payload.kunde_kontakt,
+        redirected_to_google=redirected,
+    )
+
+    # Nur bei 1-3 Sternen benachrichtigen -- eine 4/5-Sterne-Weiterleitung
+    # braucht keine Aktion vom Betrieb, die Rezension steht ohnehin gleich
+    # öffentlich auf Google.
+    if payload.rating <= 3:
+        lead_notifier.notify_review_async(profile, created["id"], {
+            "rating": payload.rating,
+            "feedback_text": feedback_text,
+            "kunde_name": payload.kunde_name,
+            "kunde_kontakt": payload.kunde_kontakt,
+        })
+
+    return ReviewSubmitResponse(success=True, redirect_url=redirect_url, message=message)
+
+
+@app.get("/api/v1/tools/reviews/{client_id}", tags=["Bewertungen"], dependencies=[Depends(require_api_key)])
+async def reviews_list(client_id: str):
+    """Zum manuellen Prüfen aller abgegebenen Bewertungen eines Betriebs --
+    API-Key-geschützt (anders als die drei öffentlichen Endpunkte oben),
+    für Anton/den Elektriker selbst, nicht für den Website-Besucher."""
+    return review_store.list_reviews(client_id)
 
 
 # ── Voice / Vapi Endpunkte ────────────────────────────────────────────────────

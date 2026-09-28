@@ -1619,7 +1619,9 @@ novara-agents/
     ├── mcp_server.py                # MCP-Server: Novara-Tools für Kunden-CRMs (Sprint 3)
     ├── notification_system.py      # NotificationSystem, SentEmail – Mock E-Mail-Versand
     ├── onboarding_tracker.py       # OnboardingTracker, build_checklist(), ChecklistItem
+    ├── quote_store.py              # Angebots-Persistenz + Freigabe-Kette (Pain 2, 25.09.2026)
     ├── reply_classifier.py         # ReplyClassifier — interested/objection/opt_out (Sprint 2)
+    ├── review_store.py             # Bewertungs-Persistenz (Pain 3, 28.09.2026)
     ├── sequence_scheduler.py       # SequenceScheduler — Multi-Touch-Kadenz + Retries (Sprint 2)
     └── ticket_system.py            # TicketSystem, TicketRecord, TicketPriority
 ```
@@ -1716,6 +1718,92 @@ Alle 5 Agenten sind implementiert. Mögliche Erweiterungen:
 **Erfundener Kontaktname im CRM (26.09.2026):** Bei `contact_source == "generated"` (Ansprechpartner vom LLM geraten, Firma nicht in der Lead-DB) speichern `write_to_crm` (`LeadRecord.contact_name`, damit auch `customer_state`) und `final_result.contact.name` den Namen `Unbekannt` (`UNKNOWN_CONTACT_NAME`, `_contact_display_name()`), nie den erfundenen. Echte DB-Kontakte behalten ihren Namen. **Ebenso E-Mail/LinkedIn (26.09.2026):** `search_leads()` verwirft die vom LLM geratene E-Mail und LinkedIn-URL des erfundenen Kontakts (`linkedin_url=""`); als E-Mail bleibt NUR eine Adresse, die wirklich im Lead-Text steht (`SecurityLayer.extract_email`). Consent-Ledger, Sequenz (Schritte ohne Identifier -> `skipped`) und CRM-Zeile arbeiten damit nur noch mit echten Daten. Bekannte Kleinigkeit: der Erstkontakt-Schritt der Sequenz heißt weiter `sent`, auch ohne Adresse (er bildet nur den CRM-Schreibvorgang ab). Test: `test_sdr_generated_contact_crm()` (205 PASS).
 
 **CRM-Spalte `website` (26.09.2026):** `LeadRecord.website` (neu) füllt die bisher leere Sheet-Spalte `website` (`_lead_record_to_sheet_row`). Quelle: `_crm_website()` in `agents/sdr_agent.py` -- bevorzugt die geprüfte Endadresse des Audits (`audit.final_url`, nach Redirects), sonst die URL aus dem Lead-Text mit `https://` ergänzt; leer, wenn der Lead keine Website nennt. Betrifft beide Schreibpfade (Service-Account und lokales OAuth, gleiche Zeilenstruktur). Test: `test_sdr_crm_website_column()` (206 PASS).
+
+## Google-Bewertungs-Filter: QR-Code + 5-Sterne-Schranke (28.09.2026, Pain 3)
+
+Dritter Pilotkunden-Schmerz nach WhatsApp-Missed-Call (Pain 1, Telnyx) und
+Angebots-Generator (Pain 2, siehe oben): eine einzige schlechte Erfahrung
+landet sofort öffentlich als 1-Stern-Rezension auf Google, während
+zufriedene Kunden selten von sich aus eine Rezension schreiben. Der Filter
+gibt dem Betrieb die Chance, ein schlechtes Erlebnis privat zu klären,
+BEVOR es öffentlich wird -- und lenkt zufriedene Kunden aktiv zu Google.
+
+**Ablauf:** Kunde scannt einen QR-Code (Rechnung/Visitenkarte/Firmenwagen)
+→ `GET /r/{client_id}` (winzige, framework-lose Sterne-Seite, vanilla JS,
+kein Jinja2/Templating-Paket im Repo, bewusst ein reiner Python-f-string-
+ähnlicher Template-`.replace()`) → `POST /api/v1/reviews/{client_id}`:
+- **4-5 Sterne** → `redirect_url` = `profile.google_review_url` (der ECHTE,
+  vom Betrieb aus seinem Google-Unternehmensprofil kopierte Link, NIE vom
+  LLM erraten -- gleiche Philosophie wie `stundensatz_eur`). Kein Link im
+  Profil hinterlegt → keine Weiterleitung, aber trotzdem gespeichert.
+- **1-3 Sterne** → KEINE Weiterleitung. Stattdessen ein privates
+  Feedback-Formular (Freitext, Name, Kontakt optional), das NIE öffentlich
+  landet, sondern per E-Mail an `profile.review_benachrichtigung_email`
+  geht (`tools/lead_notifier.py::send_review_alert()`/
+  `notify_review_async()`, gleiches SMTP-Muster wie `send_lead_notification()`,
+  Hintergrund-Thread, wirft nie, verzögert nie die HTTP-Antwort an den
+  Kunden). Ohne konfigurierte Zieladresse: nur Warn-Log, Feedback bleibt
+  trotzdem in der DB.
+
+**Kein LLM in diesem Pfad** -- reine deterministische Schranke, wie
+`price_positions()` im Angebots-Generator. Der einzige LLM-freie Freitext
+(`feedback_text`) läuft trotzdem durch dieselbe `SecurityLayer.
+check_and_redact()`-DLP-Prüfung wie jede andere öffentliche Nutzereingabe im
+System (`landing_chat()`, `client_chat()`).
+
+**Neue Dateien:** `tools/review_store.py` (SQLAlchemy, Tabelle `reviews`,
+gleiches Muster wie `tools/quote_store.py`) · drei neue `main.py`-Endpunkte,
+alle ÖFFENTLICH/kein API-Key (ein gescanntes QR-Code-Ziel kann kein Secret
+tragen, gleiche Begründung wie `landing_chat()`): `GET /r/{client_id}`
+(Seite), `GET /r/{client_id}/qr.png` (QR-Code on-the-fly per `qrcode`-Paket,
+zeigt auf den PFAD, nicht direkt auf Google -- ein bereits gedruckter
+QR-Code bricht dadurch nie, selbst wenn sich `google_review_url` später
+ändert), `POST /api/v1/reviews/{client_id}` (10/Minute Rate-Limit, niedriger
+als die Chat-Endpunkte, da kein LLM-Call, aber trotzdem ein öffentlicher
+Schreib-/Mail-Pfad). Dazu `GET /api/v1/tools/reviews/{client_id}`
+(API-Key-geschützt, zum manuellen Prüfen aller Abgaben eines Betriebs).
+`core/client_profiles.py` um `google_review_url`/
+`review_benachrichtigung_email` erweitert (beide `Optional`, kein
+Pflichtfeld -- ein Pilot ohne diese Werte funktioniert weiter, nur ohne
+Weiterleitung/Benachrichtigung).
+
+**⚠️ Bewusst offengelegte Compliance-Abwägung, nicht stillschweigend
+gebaut:** Diese Ausgestaltung ist "Review Gating" im Sinne von Googles
+eigenen Program-Richtlinien ("Don't discourage or prohibit negative reviews
+or selectively solicit positive reviews") und in den USA seit 2024 durch
+eine explizite FTC-Regel verboten. In Österreich/EU existiert keine
+identische Norm, aber dieselbe Stoßrichtung ist über das UWG denkbar --
+vergleichbar mit der bereits dokumentierten Fake-Testimonial-Lektion bei der
+eigenen Novara-Website (siehe weiter oben in dieser Datei: "Ein fake
+Testimonial ist ein echter UWG-Verstoß, keine Kosmetik"). Google kann ein
+so erkanntes Bewertungsprofil im Extremfall sperren oder Rezensionen
+entfernen; Novara selbst verhindert technisch KEINE echte Google-Rezension
+(dafür gibt es keine öffentliche API) -- es lädt bei 1-3 Sternen nur aktiv
+NICHT zur öffentlichen Abgabe ein. Anton hat diese exakte Ausgestaltung
+(5-Sterne-Schranke) ausdrücklich so angefordert; das Risiko liegt beim
+jeweiligen Pilotkunden. **Empfehlung, noch nicht umgesetzt:** dieses
+Risiko im Verkaufs-/Onboarding-Gespräch aktiv ansprechen (siehe neuer
+Abschnitt in `clients/README.md`), nicht nur im Code dokumentieren -- der
+Kunde sollte diese Entscheidung bewusst mittragen, nicht nur stillschweigend
+erben.
+
+**Noch offen (bewusst nicht in dieser Runde gebaut, Scope-Kontrolle):**
+kein Redeploy-Trigger, wenn ein Pilotkunde seinen `google_review_url`
+nachträglich einträgt (gleiche Einschränkung wie alle `clients/*.json`-Felder,
+siehe `clients/README.md`, "Nach dem Ausfüllen" -- Profile werden pro
+Prozessstart gecached); keine Integration in die Angebots-PDFs
+(`utils/pdf_generator.py::generate_angebot()`) -- ein naheliegender nächster
+Schritt wäre der QR-Code direkt auf der Rechnung/dem freigegebenen Angebot,
+aber das ist ein eigener, noch nicht angeforderter Baustein; kein
+Rate-Limiting auf `GET /r/{client_id}/qr.png` (reine Bildauslieferung ohne
+DB-Schreibzugriff, geringeres Missbrauchsrisiko als der POST-Endpunkt, aber
+theoretisch trotzdem ein unlimitierter öffentlicher Endpoint).
+
+Regressionstest: `test_review_gate()` (`test_system.py`) -- Seite/QR
+rendern, 4-5 Sterne mit/ohne hinterlegtem Google-Link, 1-3 Sterne lösen die
+private Benachrichtigung mit korrektem Rating/Text aus (Mail-Versand
+gemockt, kein echtes SMTP), unbekannte `client_id` → 404 auf allen drei
+öffentlichen Endpunkten, Rating außerhalb 1-5 → 422. Suite: 211 PASS, 0 FAIL.
 
 ## Angebots-Generator: Materialaufschlag-Bug behoben (28.09.2026)
 

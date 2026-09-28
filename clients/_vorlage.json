@@ -22,5 +22,7 @@
   "preishinweise": "",
   "stundensatz_eur": 65.0,
   "anfahrtspauschale_eur": 25.0,
-  "materialaufschlag_pct": 15.0
+  "materialaufschlag_pct": 15.0,
+  "google_review_url": "https://g.page/r/BEISPIEL/review",
+  "review_benachrichtigung_email": "info@beispiel-elektro.at"
 }

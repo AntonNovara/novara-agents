@@ -38,6 +38,32 @@ Reihenfolge ist auch die sinnvolle Gesprächsreihenfolge:
     nennen. Falls JA: unter `preishinweise` genau die Regel eintragen (z. B.
     "Anfahrtspauschale 45€, ab da nach Aufwand").
 
+## Angebots-Generator (optional, `agents/quote_agent.py`)
+
+Nur nötig, wenn der Betrieb auch den WhatsApp-Angebots-Generator nutzt:
+`stundensatz_eur`, `anfahrtspauschale_eur`, `materialaufschlag_pct`
+(Prozent-Aufschlag auf die bepreiste Lohnsumme, siehe CLAUDE.md-Abschnitt
+"Angebots-Generator: Materialaufschlag-Bug behoben"). Alle drei bleiben
+`null`/leer, solange der Betrieb sie nicht nennt — dann markiert der Agent
+jede Position als "nach Aufwand" statt einen Preis zu schätzen.
+
+## Google-Bewertungs-Filter (optional, `main.py GET/POST /r/{client_id}`)
+
+- **`google_review_url`** — der ECHTE "Rezension schreiben"-Link aus dem
+  Google-Unternehmensprofil des Betriebs (Google-Maps-Eintrag → "Rezensionen
+  verwalten" → Link kopieren, Format meist `https://g.page/r/.../review`).
+  Ohne diesen Wert bleibt die 4/5-Sterne-Weiterleitung deaktiviert.
+- **`review_benachrichtigung_email`** — wohin die private 1-3-Sterne-
+  Feedback-Mail geht. Bewusst eine EIGENE Adresse, nicht zwangsläufig
+  `ansprechpartner`/`telefonnummer` — manche Betriebe wollen dafür ein
+  eigenes Postfach.
+- **Vor dem Ausrollen unbedingt mit dem Kunden besprechen:** dieser Filter
+  lädt schlechte Bewertungen bewusst NICHT zur öffentlichen Abgabe auf
+  Google ein ("Review Gating", gegen Googles eigene Richtlinien, in den USA
+  per FTC-Regel verboten). Siehe CLAUDE.md, Abschnitt "Google-Bewertungs-
+  Filter", für die volle Abwägung — das ist eine bewusste Kundenentscheidung,
+  kein rein technisches Detail.
+
 ## Nach dem Ausfüllen
 
 1. JSON-Datei committen (`git add clients/<client_id>.json`) und pushen —

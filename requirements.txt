@@ -57,3 +57,8 @@ psycopg2-binary==2.9.10
 
 # Telnyx-Webhook-Signatur (Ed25519), tools/telnyx_voice.py
 cryptography>=42.0
+
+# Google-Bewertungs-Filter (Pain 3, main.py GET /r/{client_id}/qr.png) --
+# QR-Code-Erzeugung on-the-fly. Pillow (fürs PNG-Rendering) ist bereits über
+# fpdf2/pdfplumber im Baum, wird hier nicht erneut gepinnt.
+qrcode==8.2

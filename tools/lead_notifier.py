@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 from core.config import settings
 
 if TYPE_CHECKING:
+    from core.client_profiles import ClientProfile
     from core.lead_capture import CapturedLead
 
 logger = logging.getLogger(__name__)
@@ -190,3 +191,83 @@ def send_followup_digest(due: list[dict]) -> bool:
     except Exception:
         logger.warning("Follow-up-Digest: SMTP-Versand fehlgeschlagen", exc_info=True)
         return False
+
+
+# ── Google-Bewertungs-Filter (Pain 3, main.py GET/POST /r/{client_id}) ───────
+#
+# ANDERS als send_lead_notification()/send_followup_digest() oben (immer an
+# anton@novaraautomation.com) geht diese Mail an DEN BETRIEB SELBST
+# (ClientProfile.review_benachrichtigung_email) -- ein negatives
+# Kundenerlebnis ist Sache des Elektrikers, nicht Novaras. Kein Ziel
+# konfiguriert -> kein Versand, nur ein Warn-Log (gleiche "wirft nie"-
+# Philosophie wie überall in diesem Modul); das Feedback bleibt trotzdem in
+# tools/review_store.py gespeichert und über GET /api/v1/tools/reviews/
+# {client_id} abrufbar.
+
+def send_review_alert(profile: "ClientProfile", review: dict) -> bool:
+    """review: dict mit rating/feedback_text/kunde_name/kunde_kontakt (Form
+    von tools.review_store.create_review()). Gibt True bei Erfolg zurück,
+    False bei jedem Fehler (fehlende Zieladresse, fehlende SMTP-Credentials,
+    SMTP-Fehler) -- wirft NIE, siehe Moduldocstring oben."""
+    to_email = (profile.review_benachrichtigung_email or "").strip()
+    if not to_email:
+        logger.warning(
+            "Review-Benachrichtigung übersprungen: kein review_benachrichtigung_email im Profil",
+            extra={"client_id": profile.client_id},
+        )
+        return False
+
+    smtp_email = settings.smtp_email.get_secret_value().strip()
+    smtp_password = settings.smtp_password.get_secret_value().strip()
+    if not smtp_email or not smtp_password:
+        logger.warning("Review-Benachrichtigung übersprungen: SMTP_EMAIL/SMTP_PASSWORD nicht konfiguriert")
+        return False
+
+    stars = "★" * int(review["rating"]) + "☆" * (5 - int(review["rating"]))
+    body = (
+        f"Ein Kunde hat {review['rating']}/5 Sterne abgegeben -- NICHT öffentlich auf Google, "
+        "sondern nur an Sie geschickt, damit Sie die Chance haben, das direkt zu klären.\n\n"
+        f"Bewertung: {stars}\n"
+        f"Name: {review.get('kunde_name') or '(nicht angegeben)'}\n"
+        f"Kontakt: {review.get('kunde_kontakt') or '(nicht angegeben)'}\n\n"
+        "--- Rückmeldung des Kunden ---\n"
+        f"{review.get('feedback_text') or '(kein Text angegeben)'}\n"
+    )
+
+    msg = MIMEMultipart()
+    msg["From"] = smtp_email
+    msg["To"] = to_email
+    msg["Subject"] = f"⚠️ Neues Kundenfeedback ({review['rating']}/5 Sterne, nicht öffentlich)"
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    try:
+        with smtplib.SMTP(_SMTP_HOST, _SMTP_PORT, timeout=_SMTP_TIMEOUT_SECONDS) as server:
+            server.starttls()
+            server.login(smtp_email, smtp_password)
+            server.sendmail(smtp_email, [to_email], msg.as_string())
+        logger.info("Review-Benachrichtigung verschickt", extra={"client_id": profile.client_id, "rating": review["rating"]})
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Review-Benachrichtigung fehlgeschlagen (Netzwerk oder Credentials): %s",
+            exc,
+            extra={"client_id": profile.client_id},
+        )
+        return False
+
+
+def notify_review_async(profile: "ClientProfile", review_id: str, review: dict) -> None:
+    """Wie notify_lead_async() oben -- Hintergrund-Thread, kehrt sofort
+    zurück. Aufrufer (main.py review_submit()) muss dem Kunden sofort
+    antworten (Weiterleitung zu Google bzw. Bestätigungstext), ein
+    SMTP-Roundtrip darf das nicht verzögern."""
+    def _run() -> None:
+        try:
+            if send_review_alert(profile, review):
+                from tools import review_store  # lokaler Import, gleicher Grund wie oben (kein Zyklus)
+
+                review_store.mark_notified(review_id)
+        except Exception as exc:
+            logger.warning("Review-Benachrichtigung (Hintergrund-Thread) fehlgeschlagen: %s", exc, extra={"client_id": profile.client_id})
+
+    threading.Thread(target=_run, name=f"review-notify-{review_id}", daemon=True).start()

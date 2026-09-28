@@ -65,6 +65,25 @@ class ClientProfile(BaseModel):
     anfahrtspauschale_eur: Optional[float] = None
     materialaufschlag_pct: Optional[float] = None
 
+    # Google-Bewertungs-Filter (main.py GET/POST /r/{client_id}, Pain 3:
+    # "gute Bewertungen gehen unter, schlechte landen sofort öffentlich auf
+    # Google"). google_review_url ist der ECHTE, vom Betrieb selbst aus dem
+    # Google-Unternehmensprofil kopierte "Rezension schreiben"-Link (z. B.
+    # https://g.page/r/<ID>/review oder
+    # https://search.google.com/local/writereview?placeid=<ID>) -- wird nie
+    # vom LLM erraten, exakt dieselbe Philosophie wie stundensatz_eur oben.
+    # Fehlt der Wert, bleibt die 4-/5-Sterne-Weiterleitung deaktiviert (siehe
+    # main.py review_submit()), statt einen falschen/generischen Link zu
+    # zeigen. review_benachrichtigung_email ist die E-Mail-Adresse DES
+    # BETRIEBS (nicht Novaras) für die private 1-3-Sterne-Feedback-Mail --
+    # bewusst getrennt von ansprechpartner/telefonnummer, weil nicht jeder
+    # Elektriker seine private Handynummer für Kunden-Rohtext-Feedback nutzen
+    # will. Siehe CLAUDE.md-Abschnitt zum Review-Filter für die bewusst
+    # offengelegte Compliance-Abwägung (Google-Richtlinien/UWG "Review
+    # Gating").
+    google_review_url: Optional[str] = None
+    review_benachrichtigung_email: Optional[str] = None
+
 
 class ClientProfileNotFoundError(Exception):
     """Kein Profil unter clients/<client_id>.json gefunden."""
