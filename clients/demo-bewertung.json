@@ -1,0 +1,20 @@
+{
+  "client_id": "demo-bewertung",
+  "firmenname": "Novara Demo Elektro",
+  "branche": "Elektrikerbetrieb",
+  "servicegebiet": "Wien",
+  "leistungen": ["Elektroinstallation", "Notdienst"],
+  "notdienst_regel": "",
+  "buchungslink": "",
+  "haeufige_fragen": [],
+  "ansprechpartner": "",
+  "telefonnummer": "",
+  "ton": "freundlich, professionell, per Sie",
+  "preise_oeffentlich": false,
+  "preishinweise": "",
+  "stundensatz_eur": null,
+  "anfahrtspauschale_eur": null,
+  "materialaufschlag_pct": null,
+  "google_review_url": "https://www.google.com/search?q=Novara+Automation+-+DEMO+Weiterleitungsziel+(kein+echtes+Google-Unternehmensprofil)",
+  "review_benachrichtigung_email": "anton@novaraautomation.com"
+}
