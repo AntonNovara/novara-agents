@@ -1,0 +1,31 @@
+{
+  "client_id": "demo-elektriker",
+  "firmenname": "Elektro Demo Wien GmbH",
+  "branche": "Elektrikerbetrieb",
+  "servicegebiet": "Wien und Umgebung (alle Bezirke)",
+  "leistungen": [
+    "Elektroinstallation Neubau & Sanierung",
+    "Wallbox-Installation",
+    "Steckdosen, Schalter & Beleuchtung",
+    "Störungsbehebung / Notdienst",
+    "E-Check / Prüfungen"
+  ],
+  "notdienst_regel": "Bei Stromausfall, Kurzschluss, Brandgeruch oder Funken sofort auf den Notdienst hinweisen und die Telefonnummer nennen -- kein Terminvorschlag, sondern direkter Rückruf. Der Notdienst ist rund um die Uhr telefonisch erreichbar. Bei Rauch oder Feuer zuerst die Feuerwehr (122) rufen.",
+  "buchungslink": "https://calendar.app.google/Dqmz7HkW2XNktT6q6",
+  "haeufige_fragen": [
+    { "frage": "Was kostet eine Steckdose setzen?", "antwort": "Das hängt vom Aufwand vor Ort ab -- wir schauen uns das am liebsten kurz an oder besprechen es im Erstgespräch, damit die Zusage verbindlich ist." },
+    { "frage": "Wie schnell können Sie kommen?", "antwort": "Bei normalen Anfragen meist innerhalb weniger Tage, bei Notdienst so schnell wie möglich -- am besten kurz die Dringlichkeit im Chat nennen." },
+    { "frage": "Installieren Sie auch Wallboxen?", "antwort": "Ja, inklusive Beratung zur passenden Leistung, Anmeldung beim Netzbetreiber und Förderung, soweit möglich." },
+    { "frage": "Arbeiten Sie auch am Wochenende?", "antwort": "Reguläre Termine gibt es Montag bis Freitag. Für Notfälle erreichen Sie uns auch am Wochenende telefonisch." }
+  ],
+  "ansprechpartner": "Max Mustermann",
+  "telefonnummer": "+43 664 000 00 00",
+  "ton": "freundlich, professionell, per Sie",
+  "preise_oeffentlich": false,
+  "preishinweise": "",
+  "stundensatz_eur": 68.0,
+  "anfahrtspauschale_eur": 30.0,
+  "materialaufschlag_pct": 15.0,
+  "google_review_url": "https://www.google.com/search?q=Novara+Automation+-+DEMO+Weiterleitungsziel+(kein+echtes+Google-Unternehmensprofil)",
+  "review_benachrichtigung_email": "anton@novaraautomation.com"
+}

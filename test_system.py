@@ -4113,7 +4113,7 @@ def test_quote_agent_material_markup() -> None:
 
 
 def test_review_gate() -> None:
-    section("TEST — Google-Bewertungs-Filter: 5-Sterne-Schranke (Pain 3)")
+    section("TEST — Bewertungs-Seite: Google-Link für alle + direktes Feedback (Pain 3)")
     try:
         import main as main_module
         from fastapi.testclient import TestClient
@@ -4122,14 +4122,8 @@ def test_review_gate() -> None:
         # KEIN echtes clients/*.json nötig -- load_client_profile()/
         # client_profile_exists() werden auf Modulebene in main.py
         # gemonkeypatcht (gleiches Prinzip wie bei
-        # test_quote_agent_material_markup() oben), damit der Test nicht von
-        # echten Dateien im Repo abhängt. TestClient() OHNE "with"-Block löst
-        # main.py's lifespan() NICHT aus (kein echter Anthropic-Egress-Check),
-        # exakt das, was die übrigen main.py-Tests in dieser Datei absichtlich
-        # vermeiden (siehe Kommentar bei test_whatsapp_webhook oben) -- hier
-        # trotzdem nötig, weil die Kernlogik (Sterne-Schranke, DLP, Redirect)
-        # direkt im Route-Handler liegt, nicht in einer separat testbaren
-        # Graph-Klasse wie beim SDR-/Quote-Agenten.
+        # test_quote_agent_material_markup() oben). TestClient() OHNE
+        # "with"-Block löst main.py's lifespan() NICHT aus.
         profile_with_link = ClientProfile(
             client_id="test-review-client", firmenname="Test Elektro GmbH", leistungen=["Elektroinstallation"],
             google_review_url="https://g.page/r/TESTLINK/review", review_benachrichtigung_email="owner@example.com",
@@ -4155,41 +4149,49 @@ def test_review_gate() -> None:
         try:
             client = TestClient(main_module.app)
 
-            page_ok = (lambda r: r.status_code == 200 and "Test Elektro GmbH" in r.text)(client.get("/r/test-review-client"))
+            # Seite: Firmenname + Google-Button für JEDEN (kein Sterne-Vorfilter) + Feedback-Kanal
+            r_page = client.get("/r/test-review-client")
+            page_ok = (r_page.status_code == 200 and "Test Elektro GmbH" in r_page.text
+                       and 'href="https://g.page/r/TESTLINK/review"' in r_page.text
+                       and "Direktes Feedback an den Inhaber" in r_page.text
+                       and 'data-v=' not in r_page.text)  # keine Sterne-Buttons mehr
+            r_nolink = client.get("/r/test-review-nolink")
+            nolink_ok = r_nolink.status_code == 200 and "Auf Google bewerten" not in r_nolink.text and "Direktes Feedback" in r_nolink.text
+
             r_qr = client.get("/r/test-review-client/qr.png")
             qr_ok = r_qr.status_code == 200 and r_qr.headers["content-type"] == "image/png" and len(r_qr.content) > 100
 
-            d5 = client.post("/api/v1/reviews/test-review-client", json={"rating": 5}).json()
-            case5_ok = d5["success"] and d5["redirect_url"] == "https://g.page/r/TESTLINK/review" and not notified_calls
-
+            # Feedback: wird immer gemeldet, nie eine Weiterleitung
             d1 = client.post(
                 "/api/v1/reviews/test-review-client",
-                json={"rating": 1, "feedback_text": "Sehr unzufrieden", "kunde_name": "Kritiker"},
+                json={"feedback_text": "Termin wurde verschoben", "kunde_name": "Kritiker"},
             ).json()
-            case1_ok = (d1["success"] and d1["redirect_url"] is None and len(notified_calls) == 1
-                        and notified_calls[0][1]["rating"] == 1 and notified_calls[0][1]["feedback_text"] == "Sehr unzufrieden")
+            fb_ok = (d1["success"] and "redirect_url" not in d1 and len(notified_calls) == 1
+                     and notified_calls[0][1]["feedback_text"] == "Termin wurde verschoben" and notified_calls[0][1]["rating"] == 0)
 
-            d4 = client.post("/api/v1/reviews/test-review-nolink", json={"rating": 4}).json()
-            case4_ok = d4["success"] and d4["redirect_url"] is None and len(notified_calls) == 1  # unverändert -- 4/5 Sterne benachrichtigt nie
+            # Auch eine 5-Sterne-Abgabe (Altclient) wird gemeldet, nicht weitergeleitet
+            d5 = client.post("/api/v1/reviews/test-review-client", json={"rating": 5, "feedback_text": "Top"}).json()
+            legacy_ok = d5["success"] and "redirect_url" not in d5 and len(notified_calls) == 2
+
+            empty_ok = client.post("/api/v1/reviews/test-review-client", json={"feedback_text": "  "}).json()["success"] is False
 
             unk_ok = (client.get("/r/does-not-exist-xyz").status_code == 404
                       and client.get("/r/does-not-exist-xyz/qr.png").status_code == 404
-                      and client.post("/api/v1/reviews/does-not-exist-xyz", json={"rating": 5}).status_code == 404)
-            invalid_ok = client.post("/api/v1/reviews/test-review-client", json={"rating": 6}).status_code == 422
+                      and client.post("/api/v1/reviews/does-not-exist-xyz", json={"feedback_text": "x"}).status_code == 404)
+            invalid_ok = client.post("/api/v1/reviews/test-review-client", json={"rating": 6, "feedback_text": "x"}).status_code == 422
 
-            if page_ok and qr_ok and case5_ok and case1_ok and case4_ok and unk_ok and invalid_ok:
-                ok("Bewertungs-Filter: Seite/QR rendern; 4-5 Sterne -> Weiterleitung zu Google ohne Benachrichtigung; "
-                   "1-3 Sterne -> keine Weiterleitung, private Benachrichtigung mit Rating+Text ausgelöst; "
-                   "kein Google-Link im Profil -> kein Redirect trotz guter Bewertung; unbekannte client_id -> 404 überall; "
-                   "Rating außerhalb 1-5 -> 422")
+            if page_ok and nolink_ok and qr_ok and fb_ok and legacy_ok and empty_ok and unk_ok and invalid_ok:
+                ok("Bewertungs-Seite: Google-Button für alle sichtbar (ohne Sterne-Vorfilter), ohne Link nur Feedback-Kanal; "
+                   "Feedback wird gespeichert + immer an den Betrieb gemeldet, nie eine Weiterleitung; leeres Feedback abgelehnt; "
+                   "QR rendert; unbekannte client_id -> 404 überall; rating außerhalb 1-5 -> 422")
             else:
-                fail("Bewertungs-Filter unerwartet", str((page_ok, qr_ok, case5_ok, case1_ok, case4_ok, unk_ok, invalid_ok, notified_calls)))
+                fail("Bewertungs-Seite unerwartet", str((page_ok, nolink_ok, qr_ok, fb_ok, legacy_ok, empty_ok, unk_ok, invalid_ok, notified_calls)))
         finally:
             main_module.load_client_profile = orig_load
             main_module.client_profile_exists = orig_exists
             main_module.lead_notifier.notify_review_async = orig_notify
     except Exception:
-        fail("Bewertungs-Filter — Exception")
+        fail("Bewertungs-Seite — Exception")
         traceback.print_exc()
 
 

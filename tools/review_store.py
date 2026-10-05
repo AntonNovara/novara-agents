@@ -1,14 +1,9 @@
 """
-Review Store -- Persistenz für den Google-Bewertungs-Filter (Pain 3: "gute
-Bewertungen gehen unter, ein einziger schlechter Erlebnis-Bericht landet
-sofort öffentlich auf Google"). Siehe main.py GET/POST /r/{client_id} und den
-Abschnitt "Google-Bewertungs-Filter" in CLAUDE.md für die Gesamtarchitektur
-inkl. der bewusst offengelegten Compliance-Abwägung.
-
-Jede Sterne-Abgabe wird gespeichert -- auch eine 4/5-Sterne-Bewertung, die
-sofort zu Google weitergeleitet wird (kein Feedback-Text nötig) -- damit ein
-Betrieb im Zeitverlauf sehen kann, wie viele Kunden überhaupt bewertet haben,
-nicht nur die (öffentlich sichtbaren) Google-Rezensionen selbst.
+Review Store -- Persistenz für die Bewertungs-Seite (Pain 3). Hier landet das
+direkte, private Feedback, das Kunden über GET/POST /r/{client_id} an den
+Inhaber senden (siehe main.py und den Abschnitt "Bewertungs-Seite" in
+CLAUDE.md). Der öffentliche Google-Weg läuft komplett außerhalb dieses
+Systems -- nichts davon wird hier gespeichert.
 
 Gleiches Persistenz-Muster wie tools/quote_store.py: eigene Tabelle, eigenes
 Modul, SessionLocal/Base/engine aus core/db.py.
@@ -31,12 +26,13 @@ class _ReviewRow(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     client_id: Mapped[str] = mapped_column(String(64), nullable=False)
     rating: Mapped[int] = mapped_column(Integer, nullable=False)
-    # Nur bei 1-3 Sternen tatsächlich befüllt (main.py review_submit()) --
-    # eine 4/5-Sterne-Abgabe wird ohne Freitext sofort zu Google
-    # weitergeleitet, siehe Moduldocstring oben.
+    # Direktes Feedback an den Betrieb (main.py review_submit()). rating 0 =
+    # keine Sterne angegeben (die Seite fragt seit 2026-10-05 keine ab).
     feedback_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     kunde_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     kunde_kontakt: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    # Legacy-Spalte aus der Zeit vor 2026-10-05 (Sterne-Weiterleitung); wird
+    # immer False geschrieben, bleibt wegen create_all ohne Migration.
     redirected_to_google: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     notified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

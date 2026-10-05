@@ -223,11 +223,13 @@ def send_review_alert(profile: "ClientProfile", review: dict) -> bool:
         logger.warning("Review-Benachrichtigung übersprungen: SMTP_EMAIL/SMTP_PASSWORD nicht konfiguriert")
         return False
 
-    stars = "★" * int(review["rating"]) + "☆" * (5 - int(review["rating"]))
+    rating = int(review.get("rating") or 0)
+    stars_line = f"Bewertung: {'★' * rating}{'☆' * (5 - rating)}\n" if rating else ""
     body = (
-        f"Ein Kunde hat {review['rating']}/5 Sterne abgegeben -- NICHT öffentlich auf Google, "
-        "sondern nur an Sie geschickt, damit Sie die Chance haben, das direkt zu klären.\n\n"
-        f"Bewertung: {stars}\n"
+        "Ein Kunde hat Ihnen über die Bewertungsseite direktes Feedback geschickt -- "
+        "es geht nur an Sie, nicht an Google. Der Kunde kann unabhängig davon jederzeit "
+        "öffentlich auf Google bewerten.\n\n"
+        f"{stars_line}"
         f"Name: {review.get('kunde_name') or '(nicht angegeben)'}\n"
         f"Kontakt: {review.get('kunde_kontakt') or '(nicht angegeben)'}\n\n"
         "--- Rückmeldung des Kunden ---\n"
@@ -237,7 +239,7 @@ def send_review_alert(profile: "ClientProfile", review: dict) -> bool:
     msg = MIMEMultipart()
     msg["From"] = smtp_email
     msg["To"] = to_email
-    msg["Subject"] = f"⚠️ Neues Kundenfeedback ({review['rating']}/5 Sterne, nicht öffentlich)"
+    msg["Subject"] = "Neues Kundenfeedback (direkt an Sie, nicht öffentlich)"
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
     try:
