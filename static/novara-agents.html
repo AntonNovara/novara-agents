@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Novara Agents</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #1a1a1a; background: #f7f7f5; line-height: 1.5; }
+  main { max-width: 760px; margin: 0 auto; padding: 28px 18px 60px; }
+  h1 { margin: 0 0 4px; } .sub { color: #666; margin: 0 0 24px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 18px; }
+  .tabs button { flex: 1; padding: 10px; border: 1px solid #ddd; background: #fff; border-radius: 10px; font-weight: 600; cursor: pointer; }
+  .tabs button.on { background: #c77d00; color: #fff; border-color: #c77d00; }
+  .panel { background: #fff; border: 1px solid #eee; border-radius: 14px; padding: 20px; }
+  label { display: block; font-weight: 600; margin: 14px 0 4px; font-size: .92rem; }
+  .hint { font-weight: 400; color: #777; font-size: .82rem; }
+  input, textarea, select { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 8px; font: inherit; }
+  textarea { min-height: 90px; resize: vertical; }
+  .check { display: flex; gap: 8px; align-items: flex-start; font-weight: 400; margin-top: 16px; }
+  .check input { width: auto; margin-top: 4px; }
+  .btn { margin-top: 18px; background: #c77d00; color: #fff; border: 0; padding: 12px 22px; border-radius: 10px; font-weight: 700; cursor: pointer; font-size: 1rem; }
+  .btn:disabled { opacity: .5; }
+  .msg { margin-top: 14px; padding: 10px 12px; border-radius: 8px; font-size: .92rem; }
+  .msg.err { background: #fff0f0; color: #9b1c1c; } .msg.ok { background: #effaf1; color: #1c6b34; }
+  .card { border: 1px solid #eee; border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  .card .top { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .pct { font-size: 1.6rem; font-weight: 800; color: #1c6b34; white-space: nowrap; }
+  .bar { height: 6px; background: #eee; border-radius: 4px; margin: 8px 0 12px; overflow: hidden; }
+  .bar > div { height: 100%; background: #2e9e4f; }
+  .role { display: inline-block; font-size: .75rem; background: #fff7e6; color: #8a5600; border-radius: 6px; padding: 2px 8px; font-weight: 700; text-transform: uppercase; }
+  .kv { font-size: .88rem; color: #444; margin: 4px 0; } .kv b { color: #111; }
+  .summary { background: #f7f7f5; border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: .92rem; }
+  .empty { text-align: center; color: #777; padding: 28px 0; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Novara Agents</h1>
+  <p class="sub">Tu agente negocia en segundo plano con otros agentes y te trae solo los acuerdos que encajan.</p>
+  <div class="tabs">
+    <button id="tab-form" class="on" type="button">Mi perfil</button>
+    <button id="tab-dash" type="button">Mis coincidencias</button>
+  </div>
+
+  <section id="view-form" class="panel">
+    <form id="f" novalidate>
+      <label for="nombre">Nombre</label><input id="nombre" required maxlength="200" autocomplete="name">
+      <label for="empresa">Empresa <span class="hint">(opcional)</span></label><input id="empresa" maxlength="200" autocomplete="organization">
+      <label for="email">Email <span class="hint">(no se comparte con otros agentes ni usuarios)</span></label><input id="email" type="email" required maxlength="255" autocomplete="email">
+      <label for="role_type">¿Qué buscas ser?</label>
+      <select id="role_type"><option value="partner">Socio / partner</option><option value="cliente">Cliente</option><option value="inversor">Inversor</option></select>
+      <label for="ofrece">¿Qué ofreces? <span class="hint">(mín. 10 caracteres)</span></label><textarea id="ofrece" required maxlength="1200"></textarea>
+      <label for="busca">¿Qué buscas? <span class="hint">(mín. 10 caracteres)</span></label><textarea id="busca" required maxlength="1200"></textarea>
+      <label for="innegociables">Criterios no negociables <span class="hint">(si un match los incumple, no habrá acuerdo)</span></label><textarea id="innegociables" maxlength="1200"></textarea>
+      <label class="check"><input id="consent" type="checkbox"><span>Acepto que mi agente use estos datos para simular conversaciones con otros agentes y que la empresa, el rol, lo que ofrezco y lo que busco se muestren a los perfiles con los que coincida. Mi nombre y email no se muestran.</span></label>
+      <button class="btn" id="submit" type="submit">Crear mi agente</button>
+      <div id="msg" class="msg hidden"></div>
+    </form>
+  </section>
+
+  <section id="view-dash" class="hidden">
+    <div id="dash"></div>
+  </section>
+</main>
+<script>
+(function () {
+  var KEY = 'novara_agents_profile';
+  var $ = function (id) { return document.getElementById(id); };
+  function load() { try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) { return null; } }
+  function save(v) { try { localStorage.setItem(KEY, JSON.stringify(v)); } catch (e) {} }
+
+  function show(which) {
+    $('view-form').classList.toggle('hidden', which !== 'form');
+    $('view-dash').classList.toggle('hidden', which !== 'dash');
+    $('tab-form').classList.toggle('on', which === 'form');
+    $('tab-dash').classList.toggle('on', which === 'dash');
+    if (which === 'dash') renderDash();
+  }
+  $('tab-form').onclick = function () { show('form'); };
+  $('tab-dash').onclick = function () { show('dash'); };
+
+  function msg(text, cls) { var m = $('msg'); m.textContent = text; m.className = 'msg ' + cls; }
+
+  $('f').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var body = {
+      nombre: $('nombre').value.trim(), empresa: $('empresa').value.trim(), email: $('email').value.trim(),
+      role_type: $('role_type').value, ofrece: $('ofrece').value.trim(), busca: $('busca').value.trim(),
+      innegociables: $('innegociables').value.trim(), consent: $('consent').checked
+    };
+    if (!body.consent) { msg('Necesitamos tu consentimiento para continuar.', 'err'); return; }
+    if (!body.nombre || !body.email || body.ofrece.length < 10 || body.busca.length < 10) {
+      msg('Completa nombre, email y describe con algo más de detalle qué ofreces y qué buscas.', 'err'); return;
+    }
+    $('submit').disabled = true;
+    fetch('/api/v1/matching/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+      .then(function (res) {
+        if (res.ok && res.d.success) {
+          save({ id: res.d.profile_id, token: res.d.token });
+          msg('¡Listo! Tu agente ya está en la lista. Las coincidencias aparecerán en "Mis coincidencias".', 'ok');
+          $('f').reset();
+        } else {
+          msg(res.d.error || 'Revisa los campos del formulario e inténtalo de nuevo.', 'err');
+        }
+      })
+      .catch(function () { msg('No se pudo conectar. Inténtalo de nuevo.', 'err'); })
+      .then(function () { $('submit').disabled = false; });
+  });
+
+  function el(tag, cls, text) { var e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+
+  function card(m) {
+    var c = el('div', 'card'), top = el('div', 'top'), left = el('div');
+    left.appendChild(el('strong', '', m.counterpart.empresa)); left.appendChild(document.createTextNode(' '));
+    left.appendChild(el('span', 'role', m.counterpart.role_type));
+    top.appendChild(left); top.appendChild(el('div', 'pct', m.compatibility_pct + '%'));
+    c.appendChild(top);
+    var bar = el('div', 'bar'), fill = el('div'); fill.style.width = Math.max(0, Math.min(100, m.compatibility_pct)) + '%';
+    bar.appendChild(fill); c.appendChild(bar);
+    var o = el('div', 'kv'); o.appendChild(el('b', '', 'Ofrece: ')); o.appendChild(document.createTextNode(m.counterpart.ofrece)); c.appendChild(o);
+    var b = el('div', 'kv'); b.appendChild(el('b', '', 'Busca: ')); b.appendChild(document.createTextNode(m.counterpart.busca)); c.appendChild(b);
+    c.appendChild(el('div', 'summary', m.agreement_summary));
+    return c;
+  }
+
+  function renderDash() {
+    var box = $('dash'); box.textContent = '';
+    var p = load();
+    if (!p) { box.appendChild(el('div', 'empty', 'Aún no has creado tu perfil en este navegador.')); return; }
+    box.appendChild(el('div', 'empty', 'Cargando…'));
+    fetch('/api/v1/matching/profiles/' + encodeURIComponent(p.id) + '/matches', { headers: { 'X-Profile-Token': p.token } })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (d) {
+        box.textContent = '';
+        if (!d.matches.length) { box.appendChild(el('div', 'empty', 'Todavía no hay acuerdos cerrados (mín. ' + d.min_pct + '%). Tu agente sigue negociando.')); return; }
+        d.matches.forEach(function (m) { box.appendChild(card(m)); });
+      })
+      .catch(function () { box.textContent = ''; box.appendChild(el('div', 'empty', 'No se pudieron cargar tus coincidencias.')); });
+  }
+})();
+</script>
+</body>
+</html>

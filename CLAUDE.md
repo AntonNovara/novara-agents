@@ -1780,3 +1780,17 @@ Bislang gab es für `agents/quote_agent.py` gar keinen Regressionstest in `test_
 - **Objection-Evaluation** (`test_objection_handling(live)`, 10 typische Einwände gegen den Landing-Chat mit dem echten Modell; ohne echten Key `WARN`/übersprungen): prüft Antworten mit `core.outbound_guard.review_chat_reply()` (echte Preise, keine Garantien/Platzhalter/erfundenen Angebote) plus je Einwand ein Muss/Darf-nicht-Muster. Einzeln ausführen (nicht in der Standardsuite, wegen `SDR_CRM_LIVE_SHEET=true` in der lokalen `.env`): `DATABASE_URL=sqlite:////tmp/o.db LLM_PROVIDER=anthropic DEMO_MODE=false .venv/bin/python -c "import test_system as t; t.test_objection_handling(True)"`. Stand: 10/10 mit Claude Sonnet 4.6.
 - Sequenz: der Erstkontakt-Schritt trägt bei fehlender Adresse den Vermerk "Entwurf im CRM gespeichert, KEINE Adresse bekannt -- manuell versenden".
 - Suite: 209 PASS.
+
+## Novara Agents: B2B-Matchmaking zwischen digitalen Zwillingen (07.10.2026)
+
+Jeder Nutzer hat ein Profil (Rolle partner/cliente/inversor, was er ofrece/busca, innegociables); ein LLM lässt zwei Profil-Agenten 3 Runden (6 Nachrichten) verhandeln und liefert Kompatibilität in % + Zusammenfassung der Vereinbarung.
+
+- `tools/agent_match_store.py` -- Tabellen `match_profiles` + `agent_matches` (Paar immer sortiert, unique). Zugriffs-Token pro Profil: Klartext nur einmal bei der Anlage, gespeichert wird der SHA-256-Hash.
+- `agents/agent_matcher.py` -- `simulate_match(a, b)` (EIN LLM-Call, Sprache Spanisch) und `run_matching(max_pairs)`. Absicherungen im Code, nicht im Prompt: das LLM sieht nie Name/E-Mail; Profiltexte stehen als Daten in `<perfil_*>`-Tags (Prompt-Injection); Score auf 0-100 geklemmt; meldet das LLM ein verletztes Innegociable, wird der Score auf `MAX_PCT_IF_DEALBREAKER` (25) gedeckelt; ungültige Antwort -> `MatchSimulationError` (Demo-Modus liefert deshalb kein Match, es wird nichts gespeichert). Dashboard-Schwelle `MATCH_MIN_PCT` = 60.
+- Endpunkte (`main.py`): `GET /agents-app` (Formular + Dashboard, `static/novara-agents.html`), `POST /api/v1/matching/profiles` (öffentlich, 10/Stunde/IP, DLP, Pflicht-Consent, KEIN LLM), `GET /api/v1/matching/profiles/{id}/matches` (Header `X-Profile-Token`; falsches Token = 404), `POST /api/v1/matching/run?max_pairs=` und `GET /api/v1/matching/matches` (API-Key; Matching kostet LLM-Calls und läuft nie durch anonyme Anfragen).
+- Datenschutz: die Gegenseite sieht nur Firma/Rolle/Angebot/Suche + Zusammenfassung -- nie Name, E-Mail, Innegociables oder Transkript (Transkript nur im Admin-Endpunkt).
+- Grenzen: Matching läuft nur auf Anstoß (kein Cron); alle Paare O(n²) -- ab ~50 Profilen Vorfilter (Rolle/Embedding) einbauen; Kontaktaufnahme zwischen Matches ist bewusst noch manuell. Echte Nutzerdaten vor dem Pilot: Datenschutzerklärung/AVV anpassen. Test: `test_agent_matcher()` (213 PASS).
+
+## Telnyx: Nummer aktiv (07.10.2026)
+
+Die österreichische Telnyx-Nummer in Wien ist gekauft und aktiv: **+431587108548** (Angabe von Anton). Für die Telefonie-Anbindung (`tools/telnyx_voice.py`, Webhook `/api/v1/webhook/telnyx/voice`) gilt sie als `MISSED_CALL_*`-Zielnummer bzw. Telnyx-Eingangsnummer. Noch offen: `TELNYX_API_KEY`/`TELNYX_PUBLIC_KEY` in Railway setzen (Anton), Webhook-URL im Telnyx-Portal eintragen, Test mit einem echten Anruf (Stimmenname, Payloads, `from` bei Umleitung sind noch nicht gegen die echte Nummer verifiziert).

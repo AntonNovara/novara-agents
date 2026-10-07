@@ -36,6 +36,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
+from agents import agent_matcher
 from agents.base_agent import AgentRequest, AgentResponse
 from agents.client_receptionist_agent import ClientReceptionistAgent
 from agents.field_worker_agent import FieldWorkerAgent
@@ -51,7 +52,7 @@ from core import consent, lead_capture
 from core.client_profiles import ClientProfileInvalidError, ClientProfileNotFoundError, client_profile_exists, load_client_profile
 from core.config import settings
 from core.security import OutputBlockedError, SecurityLayer
-from tools import lead_notifier, review_store, sequence_scheduler, telnyx_voice, whatsapp_cloud
+from tools import agent_match_store, lead_notifier, review_store, sequence_scheduler, telnyx_voice, whatsapp_cloud
 from tools.calendar_integration import GoogleCalendarTool
 from tools.demo_sandbox import is_demo_message, log_demo_lead, strip_demo_marker
 from tools.document_parser import DocumentParser
@@ -1092,6 +1093,103 @@ async def reviews_list(client_id: str):
     API-Key-geschützt (anders als die drei öffentlichen Endpunkte oben),
     für Anton/den Elektriker selbst, nicht für den Website-Besucher."""
     return review_store.list_reviews(client_id)
+
+
+# ── Novara Agents: B2B-Matchmaking zwischen digitalen Zwillingen ─────────────
+#
+# Onboarding (öffentlich, rate-limitiert, KEIN LLM) -> Profil + Zugriffs-Token.
+# Matching (agents/agent_matcher.py) kostet LLM-Calls und läuft deshalb NUR über
+# den API-Key-geschützten Endpunkt /api/v1/matching/run (manuell/Cron), nie
+# durch eine anonyme Anfrage. Das Dashboard liest mit dem Token des Profils und
+# zeigt nur Firma/Rolle/Angebot/Suche der Gegenseite + Zusammenfassung -- nie
+# Name, E-Mail, Innegociables oder das Transkript.
+
+class MatchProfileRequest(BaseModel):
+    nombre: str = Field(..., min_length=1, max_length=200)
+    empresa: str = Field("", max_length=200)
+    email: str = Field(..., min_length=3, max_length=255, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    role_type: str = Field(..., pattern=r"^(partner|cliente|inversor)$")
+    ofrece: str = Field(..., min_length=10, max_length=1_200)
+    busca: str = Field(..., min_length=10, max_length=1_200)
+    innegociables: str = Field("", max_length=1_200)
+    consent: bool = False
+
+
+class MatchProfileResponse(BaseModel):
+    success: bool
+    profile_id: Optional[str] = None
+    token: Optional[str] = None
+    error: Optional[str] = None
+
+
+@app.get("/agents-app", response_class=HTMLResponse, tags=["Novara Agents"])
+async def agents_app_page():
+    """Onboarding-Formular + Dashboard (static/novara-agents.html)."""
+    return HTMLResponse((Path(__file__).parent / "static" / "novara-agents.html").read_text(encoding="utf-8"))
+
+
+@app.post("/api/v1/matching/profiles", response_model=MatchProfileResponse, tags=["Novara Agents"])
+@limiter.limit("10/hour")
+async def matching_create_profile(request: Request, payload: MatchProfileRequest) -> MatchProfileResponse:
+    """ÖFFENTLICH, KEIN API-Key (Onboarding-Formular im Browser), KEIN LLM."""
+    if not payload.consent:
+        return MatchProfileResponse(success=False, error="Sin tu consentimiento no podemos guardar el perfil.")
+    cleaned = {}
+    for field in ("nombre", "empresa", "ofrece", "busca", "innegociables"):
+        dlp = SecurityLayer.check_and_redact(getattr(payload, field))
+        if not dlp.approved:
+            log.warning("Match-Profil blocked by DLP", field=field, reason=dlp.blocked_reason)
+            return MatchProfileResponse(success=False, error="Contenido bloqueado por seguridad (datos sensibles detectados).")
+        cleaned[field] = dlp.redacted_text.strip()
+    created = agent_match_store.create_profile(
+        email=payload.email.strip().lower(), role_type=payload.role_type, consent=True, **cleaned,
+    )
+    return MatchProfileResponse(success=True, profile_id=created["id"], token=created["token"])
+
+
+@app.get("/api/v1/matching/profiles/{profile_id}/matches", tags=["Novara Agents"])
+@limiter.limit("60/minute")
+async def matching_dashboard(request: Request, profile_id: str):
+    """Dashboard-Daten eines Profils. Auth: Header X-Profile-Token (das beim
+    Onboarding ausgegebene Token). Falsches Token und unbekannte ID sind
+    absichtlich nicht unterscheidbar (404)."""
+    token = request.headers.get("X-Profile-Token", "")
+    if not agent_match_store.verify_token(profile_id, token):
+        raise HTTPException(status_code=404, detail="Perfil no encontrado.")
+    out = []
+    for m in agent_match_store.list_matches_for_profile(profile_id, min_pct=agent_matcher.MATCH_MIN_PCT):
+        other = agent_match_store.get_profile(m["other_profile_id"])
+        if other is None:
+            continue
+        out.append({
+            "match_id": m["id"],
+            "compatibility_pct": m["compatibility_pct"],
+            "agreement_summary": m["agreement_summary"],
+            "counterpart": agent_match_store.public_view(other),
+            "created_at": m["created_at"],
+        })
+    return {"profile_id": profile_id, "min_pct": agent_matcher.MATCH_MIN_PCT, "matches": out}
+
+
+@app.post("/api/v1/matching/run", tags=["Novara Agents"], dependencies=[Depends(require_api_key)])
+async def matching_run(max_pairs: int = 10):
+    """Simuliert bis zu max_pairs noch nicht bewertete Profilpaare (1 LLM-Call
+    pro Paar). Manuell oder per Cron aufrufen."""
+    import asyncio
+    max_pairs = max(1, min(max_pairs, 50))
+    return await asyncio.to_thread(agent_matcher.run_matching, max_pairs)
+
+
+@app.get("/api/v1/matching/matches", tags=["Novara Agents"], dependencies=[Depends(require_api_key)])
+async def matching_admin_list():
+    """Admin-Sicht: alle Profile und alle Matches inkl. Transkripte."""
+    profiles = agent_match_store.list_profiles()
+    matches = []
+    for p in profiles:
+        for m in agent_match_store.list_matches_for_profile(p["id"]):
+            if m["profile_a_id"] == p["id"]:  # jedes Paar nur einmal
+                matches.append(m)
+    return {"profiles": len(profiles), "matches": matches}
 
 
 # ── Voice / Vapi Endpunkte ────────────────────────────────────────────────────

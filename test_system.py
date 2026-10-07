@@ -4195,6 +4195,101 @@ def test_review_gate() -> None:
         traceback.print_exc()
 
 
+def test_agent_matcher() -> None:
+    section("TEST — Novara Agents: agentMatcher + Onboarding/Dashboard-API")
+    try:
+        import json as _json
+        import main as main_module
+        from fastapi.testclient import TestClient
+        from agents import agent_matcher
+        from tools import agent_match_store as store
+
+        class _FakeResp:
+            def __init__(self, content): self.content = content
+
+        class _FakeLLM:
+            def __init__(self, payload): self.payload, self.seen = payload, []
+            def invoke(self, messages):
+                self.seen.append("".join(str(m.content) for m in messages))
+                return _FakeResp(self.payload if isinstance(self.payload, str) else _json.dumps(self.payload))
+
+        def _payload(pct, a_v=False, b_v=False):
+            return {"transcript": [{"speaker": "A" if i % 2 == 0 else "B", "text": f"msg {i}"} for i in range(6)],
+                    "compatibility_pct": pct, "a_dealbreaker_violated": a_v, "b_dealbreaker_violated": b_v,
+                    "agreement_summary": "Acuerdo de prueba."}
+
+        a = {"id": "a", "nombre": "Ana Secreta", "empresa": "AcmeCo", "email": "ana@secret.example", "role_type": "partner",
+             "ofrece": "desarrollo web", "busca": "clientes pyme", "innegociables": "nada de tabaco"}
+        b = {"id": "b", "nombre": "Ben", "empresa": "BetaFund", "email": "ben@x.example", "role_type": "inversor",
+             "ofrece": "capital semilla", "busca": "startups saas", "innegociables": ""}
+
+        # 1) Happy path + datos minimos: Name/E-Mail nie im Prompt
+        llm = _FakeLLM(_payload(82))
+        r = agent_matcher.simulate_match(a, b, llm=llm)
+        happy = (r["compatibility_pct"] == 82 and len(r["transcript"]) == 6 and not r["deal_breaker_violated"]
+                 and "Ana Secreta" not in llm.seen[0] and "ana@secret.example" not in llm.seen[0]
+                 and "AcmeCo" in llm.seen[0])
+        # 2) Score-Klemmung + Dealbreaker-Deckel + Codefence
+        clamp = agent_matcher.simulate_match(a, b, llm=_FakeLLM("```json\n" + _json.dumps(_payload(250)) + "\n```"))["compatibility_pct"] == 100
+        capped = agent_matcher.simulate_match(a, b, llm=_FakeLLM(_payload(95, b_v=True)))
+        cap_ok = capped["compatibility_pct"] == agent_matcher.MAX_PCT_IF_DEALBREAKER and capped["deal_breaker_violated"]
+        # 3) Unbrauchbare Antworten werfen (kein Platzhalter-Match)
+        errs = 0
+        for bad in ("kein json", _json.dumps({"agreement_summary": "x", "transcript": []}), _json.dumps(_payload("hoch"))):
+            try:
+                agent_matcher.simulate_match(a, b, llm=_FakeLLM(bad))
+            except agent_matcher.MatchSimulationError:
+                errs += 1
+        # 4) Demo-Modus-LLM liefert kein gueltiges Match -> Fehler statt Muell
+        demo_err = False
+        try:
+            from core.llm import _DemoChatModel
+            agent_matcher.simulate_match(a, b, llm=_DemoChatModel())
+        except agent_matcher.MatchSimulationError:
+            demo_err = True
+
+        # 5) API: Onboarding, Token-Auth, Dashboard, Datenschutz
+        client = TestClient(main_module.app)
+        base = {"nombre": "Test Uno", "empresa": "UnoCo", "email": "uno@example.com", "role_type": "partner",
+                "ofrece": "consultoria de automatizacion", "busca": "socios de distribucion", "innegociables": "sin exclusividad", "consent": True}
+        no_consent = client.post("/api/v1/matching/profiles", json={**base, "consent": False}).json()
+        p1 = client.post("/api/v1/matching/profiles", json=base).json()
+        p2 = client.post("/api/v1/matching/profiles", json={**base, "nombre": "Test Dos", "empresa": "DosCo", "email": "dos@example.com", "role_type": "cliente"}).json()
+        bad_role = client.post("/api/v1/matching/profiles", json={**base, "role_type": "hacker"}).status_code == 422
+        onboard_ok = (not no_consent["success"] and p1["success"] and p2["success"] and bad_role and p1["token"] != p2["token"])
+
+        orig_build = agent_matcher.build_llm
+        agent_matcher.build_llm = lambda max_tokens=0: _FakeLLM(_payload(88))
+        try:
+            run_stats = agent_matcher.run_matching(max_pairs=500)
+            again = agent_matcher.run_matching(max_pairs=500)  # idempotent: Paar nur einmal
+        finally:
+            agent_matcher.build_llm = orig_build
+        run_ok = run_stats["simulated"] >= 1 and again["simulated"] == 0
+
+        h1 = {"X-Profile-Token": p1["token"]}
+        dash = client.get(f"/api/v1/matching/profiles/{p1['profile_id']}/matches", headers=h1)
+        dj = dash.json()
+        mine = [m for m in dj["matches"] if m["counterpart"]["empresa"] == "DosCo"]
+        dash_ok = (dash.status_code == 200 and len(mine) == 1 and mine[0]["compatibility_pct"] == 88
+                   and "dos@example.com" not in dash.text and "Test Dos" not in dash.text
+                   and "sin exclusividad" not in dash.text and "transcript" not in dash.text)
+        auth_ok = (client.get(f"/api/v1/matching/profiles/{p1['profile_id']}/matches").status_code == 404
+                   and client.get(f"/api/v1/matching/profiles/{p1['profile_id']}/matches", headers={"X-Profile-Token": p2["token"]}).status_code == 404
+                   and client.get("/api/v1/matching/profiles/nope/matches", headers=h1).status_code == 404)
+        page_ok = client.get("/agents-app").status_code == 200
+
+        if all([happy, clamp, cap_ok, errs == 3, demo_err, onboard_ok, run_ok, dash_ok, auth_ok, page_ok]):
+            ok("agentMatcher: 3 Runden/6 Nachrichten, Score geklemmt, Dealbreaker deckelt auf "
+               f"{agent_matcher.MAX_PCT_IF_DEALBREAKER}%, kein Name/E-Mail im Prompt, kaputte LLM-Antworten werfen; "
+               "Onboarding mit Pflicht-Consent, Dashboard nur mit Token, Gegenseite ohne Name/E-Mail/Innegociables/Transkript")
+        else:
+            fail("agentMatcher unerwartet", str((happy, clamp, cap_ok, errs, demo_err, onboard_ok, run_ok, dash_ok, auth_ok, page_ok)))
+    except Exception:
+        fail("agentMatcher — Exception")
+        traceback.print_exc()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -4251,6 +4346,7 @@ def main() -> int:
     test_objection_handling(live)
     test_quote_agent_material_markup()
     test_review_gate()
+    test_agent_matcher()
 
     # Zusammenfassung
     section("ZUSAMMENFASSUNG")
