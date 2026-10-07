@@ -1794,3 +1794,5 @@ Jeder Nutzer hat ein Profil (Rolle partner/cliente/inversor, was er ofrece/busca
 ## Telnyx: Nummer aktiv (07.10.2026)
 
 Die österreichische Telnyx-Nummer in Wien ist gekauft und aktiv: **+431587108548** (Angabe von Anton). Für die Telefonie-Anbindung (`tools/telnyx_voice.py`, Webhook `/api/v1/webhook/telnyx/voice`) gilt sie als `MISSED_CALL_*`-Zielnummer bzw. Telnyx-Eingangsnummer. Noch offen: `TELNYX_API_KEY`/`TELNYX_PUBLIC_KEY` in Railway setzen (Anton), Webhook-URL im Telnyx-Portal eintragen, Test mit einem echten Anruf (Stimmenname, Payloads, `from` bei Umleitung sind noch nicht gegen die echte Nummer verifiziert).
+
+**Automatischer Lauf (08.10.2026):** `.github/workflows/agent-matching.yml` ruft täglich 06:00 UTC `POST /api/v1/matching/run?max_pairs=10` auf (Secret `API_SECRET_KEY`, dasselbe wie `sequence-digest.yml`); manuell mit eigenem `max_pairs` startbar. Ohne neue Profile entstehen keine LLM-Kosten. Fehlgeschlagene Paare werden beim nächsten Lauf erneut versucht.

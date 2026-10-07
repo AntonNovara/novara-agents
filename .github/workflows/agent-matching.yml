@@ -1,0 +1,33 @@
+name: Agent Matching - novara-agents
+
+# Täglich 06:00 UTC: simuliert bis zu 10 noch nicht bewertete Profilpaare
+# (Novara Agents, 1 LLM-Call pro Paar). Kostenbremse: max_pairs, und nur
+# neue Paare -- ohne neue Profile passiert nichts. Manuell startbar mit
+# eigener max_pairs-Angabe (1-50).
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      max_pairs:
+        description: "Maximale Anzahl Paare in diesem Lauf (1-50)"
+        default: "10"
+
+concurrency:
+  group: agent-matching
+  cancel-in-progress: false
+
+jobs:
+  match:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Run agent matching
+        env:
+          API_SECRET_KEY: ${{ secrets.API_SECRET_KEY }}
+          MAX_PAIRS: ${{ github.event.inputs.max_pairs || '10' }}
+        run: |
+          case "$MAX_PAIRS" in ''|*[!0-9]*) echo "max_pairs muss eine Zahl sein"; exit 1;; esac
+          curl --fail-with-body --silent --show-error --max-time 480 -X POST \
+            -H "X-API-Key: ${API_SECRET_KEY}" \
+            "https://novara-agents-production.up.railway.app/api/v1/matching/run?max_pairs=${MAX_PAIRS}"
