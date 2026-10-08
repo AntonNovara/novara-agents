@@ -1567,6 +1567,30 @@ def test_voice_agent_dlp_sanitization() -> None:
 # ── Test 18: Customer State (Sprint 3, 16.09.2026) ──────────────────────────
 
 def test_customer_state() -> None:
+    """Läuft gegen eine eigene temporäre SQLite-DB: die Zählungen (history/all_customers)
+    gehen von einem leeren Store aus, vorherige Live-Tests schreiben aber in die geteilte DB."""
+    import tempfile
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from core import customer_state as cs
+    from core.db import Base
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_engine = create_engine(f"sqlite:///{tmp}/customer_state_test.db")
+        Base.metadata.create_all(
+            bind=tmp_engine,
+            tables=[cs._CustomerRow.__table__, cs._StageEventRow.__table__, cs._CompanyIndexRow.__table__],
+        )
+        original = cs.SessionLocal
+        cs.SessionLocal = sessionmaker(bind=tmp_engine, autoflush=False, expire_on_commit=False)
+        try:
+            _run_customer_state_test()
+        finally:
+            cs.SessionLocal = original
+            tmp_engine.dispose()
+
+
+def _run_customer_state_test() -> None:
     section("TEST 18 — Customer State: geteilter Kundenzustand über alle 5 Agenten")
     info(
         "core/customer_state.py muss Kunden über E-Mail (bevorzugt) oder "
