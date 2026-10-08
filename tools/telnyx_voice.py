@@ -33,7 +33,7 @@ import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from cryptography.exceptions import InvalidSignature
@@ -52,6 +52,34 @@ _MAX_CLOCK_SKEW_SECONDS = 300
 
 _DIGITS_DE = {"0": "null", "1": "eins", "2": "zwei", "3": "drei", "4": "vier",
               "5": "fünf", "6": "sechs", "7": "sieben", "8": "acht", "9": "neun"}
+
+
+# ── Agent-Modus (eingehende Anrufe an TELNYX_AGENT_NUMBER) ─────────────────────
+# Gesprächsverlauf pro call_control_id nur im Speicher (Anrufe sind kurz, eine
+# Instanz); beim Auflegen wird er verworfen. Der Agent wird von main.py registriert
+# (VoiceAgent.complete: DLP + Art.-50-Offenlegung im ersten Turn).
+
+_MAX_AGENT_TURNS = 12
+_AGENT_CALLS: dict[str, list[dict[str, str]]] = {}
+_agent_reply_fn: Optional[Callable[[list[dict]], str]] = None
+
+_GOODBYE_DE = "Vielen Dank für Ihren Anruf. Auf Wiederhören."
+_AGENT_ERROR_DE = "Entschuldigung, im Moment gibt es ein technisches Problem. Bitte schreiben Sie uns per WhatsApp. Auf Wiederhören."
+
+
+def set_agent_reply(fn: Optional[Callable[[list[dict]], str]]) -> None:
+    """Registriert die Antwortfunktion (messages -> Text). Ohne sie: Fallback-Ansage."""
+    global _agent_reply_fn
+    _agent_reply_fn = fn
+
+
+def is_agent_number(to_number: str) -> bool:
+    target = normalize_number(settings.telnyx_agent_number)
+    return bool(target) and normalize_number(to_number) == target
+
+
+def _b64(text: str) -> str:
+    return base64.b64encode(text.encode()).decode()
 
 
 # ── Persistenz ─────────────────────────────────────────────────────────────────
@@ -178,6 +206,63 @@ def _parse_time(value: Any) -> Optional[datetime]:
         return None
 
 
+def _decode_state(payload: dict[str, Any]) -> str:
+    try:
+        return base64.b64decode(str(payload.get("client_state") or "")).decode()
+    except (ValueError, UnicodeDecodeError):
+        return ""
+
+
+def _speak(call_control_id: str, text: str, state: str) -> Action:
+    return Action("speak", call_control_id, {
+        "payload": text, "voice": settings.telnyx_voice, "language": "de-DE",
+        "client_state": _b64(state), "command_id": f"speak-{state}-{call_control_id}-{time.time_ns()}",
+    })
+
+
+def _process_agent_event(event_type: str, payload: dict[str, Any], cid: str, session_id: str) -> Optional[Action]:
+    history = _AGENT_CALLS.setdefault(cid, [])
+    state = _decode_state(payload)
+
+    if event_type == "call.answered":
+        advance_status(session_id, "answered")
+        # Begrüßung inkl. KI-Offenlegung; der Agent antwortet erst auf die erste Äußerung.
+        from agents.voice_agent import AI_DISCLOSURE_DE
+        name = (settings.missed_call_business_name or "").strip() or "Novara Automation"
+        greeting = f"{AI_DISCLOSURE_DE.format(client_name=name)} Wie kann ich Ihnen helfen?"
+        # In den Verlauf, damit VoiceAgent.complete() die Offenlegung nicht noch einmal voranstellt.
+        history.append({"role": "assistant", "content": greeting})
+        return _speak(cid, greeting, "agent-greeting")
+
+    if event_type == "call.speak.ended":
+        if state == "agent-final":
+            advance_status(session_id, "spoken")
+            return Action("hangup", cid, {"command_id": f"hangup-{cid}"})
+        if state == "agent-greeting":
+            return Action("transcription_start", cid, {
+                "transcription_engine": "Google",
+                "transcription_engine_config": {"language": "de-DE", "interim_results": False},
+                "transcription_tracks": "inbound",
+                "command_id": f"stt-{cid}",
+            })
+        return None
+
+    if event_type == "call.transcription":
+        data = payload.get("transcription_data") or {}
+        text = str(data.get("transcript") or "").strip()
+        if not data.get("is_final", True) or not text:
+            return None
+        history.append({"role": "user", "content": text})
+        if sum(m["role"] == "user" for m in history) > _MAX_AGENT_TURNS:
+            return _speak(cid, _GOODBYE_DE, "agent-final")
+        return Action("agent_reply", cid, {"messages": list(history)})
+
+    if event_type == "call.hangup":
+        advance_status(session_id, "hangup")
+        _AGENT_CALLS.pop(cid, None)
+    return None
+
+
 def process_event(event: dict[str, Any]) -> Optional[Action]:
     """Verarbeitet EIN Telnyx-Event (der Inhalt von `data`): Zustand speichern und die
     nächste Aktion zurückgeben (oder None). Rein deterministisch, ohne Netzwerk."""
@@ -186,16 +271,30 @@ def process_event(event: dict[str, Any]) -> Optional[Action]:
     call_control_id = str(payload.get("call_control_id") or "")
     session_id = str(payload.get("call_session_id") or "")
 
+    wanted_connection = (settings.telnyx_connection_id or "").strip()
+    if wanted_connection and str(payload.get("connection_id") or "") != wanted_connection:
+        return None
+
     if event_type == "call.initiated":
         if str(payload.get("direction") or "") != "incoming" or not call_control_id:
             return None
         from_number = str(payload.get("from") or "")
+        if is_agent_number(str(payload.get("to") or "")):
+            _AGENT_CALLS[call_control_id] = []
+            record_call(session_id, from_number, str(payload.get("to") or ""), _parse_time(event.get("occurred_at")))
+            logger.info("Agent-Anruf von %s", _mask(from_number))
+            return Action("answer", call_control_id, {
+                "command_id": f"answer-{call_control_id}", "client_state": _b64("agent"),
+            })
         new = record_call(session_id, from_number, str(payload.get("to") or ""), _parse_time(event.get("occurred_at")))
         logger.info("Verpasster Anruf %s (von %s)", "gespeichert" if new else "bereits bekannt", _mask(from_number))
         return Action("answer", call_control_id, {"command_id": f"answer-{call_control_id}"})
 
     if not call_control_id:
         return None
+
+    if call_control_id in _AGENT_CALLS or _decode_state(payload).startswith("agent"):
+        return _process_agent_event(event_type, payload, call_control_id, session_id)
 
     if event_type == "call.answered":
         advance_status(session_id, "answered")
@@ -220,6 +319,20 @@ def process_event(event: dict[str, Any]) -> Optional[Action]:
 
 def execute(action: Action) -> bool:
     """Schickt den Befehl an die Telnyx-API. Wirft nie; False bei Fehlern/ohne API-Key."""
+    if action.name == "agent_reply":
+        # Blockierender LLM-Aufruf (läuft im Threadpool der BackgroundTasks).
+        cid, final = action.call_control_id, False
+        try:
+            if _agent_reply_fn is None:
+                raise RuntimeError("kein Agent registriert")
+            reply = (_agent_reply_fn(action.body["messages"]) or "").strip()
+            if not reply:
+                raise RuntimeError("leere Agent-Antwort")
+            _AGENT_CALLS.setdefault(cid, []).append({"role": "assistant", "content": reply})
+        except Exception as exc:
+            logger.error("Agent-Antwort fehlgeschlagen: %s", exc)
+            reply, final = _AGENT_ERROR_DE, True
+        return execute(_speak(cid, reply, "agent-final" if final else "agent-turn"))
     api_key = settings.telnyx_api_key.get_secret_value()
     if not api_key:
         logger.error("Telnyx-Befehl %s übersprungen: TELNYX_API_KEY nicht gesetzt", action.name)

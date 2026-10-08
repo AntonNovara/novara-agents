@@ -120,6 +120,33 @@ def send_lead_notification(lead: "CapturedLead") -> bool:
         return False
 
 
+def send_telegram_notification(lead: "CapturedLead") -> bool:
+    """Schickt dieselbe Lead-Zusammenfassung per Telegram-Bot an TELEGRAM_CHAT_ID.
+    Wirft nie; False ohne Konfiguration oder bei Fehlern. Reiner Text (kein parse_mode),
+    damit Nutzereingaben im Lead keine Formatierung/Injektion auslösen."""
+    token = settings.telegram_bot_token.get_secret_value().strip()
+    chat_id = (settings.telegram_chat_id or "").strip()
+    if not token or not chat_id:
+        return False
+    text = "\U0001f6a8 Neuer Lead - Novara Automation\n\n" + _build_body(lead)
+    try:
+        import httpx
+
+        resp = httpx.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True},
+            timeout=_SMTP_TIMEOUT_SECONDS,
+        )
+        if resp.status_code >= 400:
+            logger.warning("Telegram-Benachrichtigung fehlgeschlagen: HTTP %s", resp.status_code)
+            return False
+        return True
+    except Exception as exc:
+        # Exception-Text kann die URL samt Bot-Token enthalten -> nur der Typ wird geloggt.
+        logger.warning("Telegram-Benachrichtigung fehlgeschlagen: %s", type(exc).__name__)
+        return False
+
+
 def notify_lead_async(lead: "CapturedLead") -> None:
     """
     Stößt send_lead_notification() in einem Daemon-Hintergrund-Thread an und
@@ -143,7 +170,9 @@ def notify_lead_async(lead: "CapturedLead") -> None:
     """
     def _run() -> None:
         try:
-            if send_lead_notification(lead):
+            sent_mail = send_lead_notification(lead)
+            sent_telegram = send_telegram_notification(lead)
+            if sent_mail or sent_telegram:
                 from core import lead_capture  # lokaler Import: core/lead_capture.py importiert dieses Modul nicht, kein Zyklus
 
                 lead_capture.mark_notified(lead.source, lead.session_id)

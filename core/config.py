@@ -147,6 +147,9 @@ class Settings(BaseSettings):
     # Absturz des Chat-/Voice-Antwortpfads).
     smtp_email: SecretStr = Field(default="", alias="SMTP_EMAIL")
     smtp_password: SecretStr = Field(default="", alias="SMTP_PASSWORD")
+    # Telegram-Push bei neuem Lead (tools/lead_notifier.py). Beide leer = aus.
+    telegram_bot_token: SecretStr = Field(default="", alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: str = Field(default="", alias="TELEGRAM_CHAT_ID")
 
     # GuardianAgent (agents/guardian_agent.py) — Health & Infrastructure
     # Audit (GET /api/v1/health/audit). Default = die Netlify-eigene
@@ -197,6 +200,12 @@ class Settings(BaseSettings):
     telnyx_voice: str = Field(default="AWS.Polly.Vicki", alias="TELNYX_VOICE")
     missed_call_whatsapp_number: str = Field(default="", alias="MISSED_CALL_WHATSAPP_NUMBER")
     missed_call_business_name: str = Field(default="", alias="MISSED_CALL_BUSINESS_NAME")
+    # Eingehende Anrufe an diese Telnyx-Nummer (E.164, z. B. +431587108548) gehen NICHT
+    # in den Verpasst-Anruf-Ablauf, sondern an den VoiceAgent (Gespräch: Begrüßung ->
+    # Speech-to-Text -> Agent -> Ansage). Leer = Modus aus. telnyx_connection_id: ID der
+    # Call-Control-Anwendung; gesetzt -> Events anderer Connections werden ignoriert.
+    telnyx_agent_number: str = Field(default="", alias="TELNYX_AGENT_NUMBER")
+    telnyx_connection_id: str = Field(default="", alias="TELNYX_CONNECTION_ID")
 
     # Voice Agent (agents/voice_agent.py, main.py POST /api/v1/voice/chat/... und
     # /api/v1/voice/webhook): Vapi als Telefonie-Frontend, Custom-LLM-Backend.

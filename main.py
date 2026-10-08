@@ -172,6 +172,9 @@ async def lifespan(app: FastAPI):
 
     _AGENT_REGISTRY = _build_registry()
     _VOICE_AGENT = VoiceAgent()
+    telnyx_voice.set_agent_reply(
+        lambda msgs: _VOICE_AGENT.complete(msgs)["choices"][0]["message"]["content"]
+    )
     _CALENDAR_TOOL = GoogleCalendarTool()
     # GuardianAgent wiederverwendet _VOICE_AGENT.check_connectivity() für den
     # Anthropic-Teil seines Audits, daher erst NACH VoiceAgent() konstruiert.
